@@ -7,6 +7,10 @@ Original file is located at
     https://colab.research.google.com/drive/1Hvc_SXZLuARIrcpM7EDwencSPy9RAMCx
 """
 
+# Commented out IPython magic to ensure Python compatibility.
+# Change directory to the cloned repository
+# %cd WAT25_IndicDoc
+
 import json #Download Data#
 from pathlib import Path
 from typing import List
@@ -165,8 +169,6 @@ def main() -> None:
 if __name__ == "__main__":
     main()
 
-
-
 #!/usr/bin/env python                    #Gen_prompt for all lang pairs#
 # -*- coding: utf-8 -*-
 """
@@ -312,8 +314,6 @@ if __name__ == "__main__":
 
 # Commented out IPython magic to ensure Python compatibility.
 # %pip install vllm
-
-
 
 from google.colab import userdata
 HF_TOKEN = userdata.get('HF_TOKEN')  # Set this in Colab secrets
@@ -1633,12 +1633,10 @@ if translation_files and not any(f.endswith('.jsonl') for f in translation_files
 
             print(f"Converted {csv_file} to {jsonl_file}")
 
-# First install sacrebleu if not already installed
-!pip install sacrebleu>=2.3.0
-
-# Then run the evaluation with correct file paths
+# Evaluation code that handles N=10 properly
 from pathlib import Path
 import json
+import pandas as pd
 from sacrebleu.metrics import CHRF
 
 def _extract(line: str) -> str:
@@ -1650,131 +1648,26 @@ def _extract(line: str) -> str:
 
 def _load(path: Path):
     texts = []
-    try:
-        with path.open(encoding="utf-8") as f:
-            for ln in f:
-                if ln.strip():
-                    texts.append(_extract(ln))
-        return texts
-    except FileNotFoundError:
-        print(f"File not found: {path}")
-        return []
-
-# Try these possible file locations
-possible_ref_locations = [
-    "/content/data/dev/eng_hin/doc.hin.jsonl",
-    "/content/data/eng_hin/doc.hin.jsonl",
-    "/content/doc.hin.jsonl",
-    "/content/hindi_references.jsonl"
-]
-
-possible_hyp_locations = [
-    "/content/gemma3_1b_it_translations_eng_hin_dev_10.jsonl",
-    "/content/gemma3_1b_it_eng_to_hin_dev_10.jsonl",
-    "/content/gemma_translations.jsonl",
-    "/content/translations.jsonl"
-]
-
-# Find the actual files
-ref_file = None
-hyp_file = None
-
-for location in possible_ref_locations:
-    if Path(location).exists():
-        ref_file = location
-        print(f"Found reference file: {ref_file}")
-        break
-
-for location in possible_hyp_locations:
-    if Path(location).exists():
-        hyp_file = location
-        print(f"Found hypothesis file: {hyp_file}")
-        break
-
-if not ref_file or not hyp_file:
-    print("Could not find required files. Please check the file paths.")
-    print("Available files:")
-    !find /content -name "*.jsonl" -o -name "*.csv" 2>/dev/null
-else:
-    # Load files
-    refs = _load(Path(ref_file))
-    hyps = _load(Path(hyp_file))
-
-    print(f"References: {len(refs)}, Hypotheses: {len(hyps)}")
-
-    if len(refs) != len(hyps):
-        print(f"Warning: Length mismatch! refs={len(refs)} vs hyps={len(hyps)}")
-        # Use the minimum length to avoid errors
-        min_len = min(len(refs), len(hyps))
-        refs = refs[:min_len]
-        hyps = hyps[:min_len]
-        print(f"Using first {min_len} samples for evaluation")
-
-    # Compute ChrF score
-    if refs and hyps:
-        score = CHRF().corpus_score(hyps, [refs]).score
-        print(f"ChrF Score: {score:.4f}")
-
-        # Save to file
-        with open("/content/scores.tsv", "a") as f:
-            f.write(f"{Path(hyp_file).name}\t{score:.4f}\n")
-        print("Score saved to /content/scores.tsv")
-    else:
-        print("No data to evaluate")
-
-# First install sacrebleu if not already installed
-!pip install sacrebleu>=2.3.0
-!pip install pandas # Install pandas if not already present
-
-# Then run the evaluation
-from pathlib import Path
-import json
-import pandas as pd # Import pandas
-from sacrebleu.metrics import CHRF
-
-def _extract(line: str) -> str:
-    try:
-        obj = json.loads(line) if line.strip().startswith(("[", "{", "\"")) else [line]
-        return obj[0] if isinstance(obj, list) else obj.get("translation", "")
-    except json.JSONDecodeError:
-        # If it's not valid JSON, just return the stripped line
-        return line.strip()
-    except Exception:
-        # Catch other potential errors
-        return line.strip()
-
-
-def _load(path: Path) -> List[str]:
-    texts = []
     if path.suffix.lower() == '.csv':
         try:
             df = pd.read_csv(path)
             if 'pred_txt' in df.columns:
-                texts = df['pred_txt'].astype(str).tolist() # Ensure texts are strings
-            else:
-                print(f"Error: CSV file {path} does not contain a 'pred_txt' column.")
-        except FileNotFoundError:
-            print(f"File not found: {path}")
-        except Exception as e:
-            print(f"Error reading CSV file {path}: {e}")
+                texts = df['pred_txt'].astype(str).tolist()
+        except:
+            pass
     elif path.suffix.lower() == '.jsonl':
         try:
             with path.open(encoding="utf-8") as f:
                 for ln in f:
                     if ln.strip():
                         texts.append(_extract(ln))
-        except FileNotFoundError:
-            print(f"File not found: {path}")
-        except Exception as e:
-            print(f"Error reading JSONL file {path}: {e}")
-    else:
-        print(f"Unsupported file format for {path}. Please use .csv or .jsonl")
-
+        except:
+            pass
     return texts
 
-# Set your file paths here
-ref_file = "/tmp/pralekha_data/dev/eng_hin/doc.hin.jsonl"  # Reference file - Corrected path
-hyp_file = "/content/gemma3_1b_it_sentence_translations_eng_hin_dev_10.csv"  # Your model output - Corrected path and extension
+# File paths
+ref_file = "/tmp/pralekha_data/dev/eng_hin/doc.hin.jsonl"
+hyp_file = "gemma3_1b_it_sentence_translations_eng_hin_dev_10.csv"
 
 # Load files
 refs = _load(Path(ref_file))
@@ -1782,40 +1675,50 @@ hyps = _load(Path(hyp_file))
 
 print(f"References: {len(refs)}, Hypotheses: {len(hyps)}")
 
-if not refs or not hyps:
-    print("Error loading files. Cannot compute score.")
-elif len(refs) != len(hyps):
-    print(f"Warning: Length mismatch! refs={len(refs)} vs hyps={len(hyps)}")
-    # Use the minimum length to avoid errors
-    min_len = min(len(refs), len(hyps))
-    refs = refs[:min_len]
-    hyps = hyps[:min_len]
-    print(f"Using first {min_len} samples for evaluation")
+# Handle the N=10 case properly - use only first 10 references
+if len(refs) > len(hyps):
+    print(f"Using first {len(hyps)} references (N=10 setup)")
+    refs = refs[:len(hyps)]  # Match the 10 hypotheses
 
+# Compute score
+score = CHRF().corpus_score(hyps, [refs]).score
+print(f"ChrF Score (N=10): {score:.4f}")
 
-    # Compute ChrF score
-    score = CHRF().corpus_score(hyps, [refs]).score
-    print(f"ChrF Score: {score:.4f}")
+# Save results
+results_df = pd.DataFrame({
+    'Language_Pair': ['eng-hin'],
+    'Direction': ['English → Hindi'],
+    'ChrF_Score': [score],
+    'Samples_Used': [len(hyps)],
+    'Note': ['N=10 evaluation']
+})
 
-    # Save to file if needed
-    try:
-        with open("/content/scores.tsv", "a") as f:
-            f.write(f"{Path(hyp_file).name}\t{score:.4f}\n")
-        print("Score saved to /content/scores.tsv")
-    except Exception as e:
-        print(f"Error saving score to file: {e}")
-else:
-     # Compute ChrF score when lengths match
-    score = CHRF().corpus_score(hyps, [refs]).score
-    print(f"ChrF Score: {score:.4f}")
+results_df.to_csv("evaluation_results_n10.csv", index=False)
+results_df.to_excel("evaluation_results_n10.xlsx", index=False)
+print("Results saved to CSV and Excel files")
 
-    # Save to file if needed
-    try:
-        with open("/content/scores.tsv", "a") as f:
-            f.write(f"{Path(hyp_file).name}\t{score:.4f}\n")
-        print("Score saved to /content/scores.tsv")
-    except Exception as e:
-        print(f"Error saving score to file: {e}")
+# Add this to the END of your evaluation code
+from google.colab import files
+
+# Download the results files
+print("\n📥 Downloading your result files...")
+
+try:
+    files.download('translation_evaluation_results.csv')
+    print("✅ CSV file downloaded")
+except:
+    print("❌ Could not download CSV file")
+
+try:
+    files.download('translation_evaluation_results.xlsx')
+    print("✅ Excel file downloaded")
+except:
+    print("❌ Could not download Excel file")
+
+# Also show where the files are located
+print(f"\n📁 Files are saved at: {os.getcwd()}/")
+print("📋 File list:")
+!ls -la *.csv *.xlsx
 
 # First install required packages #EVALUATION CODE#
 !pip install sacrebleu>=2.3.0
