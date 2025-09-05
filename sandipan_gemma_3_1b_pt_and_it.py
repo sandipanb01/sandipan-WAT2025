@@ -935,6 +935,51 @@ def main():
 if __name__ == "__main__":
     main()
 
+# Check what files exist
+!ls -la
+
+# Look for your translation file
+!ls -la *translation*.csv
+
+# View the file content
+!head gemma3_1b_it_sentence_translations_eng_hin_dev_10.csv
+
+# See how many lines it has
+!wc -l gemma3_1b_it_sentence_translations_eng_hin_dev_10.csv
+
+# View as a DataFrame
+import pandas as pd
+df = pd.read_csv('gemma3_1b_it_sentence_translations_eng_hin_dev_10.csv')
+print(f"File shape: {df.shape}")
+print(df.head())
+
+# Display files directly in the notebook output
+print("📂 FILES IN CURRENT DIRECTORY:")
+print("=" * 40)
+
+# Get all files
+all_files = os.listdir('.')
+for file in all_files:
+    size = os.path.getsize(file)
+    print(f"📄 {file} ({size} bytes)")
+
+print("=" * 40)
+print(f"Total: {len(all_files)} files")
+
+# Show your specific file if it exists
+target_file = "gemma3_1b_it_sentence_translations_eng_hin_dev_10.csv"
+if target_file in all_files:
+    print(f"✅ YOUR FILE EXISTS: {target_file}")
+    print("📍 Location: Right here in the main directory!")
+    print("👀 It should appear in the file browser after refreshing")
+else:
+    print(f"❌ File not found: {target_file}")
+
+from google.colab import files
+
+# Download the translation file
+files.download('gemma3_1b_it_sentence_translations_eng_hin_dev_10.csv')
+
 #!/usr/bin/env python #inference prompt NOT for all lang pairs#
 """
 Modified for Gemma 3-1B models with document chunking and sentence-level translation
