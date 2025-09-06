@@ -1,4 +1,5 @@
-#!/usr/bin/env python   #TRANSLATION PROMPT FOR ALL LANGUAGE PAIRS#
+#!/usr/bin/env python
+#TRANSLATION PROMPT FOR ALL LANGUAGE PAIRS#
 """
 Quick-start: translate a slice of the Pralekha dev-set with vLLM + Gemma-3-1B-PT.
 """
@@ -83,19 +84,17 @@ def make_prompts(sentences: List[str], src: str, tgt: str) -> List[str]:
 
 
 # ---------------------------------------------------------------------------
-# 3. MODEL INSTANTIATION (vLLM)
+# 3. MODEL INSTANTIATION (vLLM) - CORRECTED FOR GEMMA 3-1B-PT
 # ---------------------------------------------------------------------------
-def init_gemma(checkpoint: str = "google/gemma-2b") -> LLM:
+def init_gemma(checkpoint: str = "google/gemma-3-1b-pt") -> LLM:  # CORRECTED MODEL NAME
     """
     Loads the Gemma 3 1B PT checkpoint under vLLM.
     """
-    # Set the HF_TOKEN environment variable for vLLM to use
-    os.environ["HF_TOKEN"] = HF_TOKEN
     return LLM(
         model=checkpoint,
         dtype="float16",
         tokenizer=checkpoint,
-        max_model_len=4096, # Reduced max_model_len to 4096
+        max_model_len=4096,
         trust_remote_code=True,
         tokenizer_mode="auto",
     )
