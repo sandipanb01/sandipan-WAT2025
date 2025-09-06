@@ -42,7 +42,7 @@ def build_generator(args):
         trust_remote_code=True,
         gpu_memory_utilization=0.85,
     )
-    
+
     # Configure sampling parameters
     sampling_params = SamplingParams(
         max_tokens=args.max_new_tokens,
@@ -50,7 +50,7 @@ def build_generator(args):
         top_p=args.top_p if args.sampling else 1.0,
         stop=["<end_of_turn>", "\n\n"],
     )
-    
+
     # Define a generator function that uses vLLM for batched inference
     def generate(prompts):
         outputs = llm.generate(prompts, sampling_params)
@@ -58,26 +58,26 @@ def build_generator(args):
             {"generated_text": prompt + output.outputs[0].text}
             for prompt, output in zip(prompts, outputs)
         ]
-    
+
     return generate
 
 def main():
     args = parse_args()
     prompts = list(load_prompts(args.input_file))
     print(f"Loaded {len(prompts)} prompts.")
-    
+
     # Create output directory if it doesn't exist
     os.makedirs(os.path.dirname(args.output_file), exist_ok=True)
-    
+
     # Initialize vLLM generator
     gen_fn = build_generator(args)
     print(f"Starting batched inference with vLLM (batch size: {args.batch_size})...")
-    
+
     with open(args.output_file, "w", encoding="utf-8") as fout:
         for i in tqdm(range(0, len(prompts), args.batch_size), desc="Generating"):
             batch_prompts = prompts[i:i + args.batch_size]
             batch_outputs = gen_fn(batch_prompts)
-            
+
             for output, prompt in zip(batch_outputs, batch_prompts):
                 generation = output["generated_text"].replace(prompt, "").strip()
                 # Clean up any remaining special tokens
@@ -90,7 +90,7 @@ def main():
                 torch.cuda.synchronize()
                 used_memory = torch.cuda.max_memory_allocated() / (1024 ** 2)
                 print(f"Max GPU memory used: {used_memory:.2f} MB")
-    
+
     print("vLLM inference completed successfully.")
 
 if __name__ == "__main__":
