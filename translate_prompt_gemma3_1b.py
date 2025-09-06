@@ -85,15 +85,19 @@ def make_prompts(sentences: List[str], src: str, tgt: str) -> List[str]:
 # ---------------------------------------------------------------------------
 # 3. MODEL INSTANTIATION (vLLM)
 # ---------------------------------------------------------------------------
-def init_gemma(checkpoint: str = "google/gemma-3-1b-pt") -> LLM:
+def init_gemma(checkpoint: str = "google/gemma-2b") -> LLM:
     """
     Loads the Gemma 3 1B PT checkpoint under vLLM.
     """
+    # Set the HF_TOKEN environment variable for vLLM to use
+    os.environ["HF_TOKEN"] = HF_TOKEN
     return LLM(
         model=checkpoint,
         dtype="float16",
         tokenizer=checkpoint,
-        max_model_len=4096,
+        max_model_len=4096, # Reduced max_model_len to 4096
+        trust_remote_code=True,
+        tokenizer_mode="auto",
     )
 
 
@@ -107,11 +111,29 @@ def translate(
     max_tokens: int = 4096,
 ) -> List[str]:
     params = SamplingParams(
-        temperature=temperature, 
+        temperature=temperature,
         max_tokens=max_tokens,
         stop=["<end_of_turn>", "\n\n"]
     )
-    outputs = llm.generate(prompts, params)
+
+    # Filter out prompts that are too long
+    tokenizer = llm.get_tokenizer()
+    valid_prompts = []
+    skipped_prompts_count = 0
+    for prompt in prompts:
+        if len(tokenizer.encode(prompt)) <= llm.max_model_len:
+            valid_prompts.append(prompt)
+        else:
+            skipped_prompts_count += 1
+
+    if skipped_prompts_count > 0:
+        print(f"Skipped {skipped_prompts_count} prompts that were too long for the model.")
+
+    if not valid_prompts:
+        print("No valid prompts to process.")
+        return []
+
+    outputs = llm.generate(valid_prompts, params)
     # Extract and clean the translations
     translations = []
     for out in outputs:
@@ -131,28 +153,39 @@ def main():
         "eng_ben", "eng_guj", "eng_hin", "eng_kan", "eng_mal",
         "eng_mar", "eng_ori", "eng_pan", "eng_tam", "eng_tel", "eng_urd",
     ]
-    
+
     SUBSET = "dev"  # or "test"
-    
+
     for pair in LANGUAGE_PAIRS:
         src_lang, tgt_lang = pair.split("_")
         print(f"\nProcessing {src_lang} to {tgt_lang}...")
-        
+
         # Load data
         ds = load_pralekha_split(src_lang, tgt_lang, SUBSET)
         print(f"Loaded {len(ds):,} rows from {SUBSET}/{src_lang}_{tgt_lang}")
 
         # Initialize model
         llm = init_gemma()
-        
+
         # Create prompts
         prompts = make_prompts(ds["src_txt"], src_lang, tgt_lang)
-        
+
         # Translate
         translations = translate(llm, prompts)
 
         # Add predictions & persist
-        ds = ds.add_column("pred_txt", translations)
+        # Ensure the number of translations matches the number of initially loaded documents
+        # by adding empty strings for skipped prompts
+        full_translations = [""] * len(ds)
+        valid_prompt_index = 0
+        tokenizer = llm.get_tokenizer()
+        for i, prompt in enumerate(prompts):
+            if len(tokenizer.encode(prompt)) <= llm.max_model_len:
+                full_translations[i] = translations[valid_prompt_index]
+                valid_prompt_index += 1
+
+
+        ds = ds.add_column("pred_txt", full_translations)
         out_file = Path(f"translations_{src_lang}_{tgt_lang}_{SUBSET}.csv")
         ds.to_pandas().to_csv(out_file, index=False)
         print(f"✓ Saved translations to {out_file.resolve()}")
