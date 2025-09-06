@@ -177,7 +177,7 @@ if __name__ == "__main__":
 # Commented out IPython magic to ensure Python compatibility.
 # %pip install --upgrade "datasets>=2.19.0" "vllm>=0.4.2" accelerate torch --extra-index-url https://download.pytorch.org/whl/cu121
 
-#!/usr/bin/env python
+#!/usr/bin/env python   #TRANSLATION PROMPT FOR 1 LANGUAGE PAIR#
 """
 Quick-start: translate a slice of the Pralekha dev-set with vLLM + Gemma-3-1b-pt.
 """
@@ -318,7 +318,169 @@ def main():
 if __name__ == "__main__":
     main()
 
-#!/usr/bin/env python
+#!/usr/bin/env python   #TRANSLATION PROMPT FOR ALL LANGUAGE PAIRS#
+"""
+Quick-start: translate a slice of the Pralekha dev-set with vLLM + Gemma-3-1B-PT.
+"""
+import os
+os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
+from pathlib import Path
+from typing import List
+
+from datasets import load_dataset
+from vllm import LLM, SamplingParams
+
+import os, re, subprocess, sys
+
+def _fix_cuda_visible_devices():
+    cvd = os.environ.get("CUDA_VISIBLE_DEVICES", "")
+    if not cvd.startswith("GPU-"):
+        # Already numeric -> nothing to do
+        return
+
+    # 1) Build a map {UUID -> index} from `nvidia-smi -L`
+    try:
+        smi = subprocess.check_output(["nvidia-smi", "-L"], text=True)
+    except FileNotFoundError:
+        sys.exit("!! nvidia-smi not found—cannot map GPU UUIDs to indices")
+
+    uuid2idx = {}
+    for line in smi.splitlines():
+        # Example: "GPU 2: NVIDIA H100 (UUID: GPU-b1b8e0d1-5d40-8a62-d5da-393bca3fd881)"
+        m = re.match(r"GPU\s+(\d+):.*\(UUID:\s+(GPU-[0-9a-f\-]+)\)", line)
+        if m:
+            idx, uuid = m.groups()
+            uuid2idx[uuid] = idx
+
+    # 2) Translate the job-allocated UUID list to indices
+    try:
+        new_ids = ",".join(uuid2idx[uuid] for uuid in cvd.split(","))
+    except KeyError as e:
+        missing = str(e).strip("'")
+        sys.exit(f"!! UUID {missing} not found in `nvidia-smi -L` output.\n"
+                 f"   CUDA_VISIBLE_DEVICES was: {cvd}")
+
+    os.environ["CUDA_VISIBLE_DEVICES"] = new_ids
+    print(f"[fix-gpu] CUDA_VISIBLE_DEVICES  {cvd}  →  {new_ids}")
+
+_fix_cuda_visible_devices()
+
+# ---------------------------------------------------------------------------
+# 1. DATA LOADING
+# ---------------------------------------------------------------------------
+def load_pralekha_split(
+    src_lang: str = "eng",
+    tgt_lang: str = "hin",
+    subset: str = "dev",
+    max_rows: int | None = None,
+):
+    ds = load_dataset("ai4bharat/Pralekha", f"{subset}", split=f"{src_lang}_{tgt_lang}")
+    if max_rows:
+        ds = ds.select(range(min(max_rows, len(ds))))
+    return ds
+
+# ---------------------------------------------------------------------------
+# 2. PROMPT TEMPLATING (Gemma format for document translation)
+# ---------------------------------------------------------------------------
+_SYSTEM = (
+    "You are a professional document translator. Translate the entire document precisely "
+    "from {src} to {tgt}, preserving meaning, tone, formatting, and document structure."
+)
+
+def make_prompts(sentences: List[str], src: str, tgt: str) -> List[str]:
+    sys = _SYSTEM.format(src=src, tgt=tgt)
+    return [
+        (
+            f"<start_of_turn>user\n"
+            f"{sys}\n"
+            f"Please translate the following document from {src} to {tgt}:\n"
+            f"{s}\n"
+            f"<end_of_turn>\n"
+            f"<start_of_turn>model\n"
+        )
+        for s in sentences
+    ]
+
+
+# ---------------------------------------------------------------------------
+# 3. MODEL INSTANTIATION (vLLM)
+# ---------------------------------------------------------------------------
+def init_gemma(checkpoint: str = "google/gemma-3-1b-pt") -> LLM:
+    """
+    Loads the Gemma 3 1B PT checkpoint under vLLM.
+    """
+    return LLM(
+        model=checkpoint,
+        dtype="float16",
+        tokenizer=checkpoint,
+        max_model_len=4096,
+    )
+
+
+# ---------------------------------------------------------------------------
+# 4. BATCH TRANSLATION
+# ---------------------------------------------------------------------------
+def translate(
+    llm: LLM,
+    prompts: List[str],
+    temperature: float = 0.0,
+    max_tokens: int = 4096,
+) -> List[str]:
+    params = SamplingParams(
+        temperature=temperature,
+        max_tokens=max_tokens,
+        stop=["<end_of_turn>", "\n\n"]
+    )
+    outputs = llm.generate(prompts, params)
+    # Extract and clean the translations
+    translations = []
+    for out in outputs:
+        text = out.outputs[0].text.strip()
+        # Clean up any remaining special tokens
+        text = text.replace("<start_of_turn>", "").replace("<end_of_turn>", "").strip()
+        translations.append(text)
+    return translations
+
+
+# ---------------------------------------------------------------------------
+# 5. END-TO-END EXECUTION FOR ALL LANGUAGE PAIRS
+# ---------------------------------------------------------------------------
+def main():
+    # All language pairs to process
+    LANGUAGE_PAIRS = [
+        "eng_ben", "eng_guj", "eng_hin", "eng_kan", "eng_mal",
+        "eng_mar", "eng_ori", "eng_pan", "eng_tam", "eng_tel", "eng_urd",
+    ]
+
+    SUBSET = "dev"  # or "test"
+
+    for pair in LANGUAGE_PAIRS:
+        src_lang, tgt_lang = pair.split("_")
+        print(f"\nProcessing {src_lang} to {tgt_lang}...")
+
+        # Load data
+        ds = load_pralekha_split(src_lang, tgt_lang, SUBSET)
+        print(f"Loaded {len(ds):,} rows from {SUBSET}/{src_lang}_{tgt_lang}")
+
+        # Initialize model
+        llm = init_gemma()
+
+        # Create prompts
+        prompts = make_prompts(ds["src_txt"], src_lang, tgt_lang)
+
+        # Translate
+        translations = translate(llm, prompts)
+
+        # Add predictions & persist
+        ds = ds.add_column("pred_txt", translations)
+        out_file = Path(f"translations_{src_lang}_{tgt_lang}_{SUBSET}.csv")
+        ds.to_pandas().to_csv(out_file, index=False)
+        print(f"✓ Saved translations to {out_file.resolve()}")
+
+if __name__ == "__main__":
+    main()
+
+#!/usr/bin/env python    #INFERENCE CODE FOR ONE LANGUAGE PAIR#
 # inference_vllm.py
 import argparse
 import json
@@ -437,7 +599,105 @@ if __name__ == "__main__":
 # Commented out IPython magic to ensure Python compatibility.
 # %pip install sacrebleu>=2.3
 
-#!/usr/bin/env python
+#!/usr/bin/env python    #INFERENCE PROMPT FOR ALL LANGUAGE PAIRS#
+# inference_vllm.py
+import argparse
+import json
+import sys
+import os
+from tqdm import tqdm
+from pathlib import Path
+import torch
+
+def parse_args():
+    p = argparse.ArgumentParser()
+    p.add_argument("--input_file", required=True)
+    p.add_argument("--output_file", required=True)
+    p.add_argument("--model", default="google/gemma-3-1b-pt",
+                   help="HF repo path or local dir; using google/gemma-3-1b-pt")
+    p.add_argument("--max_new_tokens", type=int, default=4096)
+    p.add_argument("--sampling", action="store_true")
+    p.add_argument("--temperature", type=float, default=0.7)
+    p.add_argument("--top_p", type=float, default=0.9)
+    p.add_argument("--batch_size", type=int, default=4)
+    return p.parse_args()
+
+def load_prompts(path):
+    for line in Path(path).read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line: continue
+        obj = json.loads(line) if line[0] in "{[" else {"prompt": line}
+        if isinstance(obj, list): yield obj[0]
+        else: yield obj["prompt"]
+
+def build_generator(args):
+    # Import vLLM here to control error handling
+    from vllm import LLM, SamplingParams
+
+    # Initialize vLLM engine
+    print(f"Initializing vLLM for model: {args.model}")
+    llm = LLM(
+        model=args.model,
+        tensor_parallel_size=1,
+        dtype="float16",
+        trust_remote_code=True,
+        gpu_memory_utilization=0.85,
+    )
+
+    # Configure sampling parameters
+    sampling_params = SamplingParams(
+        max_tokens=args.max_new_tokens,
+        temperature=args.temperature if args.sampling else 0.0,
+        top_p=args.top_p if args.sampling else 1.0,
+        stop=["<end_of_turn>", "\n\n"],
+    )
+
+    # Define a generator function that uses vLLM for batched inference
+    def generate(prompts):
+        outputs = llm.generate(prompts, sampling_params)
+        return [
+            {"generated_text": prompt + output.outputs[0].text}
+            for prompt, output in zip(prompts, outputs)
+        ]
+
+    return generate
+
+def main():
+    args = parse_args()
+    prompts = list(load_prompts(args.input_file))
+    print(f"Loaded {len(prompts)} prompts.")
+
+    # Create output directory if it doesn't exist
+    os.makedirs(os.path.dirname(args.output_file), exist_ok=True)
+
+    # Initialize vLLM generator
+    gen_fn = build_generator(args)
+    print(f"Starting batched inference with vLLM (batch size: {args.batch_size})...")
+
+    with open(args.output_file, "w", encoding="utf-8") as fout:
+        for i in tqdm(range(0, len(prompts), args.batch_size), desc="Generating"):
+            batch_prompts = prompts[i:i + args.batch_size]
+            batch_outputs = gen_fn(batch_prompts)
+
+            for output, prompt in zip(batch_outputs, batch_prompts):
+                generation = output["generated_text"].replace(prompt, "").strip()
+                # Clean up any remaining special tokens
+                generation = generation.replace("<start_of_turn>", "").replace("<end_of_turn>", "").strip()
+                fout.write(json.dumps([generation], ensure_ascii=False) + "\n")
+            fout.flush()
+
+            # Report memory usage for monitoring
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+                used_memory = torch.cuda.max_memory_allocated() / (1024 ** 2)
+                print(f"Max GPU memory used: {used_memory:.2f} MB")
+
+    print("vLLM inference completed successfully.")
+
+if __name__ == "__main__":
+    main()
+
+#!/usr/bin/env python   #EVALUTAION FOR ONE LANGUAGE PAIR#
 # -*- coding: utf-8 -*-
 """
 eval_chrf.py  –  Compute ChrF for WAT JSONL outputs.
@@ -494,6 +754,113 @@ def main() -> None:
         out_path.parent.mkdir(parents=True, exist_ok=True)
         with out_path.open("a", encoding="utf-8") as f:
             f.write(result_line + "\n")
+
+# ---------------------------------------------------------------------------
+if __name__ == "__main__":
+    main()
+
+#!/usr/bin/env python   #EVALUATION FOR ALL LANGUAGE PAIR#
+# -*- coding: utf-8 -*-
+"""
+eval_chrf.py  –  Compute ChrF for WAT JSONL outputs for all language pairs.
+"""
+
+from __future__ import annotations
+import argparse, json, sys
+from pathlib import Path
+from typing import List, Dict
+import pandas as pd
+
+try:
+    from sacrebleu.metrics import CHRF
+except ImportError:
+    sys.exit("Please `pip install sacrebleu>=2.3` first.")
+
+# ---------------------------------------------------------------------------
+def _extract(line: str) -> str:
+    obj = json.loads(line) if line.strip().startswith(("[", "{", "\"")) else [line]
+    return obj[0] if isinstance(obj, list) else obj.get("translation", "")
+
+def _load(path: Path) -> List[str]:
+    with path.open(encoding="utf-8") as f:
+        return [_extract(ln).strip() for ln in f if ln.strip()]
+
+def evaluate_all_pairs(ref_dir: Path, hyp_dir: Path, output_file: Path):
+    """Evaluate all language pairs and save results to Excel/CSV."""
+
+    LANGUAGE_PAIRS = [
+        "eng_ben", "eng_guj", "eng_hin", "eng_kan", "eng_mal",
+        "eng_mar", "eng_ori", "eng_pan", "eng_tam", "eng_tel", "eng_urd",
+    ]
+
+    results = []
+
+    for pair in LANGUAGE_PAIRS:
+        src_lang, tgt_lang = pair.split("_")
+
+        # Reference file
+        ref_file = ref_dir / pair / f"doc.{tgt_lang}.jsonl"
+
+        # Hypothesis file (assuming naming convention)
+        hyp_file = hyp_dir / f"translations_{src_lang}_{tgt_lang}_dev.csv"
+
+        if not ref_file.exists():
+            print(f"Warning: Reference file not found: {ref_file}")
+            continue
+
+        if not hyp_file.exists():
+            print(f"Warning: Hypothesis file not found: {hyp_file}")
+            continue
+
+        try:
+            # Load references
+            refs = _load(ref_file)
+
+            # Load hypotheses from CSV
+            df = pd.read_csv(hyp_file)
+            hyps = df["pred_txt"].tolist()
+
+            if len(refs) != len(hyps):
+                print(f"Warning: Length mismatch for {pair}: refs={len(refs)} vs hyps={len(hyps)}")
+                continue
+
+            # Calculate ChrF score
+            score = CHRF().corpus_score(hyps, [refs]).score
+
+            results.append({
+                "language_pair": pair,
+                "chrf_score": score,
+                "num_samples": len(refs)
+            })
+
+            print(f"{pair}: ChrF = {score:.4f} (n={len(refs)})")
+
+        except Exception as e:
+            print(f"Error processing {pair}: {e}")
+            continue
+
+    # Save results
+    if results:
+        df_results = pd.DataFrame(results)
+        df_results.to_excel(output_file.with_suffix(".xlsx"), index=False)
+        df_results.to_csv(output_file.with_suffix(".csv"), index=False)
+        print(f"✓ Results saved to {output_file.with_suffix('.xlsx')} and {output_file.with_suffix('.csv')}")
+    else:
+        print("No results to save")
+
+# ---------------------------------------------------------------------------
+def main() -> None:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--ref_dir", required=True, help="Directory containing reference JSONL files")
+    ap.add_argument("--hyp_dir", required=True, help="Directory containing hypothesis files")
+    ap.add_argument("--output_file", required=True, help="Output file path (without extension)")
+    args = ap.parse_args()
+
+    ref_dir = Path(args.ref_dir)
+    hyp_dir = Path(args.hyp_dir)
+    output_file = Path(args.output_file)
+
+    evaluate_all_pairs(ref_dir, hyp_dir, output_file)
 
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
