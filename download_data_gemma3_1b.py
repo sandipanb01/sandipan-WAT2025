@@ -1,4 +1,4 @@
-import json #Download Data#
+import json
 from pathlib import Path
 from typing import List
 
@@ -27,9 +27,10 @@ def dump_pair(subset: str, pair: str, out_root: Path) -> None:
     save_jsonl(ds["tgt_txt"], out_root / subset / pair / f"doc.{tgt_lang}.jsonl")
 
 def main() -> None:
-    """Main function to download data."""
-    out_root = Path("/tmp/pralekha_data").expanduser()
-    splits = ["dev", "test"]
+    """Main function to parse arguments and download data."""
+    # Define output directory and splits directly for Colab environment
+    out_root = Path("./pralekha_data").expanduser()  # Example output directory
+    splits = ["dev", "test"]  # Example splits
 
     print("Language pairs fixed to:", ", ".join(PAIRS))
     print("Splits:", ", ".join(splits))
