@@ -1,200 +1,142 @@
 #!/usr/bin/env python
 """
-Iterative Back-Translation with fine-tuned Gemma-3-1B-PT
-- Uses monolingual data from Pralekha (src-only or tgt-only sides)
-- Generates synthetic parallel corpus using the model
-- Merges synthetic + gold pairs
-- Fine-tunes further (LoRA) for N iterations
+Iterative Back-Translation (IBT) with Pralekha
+- Runs document-level IBT on all language pairs (bidirectional)
+- Generates synthetic data + merges with gold Pralekha
+- Outputs ready-to-train Hugging Face DatasetDict
 """
 
 import os
+import json
 import torch
 from pathlib import Path
-from datasets import load_dataset, Dataset, concatenate_datasets
-from transformers import AutoTokenizer, AutoModelForCausalLM, TrainingArguments, DataCollatorForLanguageModeling
-from peft import get_peft_model, LoraConfig, prepare_model_for_kbit_training
-from trl import SFTTrainer
+from datasets import load_dataset, Dataset, DatasetDict, concatenate_datasets
+from transformers import AutoTokenizer, AutoModelForCausalLM
 
-# ------------------------------
+# -------------------------
 # Config
-# ------------------------------
-BASE_MODEL = Path("./gemma3-1b-pt-indicdoc")  # already fine-tuned checkpoint
-OUTPUT_ROOT = Path("./ibt_gemma3-1b-pt")
-LANGUAGE_PAIRS = [
-    ("eng", "hin"),  # example pair, extend to all
-]
-N_ITER = 3         # number of IBT cycles
-SYN_SAMPLES = 500  # synthetic per iteration per pair
-REAL_SAMPLES = 200 # gold samples for balance
+# -------------------------
+MODEL_PATH = "./gemma3-1b-pt-indicdoc"  # your fine-tuned model
+OUTPUT_DIR = Path("./ibt_augmented")
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
-# ------------------------------
-# Utils: load model for inference
-# ------------------------------
-def load_model_for_inference(model_path):
-    tokenizer = AutoTokenizer.from_pretrained(str(model_path), local_files_only=True)
-    model = AutoModelForCausalLM.from_pretrained(
-        str(model_path),
-        device_map="auto",
-        torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
-        local_files_only=True
-    )
-    model.eval()
+LANGUAGE_PAIRS = [
+    "eng_ben", "eng_guj", "eng_hin", "eng_kan", "eng_mal",
+    "eng_mar", "eng_ori", "eng_pan", "eng_tam", "eng_tel", "eng_urd",
+    "ben_eng", "hin_eng", "tam_eng", "urd_eng"
+]
+
+MAX_TOKENS = 4096
+MAX_DOCS = 200     # limit per pair for speed/debug
+N_ITER = 2         # number of back-translation cycles
+SPLIT = "train"
+
+# -------------------------
+# Helpers
+# -------------------------
+def load_model():
+    tokenizer = AutoTokenizer.from_pretrained(MODEL_PATH)
+    model = AutoModelForCausalLM.from_pretrained(MODEL_PATH, device_map="auto")
     return tokenizer, model
 
-def build_prompt(src, tgt, text):
-    return f"""<start_of_turn>user
-Translate this {src} text to {tgt}:
+def translate_doc(tokenizer, model, text, src, tgt, max_tokens=MAX_TOKENS):
+    """Document-level translation"""
+    prompt = f"""<start_of_turn>user
+Translate this {src} document to {tgt}:
 {text}<end_of_turn>
 <start_of_turn>model"""
+    inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=max_tokens).to(model.device)
+    outputs = model.generate(**inputs, max_new_tokens=512, do_sample=False)
+    decoded = tokenizer.decode(outputs[0], skip_special_tokens=True)
 
-def translate_batch(tokenizer, model, src, tgt, texts, max_new_tokens=128):
-    outputs = []
-    for text in texts:
-        prompt = build_prompt(src, tgt, text)
-        inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
-        with torch.no_grad():
-            gen = model.generate(**inputs, max_new_tokens=max_new_tokens, do_sample=False)
-        decoded = tokenizer.decode(gen[0], skip_special_tokens=True)
-        if "<start_of_turn>model" in decoded:
-            decoded = decoded.split("<start_of_turn>model")[-1].strip()
-        if "<end_of_turn>" in decoded:
-            decoded = decoded.split("<end_of_turn>")[0].strip()
-        outputs.append(decoded)
-    return outputs
+    if "<start_of_turn>model" in decoded:
+        decoded = decoded.split("<start_of_turn>model")[-1].strip()
+    if "<end_of_turn>" in decoded:
+        decoded = decoded.split("<end_of_turn>")[0].strip()
+    return decoded
 
-# ------------------------------
-# Step 1: Create synthetic parallel data
-# ------------------------------
-def create_synthetic_parallel(pair, tokenizer, model, max_samples=SYN_SAMPLES, subset="train"):
-    src, tgt = pair
-    print(f"[IBT] Generating synthetic {tgt}→{src} for {pair} ...")
-
-    # Load monolingual data (e.g., target side sentences only)
+def backtranslate_corpus(tokenizer, model, src_lang, tgt_lang, split=SPLIT, max_docs=MAX_DOCS):
+    """Run forward+back translation for one language pair"""
+    print(f"[IBT] {src_lang} → {tgt_lang} → {src_lang}")
     try:
-        ds = load_dataset("ai4bharat/Pralekha", subset, split=f"{src}_{tgt}")
+        ds = load_dataset("ai4bharat/Pralekha", split=f"{src_lang}_{tgt_lang}", name=split)
     except Exception as e:
-        print(f"  [WARN] Skipping {pair}: {e}")
-        return Dataset.from_list([])
+        print(f"  [WARN] Could not load {src_lang}_{tgt_lang}: {e}")
+        return []
 
-    ds = ds.select(range(min(max_samples, len(ds))))
+    ds = ds.select(range(min(max_docs, len(ds))))
 
-    # Back-translate: tgt → src
-    tgt_texts = ds["tgt_txt"]
-    synthetic_src = translate_batch(tokenizer, model, tgt, src, tgt_texts)
+    synthetic_pairs = []
+    for row in ds:
+        src_text = row.get("src_txt") or row.get("src_text", "")
+        tgt_text = row.get("tgt_txt") or row.get("tgt_text", "")
+        if not src_text or not tgt_text:
+            continue
 
-    # Build synthetic parallel
-    synthetic = []
-    for s, t in zip(synthetic_src, tgt_texts):
-        prompt = f"""<start_of_turn>user
-Translate this {src} text to {tgt}:
-{s}<end_of_turn>
-<start_of_turn>model
-{t}<end_of_turn>"""
-        synthetic.append({"text": prompt})
+        # Forward translate source → target
+        fwd = translate_doc(tokenizer, model, src_text, src_lang, tgt_lang)
 
-    return Dataset.from_list(synthetic)
+        # Back translate target → source
+        back = translate_doc(tokenizer, model, fwd, tgt_lang, src_lang)
 
-# ------------------------------
-# Step 2: Merge gold + synthetic
-# ------------------------------
-def prepare_training_dataset(pair, synthetic_ds, real_samples=REAL_SAMPLES):
-    src, tgt = pair
-    print(f"[IBT] Preparing gold + synthetic mix for {pair}")
+        synthetic_pairs.append({
+            "src_txt": back,
+            "tgt_txt": fwd,
+            "original_src": src_text,
+            "original_tgt": tgt_text,
+            "lang_pair": f"{src_lang}_{tgt_lang}"
+        })
 
-    try:
-        gold = load_dataset("ai4bharat/Pralekha", "train", split=f"{src}_{tgt}")
-        gold = gold.select(range(min(real_samples, len(gold))))
-    except Exception as e:
-        print(f"  [WARN] Could not load gold: {e}")
-        return synthetic_ds
+    return synthetic_pairs
 
-    formatted_gold = []
-    for row in gold:
-        src_text, tgt_text = row["src_txt"], row["tgt_txt"]
-        prompt = f"""<start_of_turn>user
-Translate this {src} text to {tgt}:
-{src_text}<end_of_turn>
-<start_of_turn>model
-{tgt_text}<end_of_turn>"""
-        formatted_gold.append({"text": prompt})
-
-    gold_ds = Dataset.from_list(formatted_gold)
-    return concatenate_datasets([gold_ds, synthetic_ds])
-
-# ------------------------------
-# Step 3: Fine-tune with LoRA on mix
-# ------------------------------
-def finetune_iteration(iter_id, train_ds, base_model=BASE_MODEL):
-    print(f"[IBT] Fine-tuning iteration {iter_id} ...")
-    tokenizer = AutoTokenizer.from_pretrained(str(base_model), local_files_only=True)
-    tokenizer.pad_token = tokenizer.eos_token
-    tokenizer.padding_side = "right"
-
-    model = AutoModelForCausalLM.from_pretrained(
-        str(base_model),
-        device_map="auto",
-        torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
-        local_files_only=True
-    )
-    model = prepare_model_for_kbit_training(model)
-
-    lora_config = LoraConfig(
-        r=8, lora_alpha=16,
-        target_modules=["q_proj", "v_proj", "k_proj", "o_proj"],
-        lora_dropout=0.05,
-        bias="none",
-        task_type="CAUSAL_LM"
-    )
-    model = get_peft_model(model, lora_config)
-
-    out_dir = OUTPUT_ROOT / f"ibt_iter{iter_id}"
-    training_args = TrainingArguments(
-        output_dir=str(out_dir),
-        per_device_train_batch_size=1,
-        gradient_accumulation_steps=8,
-        learning_rate=2e-4,
-        num_train_epochs=1,
-        logging_steps=50,
-        save_strategy="epoch",
-        bf16=torch.cuda.is_available(),
-        report_to="none"
-    )
-
-    trainer = SFTTrainer(
-        model=model,
-        args=training_args,
-        train_dataset=train_ds,
-        tokenizer=tokenizer,
-        max_seq_length=2048,
-        packing=False,
-        data_collator=DataCollatorForLanguageModeling(tokenizer, mlm=False)
-    )
-
-    trainer.train()
-    trainer.save_model()
-    tokenizer.save_pretrained(out_dir)
-    return out_dir
-
-# ------------------------------
-# Main IBT Loop
-# ------------------------------
+# -------------------------
+# Main IBT loop + dataset merge
+# -------------------------
 def main():
-    current_model = BASE_MODEL
-    tokenizer, model = load_model_for_inference(current_model)
+    tokenizer, model = load_model()
+    augmented_data = []
 
-    for i in range(1, N_ITER + 1):
-        print(f"\n========== Iteration {i}/{N_ITER} ==========")
+    for it in range(N_ITER):
+        print(f"\n========== Iteration {it+1}/{N_ITER} ==========")
         for pair in LANGUAGE_PAIRS:
-            synthetic_ds = create_synthetic_parallel(pair, tokenizer, model)
-            mixed_ds = prepare_training_dataset(pair, synthetic_ds)
+            src, tgt = pair.split("_")
+            synthetic = backtranslate_corpus(tokenizer, model, src, tgt, split=SPLIT)
+            if synthetic:
+                augmented_data.extend(synthetic)
+                out_file = OUTPUT_DIR / f"{pair}_ibt_iter{it+1}.jsonl"
+                with open(out_file, "w", encoding="utf-8") as f:
+                    for item in synthetic:
+                        f.write(json.dumps(item, ensure_ascii=False) + "\n")
+                print(f"  Saved {len(synthetic)} synthetic pairs → {out_file}")
 
-            # Fine-tune on combined data
-            current_model = finetune_iteration(i, mixed_ds, base_model=current_model)
+    # -------------------------
+    # Merge with gold Pralekha
+    # -------------------------
+    print("\n[INFO] Merging synthetic + gold Pralekha...")
+    gold_datasets = []
+    for pair in LANGUAGE_PAIRS:
+        try:
+            ds_gold = load_dataset("ai4bharat/Pralekha", split=f"{pair}", name=SPLIT)
+            gold_datasets.append(ds_gold)
+        except Exception as e:
+            print(f"  [WARN] Could not load gold {pair}: {e}")
 
-        # reload updated model for next loop
-        tokenizer, model = load_model_for_inference(current_model)
+    # Convert synthetic list → Dataset
+    synthetic_dataset = Dataset.from_list(augmented_data) if augmented_data else None
 
-    print("[IBT] Finished all iterations.")
+    if synthetic_dataset and gold_datasets:
+        merged = concatenate_datasets(gold_datasets + [synthetic_dataset])
+    elif synthetic_dataset:
+        merged = synthetic_dataset
+    else:
+        merged = concatenate_datasets(gold_datasets)
+
+    dataset_dict = DatasetDict({"train": merged})
+    out_path = OUTPUT_DIR / f"ibt_augmented_dataset_iter{N_ITER}"
+    dataset_dict.save_to_disk(str(out_path))
+
+    print(f"[INFO] Finished IBT. Total synthetic pairs: {len(augmented_data)}")
+    print(f"[INFO] Merged dataset saved to {out_path}")
 
 if __name__ == "__main__":
     main()
