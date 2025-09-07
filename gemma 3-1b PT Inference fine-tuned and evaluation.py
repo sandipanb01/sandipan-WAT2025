@@ -3,6 +3,7 @@
 Unified Inference + Evaluation for fine-tuned Gemma-3-1B-PT
 - Supports single, batch, and document-level translation
 - Evaluates BLEU + chrF2 on Pralekha dev/test
+- Exports results to Excel and optionally Google Sheets
 """
 
 import torch
@@ -11,6 +12,17 @@ from pathlib import Path
 from datasets import load_dataset
 from transformers import AutoTokenizer, AutoModelForCausalLM
 import sacrebleu
+import pandas as pd
+
+# ------------------------------
+# Optional Google Sheets support
+# ------------------------------
+try:
+    import gspread
+    from gspread_dataframe import set_with_dataframe
+    HAS_GSPREAD = True
+except ImportError:
+    HAS_GSPREAD = False
 
 # Path to fine-tuned model
 MODEL_PATH = Path("./gemma3-1b-pt-indicdoc")
@@ -56,7 +68,6 @@ Translate this {src_lang} text to {tgt_lang}:
 # Translation
 # ------------------------------
 def translate_text(tokenizer, model, src_lang, tgt_lang, text, doc_level=False, max_new_tokens=512):
-    """Translate a single text or document"""
     prompt = build_prompt(src_lang, tgt_lang, text, doc_level)
     inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
 
@@ -69,25 +80,21 @@ def translate_text(tokenizer, model, src_lang, tgt_lang, text, doc_level=False, 
         )
 
     decoded = tokenizer.decode(outputs[0], skip_special_tokens=True)
-
-    # Extract only the translation
     if "<start_of_turn>model" in decoded:
         decoded = decoded.split("<start_of_turn>model")[-1].strip()
     if "<end_of_turn>" in decoded:
         decoded = decoded.split("<end_of_turn>")[0].strip()
-
     return decoded
 
 def batch_translate(tokenizer, model, src_lang, tgt_lang, texts, doc_level=False):
-    """Translate a list of texts"""
     return [translate_text(tokenizer, model, src_lang, tgt_lang, t, doc_level) for t in texts]
 
 # ------------------------------
 # Evaluation
 # ------------------------------
-def evaluate_model(tokenizer, model, lang_pairs, subset="dev", max_samples=200):
+def evaluate_model(tokenizer, model, lang_pairs, subset="dev", max_samples=200, export_excel=True, export_gsheet=False):
     print(f"[INFO] Starting evaluation on {subset} split...")
-    results = {}
+    results = []
 
     for pair in lang_pairs:
         src, tgt = pair.split("_")
@@ -107,7 +114,6 @@ def evaluate_model(tokenizer, model, lang_pairs, subset="dev", max_samples=200):
             ref_text = row.get("tgt_txt") or row.get("tgt_text", "")
             if not src_text or not ref_text:
                 continue
-
             pred = translate_text(tokenizer, model, src, tgt, src_text)
             preds.append(pred)
             refs.append(ref_text)
@@ -115,14 +121,34 @@ def evaluate_model(tokenizer, model, lang_pairs, subset="dev", max_samples=200):
         if preds and refs:
             bleu = sacrebleu.corpus_bleu(preds, [refs])
             chrf = sacrebleu.corpus_chrf(preds, [refs])
-            results[pair] = {"BLEU": bleu.score, "chrF2": chrf.score}
+            results.append({"pair": pair, "BLEU": bleu.score, "chrF2": chrf.score})
             print(f"  BLEU={bleu.score:.2f}, chrF2={chrf.score:.2f}")
 
+    # Save JSON
     out_path = MODEL_PATH / f"eval_results_{subset}.json"
     with open(out_path, "w", encoding="utf-8") as f:
         json.dump(results, f, indent=2, ensure_ascii=False)
+    print(f"[INFO] Saved JSON → {out_path}")
 
-    print(f"[INFO] Saved evaluation → {out_path}")
+    # Save Excel
+    if export_excel:
+        df = pd.DataFrame(results)
+        excel_path = MODEL_PATH / f"eval_results_{subset}.xlsx"
+        df.to_excel(excel_path, index=False, engine="openpyxl")
+        print(f"[INFO] Saved Excel → {excel_path}")
+
+    # Save Google Sheets
+    if export_gsheet:
+        if not HAS_GSPREAD:
+            print("[WARN] gspread not installed. Skipping Google Sheets export.")
+        else:
+            gc = gspread.service_account(filename="service_account.json")
+            sh = gc.open("Gemma3 IndicEval")  # must exist already
+            worksheet = sh.worksheet(subset) if subset in [w.title for w in sh.worksheets()] else sh.add_worksheet(title=subset, rows="100", cols="20")
+            df = pd.DataFrame(results)
+            worksheet.clear()
+            set_with_dataframe(worksheet, df)
+            print("[INFO] Saved results to Google Sheets.")
 
 # ------------------------------
 # Main demo
@@ -130,30 +156,13 @@ def evaluate_model(tokenizer, model, lang_pairs, subset="dev", max_samples=200):
 def main():
     tokenizer, model = load_model()
 
-    # Example 1: Single sentence
-    src, tgt = "eng", "ben"
+    # Quick demo
     text = "India is a diverse country."
-    out = translate_text(tokenizer, model, src, tgt, text)
-    print(f"\n[{src} → {tgt}] {text}")
-    print(f"Translation: {out}")
+    print("\n[eng → ben] Demo Translation:")
+    print(translate_text(tokenizer, model, "eng", "ben", text))
 
-    # Example 2: Batch
-    sentences = ["The weather is nice today.", "Artificial Intelligence is the future."]
-    outs = batch_translate(tokenizer, model, "eng", "hin", sentences)
-    for s, o in zip(sentences, outs):
-        print(f"\n[eng → hin] {s}")
-        print(f"Translation: {o}")
-
-    # Example 3: Document-level
-    doc = (
-        "India is a diverse country. It has many languages and cultures. "
-        "The capital city is New Delhi. Cricket is a very popular sport."
-    )
-    doc_out = translate_text(tokenizer, model, "eng", "tam", doc, doc_level=True)
-    print(f"\n[eng → tam] Document Translation:\n{doc_out}")
-
-    # 🔹 Run evaluation
-    evaluate_model(tokenizer, model, ["eng_ben", "eng_hin", "hin_eng"], subset="dev", max_samples=50)
+    # Run evaluation + export
+    evaluate_model(tokenizer, model, ["eng_ben", "eng_hin", "hin_eng"], subset="dev", max_samples=50, export_excel=True, export_gsheet=False)
 
 if __name__ == "__main__":
     main()
