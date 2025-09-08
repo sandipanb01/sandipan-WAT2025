@@ -1,19 +1,28 @@
-#!/usr/bin/env python   #EVALUATION FOR ALL LANGUAGE PAIR#
+#!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """
-eval_chrf.py  –  Compute ChrF for WAT JSONL outputs for all language pairs.
+Evaluate WAT2025 IndicDoc outputs with ChrF and BLEU.
+- Loops over all 11 pairs
+- Collects scores
+- Saves to TSV, CSV, and Excel
 """
 
 from __future__ import annotations
 import argparse, json, sys
 from pathlib import Path
-from typing import List, Dict
+from typing import List
 import pandas as pd
 
 try:
-    from sacrebleu.metrics import CHRF
+    from sacrebleu.metrics import CHRF, BLEU
 except ImportError:
     sys.exit("Please `pip install sacrebleu>=2.3` first.")
+
+# ---------------------------------------------------------------------------
+PAIRS = [
+    "eng_ben", "eng_guj", "eng_hin", "eng_kan", "eng_mal",
+    "eng_mar", "eng_ori", "eng_pan", "eng_tam", "eng_tel", "eng_urd",
+]
 
 # ---------------------------------------------------------------------------
 def _extract(line: str) -> str:
@@ -24,107 +33,55 @@ def _load(path: Path) -> List[str]:
     with path.open(encoding="utf-8") as f:
         return [_extract(ln).strip() for ln in f if ln.strip()]
 
-def evaluate_all_pairs(ref_dir: Path, hyp_dir: Path, output_file: Path):
-    """Evaluate all language pairs and save results to Excel/CSV."""
+# ---------------------------------------------------------------------------
+def evaluate_all(data_root: Path, output_root: Path, out_prefix: str):
+    scores = []
+    chrf_metric = CHRF()
+    bleu_metric = BLEU()
 
-    LANGUAGE_PAIRS = [
-        "eng_ben", "eng_guj", "eng_hin", "eng_kan", "eng_mal",
-        "eng_mar", "eng_ori", "eng_pan", "eng_tam", "eng_tel", "eng_urd",
-    ]
+    for pair in PAIRS:
+        src, tgt = pair.split("_")
+        ref_file = data_root / "dev" / pair / f"doc.{tgt}.jsonl"
+        hyp_file = output_root / f"{pair}.gemma.jsonl"
 
-    results = []
-
-    for pair in LANGUAGE_PAIRS:
-        src_lang, tgt_lang = pair.split("_")
-
-        # Reference file
-        ref_file = ref_dir / pair / f"doc.{tgt_lang}.jsonl"
-
-        # Hypothesis file (assuming naming convention)
-        hyp_file = hyp_dir / f"translations_{src_lang}_{tgt_lang}_dev.csv"
-
-        if not ref_file.exists():
-            print(f"Warning: Reference file not found: {ref_file}")
+        if not ref_file.exists() or not hyp_file.exists():
+            print(f"[!] Skipping {pair} (missing files)")
             continue
 
-        if not hyp_file.exists():
-            print(f"Warning: Hypothesis file not found: {hyp_file}")
+        refs = _load(ref_file)
+        hyps = _load(hyp_file)
+
+        if len(refs) != len(hyps):
+            print(f"[!] Length mismatch for {pair}: refs={len(refs)} vs hyps={len(hyps)}")
             continue
 
-        try:
-            # Load references
-            refs = _load(ref_file)
+        chrf = chrf_metric.corpus_score(hyps, [refs]).score
+        bleu = bleu_metric.corpus_score(hyps, [refs]).score
 
-            # Load hypotheses from CSV
-            df = pd.read_csv(hyp_file)
-            hyps = df["pred_txt"].tolist()
-
-            if len(refs) != len(hyps):
-                print(f"Warning: Length mismatch for {pair}: refs={len(refs)} vs hyps={len(hyps)}")
-                # Truncate or pad the shorter list to match the length of the longer list
-                min_len = min(len(refs), len(hyps))
-                refs = refs[:min_len]
-                hyps = hyps[:min_len]
-                print(f"Adjusted lengths to {min_len} for {pair}")
-
-
-            # Calculate ChrF score
-            score = CHRF().corpus_score(hyps, [refs]).score
-
-            results.append({
-                "language_pair": pair,
-                "chrf_score": score,
-                "num_samples": len(refs)
-            })
-
-            print(f"{pair}: ChrF = {score:.4f} (n={len(refs)})")
-
-        except Exception as e:
-            print(f"Error processing {pair}: {e}")
-            continue
+        scores.append((pair, chrf, bleu))
+        print(f"{pair}\tChrF={chrf:.4f}\tBLEU={bleu:.2f}")
 
     # Save results
-    if results:
-        df_results = pd.DataFrame(results)
-        df_results.to_excel(output_file.with_suffix(".xlsx"), index=False)
-        df_results.to_csv(output_file.with_suffix(".csv"), index=False)
-        print(f"✓ Results saved to {output_file.with_suffix('.xlsx')} and {output_file.with_suffix('.csv')}")
-    else:
-        print("No results to save")
+    df = pd.DataFrame(scores, columns=["pair", "chrf", "bleu"])
+    out_tsv = output_root / f"{out_prefix}.tsv"
+    out_csv = output_root / f"{out_prefix}.csv"
+    out_xlsx = output_root / f"{out_prefix}.xlsx"
+
+    df.to_csv(out_tsv, sep="\t", index=False)
+    df.to_csv(out_csv, index=False)
+    df.to_excel(out_xlsx, index=False)
+
+    print(f"\n✓ Results saved: {out_tsv}, {out_csv}, {out_xlsx}")
 
 # ---------------------------------------------------------------------------
-def main() -> None:
-    # Check if running in Colab and provide default args
-    if 'google.colab' in sys.modules:
-        # Define default values for Colab environment
-        default_ref_dir = Path("./pralekha_data/dev") # Example reference directory
-        default_hyp_dir = Path(".") # Example hypothesis directory (assuming CSVs are in the current directory)
-        default_output_file = Path("./evaluation_results") # Example output file path
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--data_root", default="./data", help="Root directory of Pralekha dataset")
+    ap.add_argument("--output_root", default="./outputs", help="Directory containing system outputs")
+    ap.add_argument("--out_prefix", default="scores", help="Prefix for results file")
+    args = ap.parse_args()
 
-        # Create a dummy parser to get default values
-        p = argparse.ArgumentParser()
-        p.add_argument("--ref_dir", type=Path, default=default_ref_dir)
-        p.add_argument("--hyp_dir", type=Path, default=default_hyp_dir)
-        p.add_argument("--output_file", type=Path, default=default_output_file)
-        args = p.parse_args([]) # Parse empty args to get defaults
-
-        ref_dir = args.ref_dir
-        hyp_dir = args.hyp_dir
-        output_file = args.output_file
-    else:
-        # Use argparse for command-line execution
-        ap = argparse.ArgumentParser()
-        ap.add_argument("--ref_dir", required=True, type=Path, help="Directory containing reference JSONL files")
-        ap.add_argument("--hyp_dir", required=True, type=Path, help="Directory containing hypothesis files")
-        ap.add_argument("--output_file", required=True, type=Path, help="Output file path (without extension)")
-        args = ap.parse_args()
-
-        ref_dir = args.ref_dir
-        hyp_dir = args.hyp_dir
-        output_file = args.output_file
-
-
-    evaluate_all_pairs(ref_dir, hyp_dir, output_file)
+    evaluate_all(Path(args.data_root), Path(args.output_root), args.out_prefix)
 
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
