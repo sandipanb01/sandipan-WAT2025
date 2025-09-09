@@ -44,31 +44,35 @@ def build_examples(src_texts, tgt_texts, src_label, tgt_label, few_shot):
     return selected
 
 
-def build_chat_prompt(examples, test_src, src_label, tgt_label, tokenizer):
+def build_chat_prompt(examples, test_src, src_label, tgt_label, tokenizer, system_prompt):
     """
-    Builds a chat prompt with a system instruction + few-shot examples + test input,
-    then applies Hugging Face’s chat template.
+    Places few-shot examples directly inside the system instruction,
+    then appends the test input as a user message.
     """
-    messages = [
-        {
-            "role": "system",
-            "content": f"You are a translation assistant. Translate from {src_label} to {tgt_label}. "
-                       f"Generate only the translation, nothing else."
-        }
-    ]
-
-    # Add few-shot examples
+    # Build example string
+    example_strs = []
     for s, t in examples:
-        messages.append({"role": "user", "content": f"{src_label}: {s}"})
-        messages.append({"role": "assistant", "content": f"{tgt_label}: {t}"})
+        example_strs.append(f"{src_label}: {s}\n{tgt_label}: {t}")
+    examples_block = "\n\n".join(example_strs)
 
-    # Final turn: test input for generation
-    messages.append({"role": "user", "content": f"{src_label}: {test_src}"})
+    # Final system instruction
+    sys_msg = system_prompt or (
+        f"You are a translation assistant. Translate from {src_label} to {tgt_label}. "
+        f"Generate only the translation, nothing else."
+    )
+    if examples_block:
+        sys_msg += f"\n\nHere are some examples:\n\n{examples_block}\n\nFollow this style."
+
+    # Messages: system + user
+    messages = [
+        {"role": "system", "content": sys_msg},
+        {"role": "user", "content": f"{src_label}: {test_src}"}
+    ]
 
     formatted = tokenizer.apply_chat_template(
         messages,
         tokenize=False,
-        add_generation_prompt=True  # signals model to generate the assistant response
+        add_generation_prompt=True
     )
     return formatted
 
@@ -87,6 +91,8 @@ def main():
     parser.add_argument("--chat_template", action="store_true",
                         help="Enable chat formatting using tokenizer.apply_chat_template")
     parser.add_argument("--model", help="Required to load tokenizer when using chat_template")
+    parser.add_argument("--system_prompt",
+                        help="Custom system instruction (default is translation-focused)")
     args = parser.parse_args()
 
     if args.few_shot < 0:
@@ -116,9 +122,10 @@ def main():
             test_src = _extract_text(test_line).strip()
 
             if args.chat_template:
-                prompt = build_chat_prompt(examples, test_src, src_label, tgt_label, tokenizer)
+                prompt = build_chat_prompt(examples, test_src, src_label, tgt_label, tokenizer, args.system_prompt)
                 fout.write(json.dumps(prompt, ensure_ascii=False) + "\n")
             else:
+                # Non-chat baseline mode
                 parts = []
                 for s, t in examples:
                     parts.append(f"{src_label}: {s}\n\n{tgt_label}: {t}")
