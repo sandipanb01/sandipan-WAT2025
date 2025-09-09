@@ -1,54 +1,56 @@
 #!/usr/bin/env python
-# inference_all_pairs_vllm.py
+# inference_vllm_chat_multiturn.py
 import argparse
 import json
-import sys
 import os
-from tqdm import tqdm
 from pathlib import Path
-import torch
+from tqdm import tqdm
 from transformers import AutoTokenizer
 
-def parse_args(args=None):
+def parse_args():
     p = argparse.ArgumentParser()
+    p.add_argument("--input_file", required=True)
+    p.add_argument("--output_file", required=True)
     p.add_argument("--model", required=True,
-                   help="HF repo path or local dir; e.g. google/gemma-3-1b-it")
-    p.add_argument("--max_new_tokens", type=int, default=4096)  # Increased for document-level translation
+                   help="HF repo path or local dir; e.g. meta-llama/Llama-3.1-8B")
+    p.add_argument("--max_new_tokens", type=int, default=256)
     p.add_argument("--sampling", action="store_true")
     p.add_argument("--temperature", type=float, default=0.7)
     p.add_argument("--top_p", type=float, default=0.9)
     p.add_argument("--batch_size", type=int, default=4)
-    p.add_argument("--model_type", choices=["pretrained", "instruction_tuned"], default="instruction_tuned",
-                   help="Type of model: 'pretrained' for base models, 'instruction_tuned' for chat models")
-    p.add_argument("--test_root", required=True,
-                   help="Root folder for Pralekha test set, e.g. /content/pralekha_data/test")
-    p.add_argument("--out_root", required=True,
-                   help="Root folder for saving outputs, e.g. /content/pralekha_data/vllm_outputs")
-    return p.parse_args(args=args)
+    return p.parse_args()
 
 def load_prompts(path):
+    """
+    Expects each line to be either:
+      - a string (single user prompt)
+      - a JSON object like {"messages":[{"role":"user","content":"..."}, ...]}
+    """
     for line in Path(path).read_text(encoding="utf-8").splitlines():
         line = line.strip()
-        if not line: 
+        if not line:
             continue
-        obj = json.loads(line) if line[0] in "{[" else {"prompt": line}
-        if isinstance(obj, list):
-            yield obj[0]
-        else:
-            yield obj["prompt"]
+        try:
+            obj = json.loads(line)
+            if isinstance(obj, dict) and "messages" in obj:
+                yield obj["messages"]
+            else:
+                yield [{"role": "user", "content": line}]
+        except json.JSONDecodeError:
+            yield [{"role": "user", "content": line}]
 
 def build_generator(args):
     from vllm import LLM, SamplingParams
-
-    print(f"Initializing vLLM for model: {args.model} ({args.model_type})")
+    
+    print(f"Initializing vLLM for model: {args.model}")
     llm = LLM(
         model=args.model,
         tensor_parallel_size=1,
-        dtype="float16",
+        dtype="bfloat16",
         trust_remote_code=True,
         gpu_memory_utilization=0.85,
     )
-
+    
     sampling_params = SamplingParams(
         max_tokens=args.max_new_tokens,
         temperature=args.temperature if args.sampling else 0.0,
@@ -58,100 +60,45 @@ def build_generator(args):
 
     tokenizer = AutoTokenizer.from_pretrained(args.model)
 
-    def generate(prompts, tokenizer):
-        if args.model_type == "instruction_tuned":
-            formatted = []
-            for prompt_text in prompts:
-                messages = [{"role": "user", "content": prompt_text}]
-                template_text = tokenizer.apply_chat_template(
-                    messages,
-                    tokenize=False,
-                    add_generation_prompt=True
-                )
-                formatted.append(template_text)
-            outputs = llm.generate(formatted, sampling_params)
-        else:
-            outputs = llm.generate(prompts, sampling_params)
-
-        return [{"generated_text": out.outputs[0].text.strip()} for out in outputs]
+    def generate(batch_messages, tokenizer):
+        # batch_messages is a list of lists of {"role":..., "content":...} messages
+        chat_prompts = [
+            tokenizer.apply_chat_template(
+                messages=messages,
+                add_generation_prompt=True,
+                tokenize=False
+            )
+            for messages in batch_messages
+        ]
+        outputs = llm.generate(chat_prompts, sampling_params)
+        return [
+            {"generated_text": output.outputs[0].text}
+            for output in outputs
+        ]
 
     return generate, tokenizer
 
-def run_inference(args, lang_pair, direction):
-    # Input file path
-    test_file = os.path.join(args.test_root, lang_pair, f"doc.{direction}.jsonl")
-    if not os.path.exists(test_file):
-        print(f"Skipping {direction}: {test_file} not found")
-        return
-
-    # Output file path
-    os.makedirs(os.path.join(args.out_root, lang_pair), exist_ok=True)
-    out_file = os.path.join(
-        args.out_root, lang_pair,
-        f"doc.{direction}.vllm.{Path(args.model).name}.{args.model_type}.jsonl"
-    )
-
-    prompts = list(load_prompts(test_file))
-    print(f"[{direction}] Loaded {len(prompts)} prompts.")
-
+def main():
+    args = parse_args()
+    prompts = list(load_prompts(args.input_file))
+    print(f"Loaded {len(prompts)} prompts.")
+    
+    os.makedirs(os.path.dirname(args.output_file), exist_ok=True)
+    
     gen_fn, tokenizer = build_generator(args)
-
-    with open(out_file, "w", encoding="utf-8") as fout:
-        for i in tqdm(range(0, len(prompts), args.batch_size), desc=f"Generating {direction}"):
+    print(f"Starting batched inference with vLLM (batch size: {args.batch_size})...")
+    
+    with open(args.output_file, "w", encoding="utf-8") as fout:
+        for i in tqdm(range(0, len(prompts), args.batch_size), desc="Generating"):
             batch_prompts = prompts[i:i + args.batch_size]
             batch_outputs = gen_fn(batch_prompts, tokenizer)
-
+            
             for output in batch_outputs:
-                generation = output["generated_text"]
+                generation = output["generated_text"].strip()
                 fout.write(json.dumps([generation], ensure_ascii=False) + "\n")
             fout.flush()
 
-    print(f"[{direction}] Saved outputs to {out_file}")
-
-def main(args=None):
-    args = parse_args(args=args)
-
-    # All Pralekha doc-level language pairs
-    lang_pairs = {
-        "eng_ben": ["eng_2_ben", "ben_2_eng"],
-        "eng_guj": ["eng_2_guj", "guj_2_eng"],
-        "eng_hin": ["eng_2_hin", "hin_2_eng"],
-        "eng_mar": ["eng_2_mar", "mar_2_eng"],
-        "eng_mal": ["eng_2_mal", "mal_2_eng"],
-        "eng_ory": ["eng_2_ory", "ory_2_eng"],
-        "eng_pan": ["eng_2_pan", "pan_2_eng"],
-        "eng_tam": ["eng_2_tam", "tam_2_eng"],
-        "eng_tel": ["eng_2_tel", "tel_2_eng"],
-        "eng_urd": ["eng_2_urd", "urd_2_eng"],
-    }
-
-    for lang_pair, directions in lang_pairs.items():
-        for direction in directions:
-            run_inference(args, lang_pair, direction)
+    print("vLLM multi-turn chat inference completed successfully.")
 
 if __name__ == "__main__":
-    # Example: instruction-tuned
-    colab_args_instruct = [
-        "--model", "google/gemma-3-1b-it",
-        "--model_type", "instruction_tuned",
-        "--max_new_tokens", "4096",
-        "--batch_size", "4",
-        "--test_root", "/content/pralekha_data/test",
-        "--out_root", "/content/pralekha_data/vllm_outputs"
-    ]
-
-    # Example: pretrained
-    colab_args_pretrained = [
-        "--model", "google/gemma-3-1b-pt",
-        "--model_type", "pretrained",
-        "--max_new_tokens", "4096",
-        "--batch_size", "4",
-        "--test_root", "/content/pralekha_data/test",
-        "--out_root", "/content/pralekha_data/vllm_outputs"
-    ]
-
-    print("=== Running inference for Gemma 3-1B instruction-tuned model ===")
-    main(args=colab_args_instruct)
-
-    print("=== Running inference for Gemma 3-1B pretrained model ===")
-    main(args=colab_args_pretrained)
+    main()
