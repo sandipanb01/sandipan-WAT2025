@@ -46,13 +46,22 @@ def build_examples(src_texts, tgt_texts, src_label, tgt_label, few_shot):
 
 def build_chat_prompt(examples, test_src, src_label, tgt_label, tokenizer):
     """
-    Combines few-shot examples and the test input into a single list of chat messages,
-    then applies Hugging Face’s `apply_chat_template` with add_generation_prompt.
+    Builds a chat prompt with a system instruction + few-shot examples + test input,
+    then applies Hugging Face’s chat template.
     """
-    messages = []
+    messages = [
+        {
+            "role": "system",
+            "content": f"You are a translation assistant. Translate from {src_label} to {tgt_label}. "
+                       f"Generate only the translation, nothing else."
+        }
+    ]
+
+    # Add few-shot examples
     for s, t in examples:
         messages.append({"role": "user", "content": f"{src_label}: {s}"})
         messages.append({"role": "assistant", "content": f"{tgt_label}: {t}"})
+
     # Final turn: test input for generation
     messages.append({"role": "user", "content": f"{src_label}: {test_src}"})
 
