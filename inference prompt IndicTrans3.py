@@ -1,90 +1,128 @@
 #!/usr/bin/env python
 # inference_indictrans3.py
-"""
-Run inference for IndicTrans3 using generated prompts.
-Saves output translations to JSONL.
-"""
 
 import argparse
 import json
 from pathlib import Path
 from tqdm import tqdm
+from vllm import LLM, SamplingParams
 from transformers import AutoTokenizer
 
-def load_prompts(path):
-    """Load prompts from JSONL."""
-    if not Path(path).exists():
-        raise FileNotFoundError(f"Input prompt file not found: {path}")
+
+# -------------------------------
+# Utility: Build chat-style prompt
+# -------------------------------
+def build_prompt(src_text: str, src_lang: str, tgt_lang: str):
+    """Builds chat-style prompts for IndicTrans3 using HF chat template."""
+    # System instruction
+    system_msg = (
+        f"You are a translation model. Translate the following text "
+        f"from {src_lang} to {tgt_lang}."
+    )
+
+    # Chat message format
+    messages = [
+        {"role": "system", "content": system_msg},
+        {"role": "user", "content": src_text},
+    ]
+    return messages
+
+
+# -------------------------------
+# Load prompts from file
+# -------------------------------
+def load_prompts(path: Path):
+    """Load prompts from JSONL file. Each line is a dict with src_text, src_lang, tgt_lang."""
+    prompts = []
     with open(path, "r", encoding="utf-8") as f:
-        lines = [json.loads(line) for line in f if line.strip()]
-    return lines
+        for line in f:
+            entry = json.loads(line.strip())
+            prompts.append(entry)
+    return prompts
 
-def save_jsonl(lines, path):
-    path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", encoding="utf-8") as f:
-        for line in lines:
-            f.write(json.dumps(line, ensure_ascii=False) + "\n")
 
-def build_generator(model_name, max_new_tokens=4096, sampling=True, temperature=0.7, top_p=0.9):
-    """Initialize vLLM generator and tokenizer."""
-    from vllm import LLM, SamplingParams
+# -------------------------------
+# Save translations
+# -------------------------------
+def save_outputs(outputs, path: Path):
+    with open(path, "w", encoding="utf-8") as f:
+        for out in outputs:
+            f.write(json.dumps(out, ensure_ascii=False) + "\n")
 
-    llm = LLM(
-        model=model_name,
-        tensor_parallel_size=1,
-        dtype="bfloat16",
-        trust_remote_code=True,
-        gpu_memory_utilization=0.85,
-    )
 
+# -------------------------------
+# Main inference function
+# -------------------------------
+def run_inference(model_name, input_file, output_file, max_new_tokens=4096):
+    # Load tokenizer
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
+
+    # Init vLLM
+    llm = LLM(model=model_name, trust_remote_code=True)
+
+    # Sampling params
     sampling_params = SamplingParams(
+        temperature=0.0,
+        top_p=1.0,
         max_tokens=max_new_tokens,
-        temperature=temperature if sampling else 0.0,
-        top_p=top_p if sampling else 1.0,
-        stop=["\n\n"],
     )
 
-    tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
+    # Load prompts
+    data = load_prompts(Path(input_file))
 
-    def generate(batch_prompts):
-        outputs = llm.generate(batch_prompts, sampling_params)
-        return [output.outputs[0].text.strip() for output in outputs]
+    # Format prompts using chat template
+    formatted_prompts = []
+    for item in data:
+        src_text = item["src_text"]
+        src_lang = item["src_lang"]
+        tgt_lang = item["tgt_lang"]
 
-    return generate, tokenizer
+        messages = build_prompt(src_text, src_lang, tgt_lang)
+        formatted_prompt = tokenizer.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True
+        )
+        formatted_prompts.append(
+            {"id": item.get("id", None), "prompt": formatted_prompt}
+        )
 
-def main(args=None): # Modified to accept args
-    parser = argparse.ArgumentParser(description="IndicTrans3 inference")
-    parser.add_argument("--input_file", required=True, help="JSONL file of prompts")
-    parser.add_argument("--output_file", required=True, help="Output JSONL file of translations")
-    parser.add_argument("--model", default="ai4bharat/IndicTrans3-beta", help="HF model name")
-    parser.add_argument("--batch_size", type=int, default=2)
-    parser.add_argument("--max_new_tokens", type=int, default=4096)
-    parser.add_argument("--sampling", action="store_true")
+    # Run inference
+    texts = [x["prompt"] for x in formatted_prompts]
+    outputs = llm.generate(texts, sampling_params)
+
+    # Collect results
+    results = []
+    for inp, out in zip(formatted_prompts, outputs):
+        translation = out.outputs[0].text.strip()
+        results.append(
+            {
+                "id": inp["id"],
+                "prompt": inp["prompt"],
+                "translation": translation,
+            }
+        )
+
+    # Save
+    save_outputs(results, Path(output_file))
+    print(f"✅ Saved {len(results)} translations to {output_file}")
+
+
+# -------------------------------
+# CLI entrypoint
+# -------------------------------
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--model_name", type=str, required=True,
+                        help="Path or name of IndicTrans3 model")
+    parser.add_argument("--input_file", type=str, required=True,
+                        help="Path to JSONL prompts file")
+    parser.add_argument("--output_file", type=str, required=True,
+                        help="Where to save translations")
+    parser.add_argument("--max_new_tokens", type=int, default=4096,
+                        help="Max tokens for generation")
     args = parser.parse_args()
 
-    prompts = load_prompts(args.input_file)
-    print(f"Loaded {len(prompts)} prompts.")
+    run_inference(args.model_name, args.input_file, args.output_file, args.max_new_tokens)
 
-    gen_fn, _ = build_generator(args.model, args.max_new_tokens, args.sampling)
-
-    translations = []
-    for i in tqdm(range(0, len(prompts), args.batch_size), desc="Generating"):
-        batch_prompts = prompts[i:i + args.batch_size]
-        batch_outputs = gen_fn(batch_prompts)
-        translations.extend(batch_outputs)
-
-    save_jsonl(translations, args.output_file)
-    print(f"✓ Translations saved to {args.output_file} ({len(translations)} docs)")
 
 if __name__ == "__main__":
-    # Example of how to run in Colab by passing arguments as a list
-    # Replace placeholder values with actual file paths and language codes
-    main(args=[
-        '--input_file', '/content/pralekha_data/dev/eng_hin/doc.eng_2_hin.0.prompts.jsonl', # Replace with your input prompt file
-        '--output_file', '/content/pralekha_data/dev/eng_hin/doc.eng_2_hin.translations.jsonl', # Replace with your desired output file
-        '--model', 'ai4bharat/IndicTrans3-beta', # Model to use
-        '--max_new_tokens', '4096',
-        '--batch_size', '2',
-        '--sampling'
-    ])
+    main()
