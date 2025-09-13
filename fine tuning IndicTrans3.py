@@ -164,7 +164,4 @@ def train_indictrans3(
 
     print("[INFO] ✅ Training finished!")
 
-# ------------------------------
-# Example usage in Colab
-# ------------------------------
-# train_indictrans3(max_train_samples=500)  # limit samples for quick Colab test
+
