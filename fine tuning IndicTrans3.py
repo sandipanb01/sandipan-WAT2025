@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """
-Colab-friendly IndicTrans3 doc-level fine-tuning with LoRA (Seq2SeqLM)
+IndicTrans3 doc-level fine-tuning with LoRA (Seq2SeqLM)
 - Works with all English ↔ Indic language pairs in Pralekha
 - Doc-level packing (≤4096 tokens)
 - Trainer API style using Hugging Face + PEFT
