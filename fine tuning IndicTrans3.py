@@ -1,178 +1,163 @@
 #!/usr/bin/env python
-# -*- coding: utf-8 -*-
 """
-IndicTrans3 doc-level fine-tuning with LoRA (Trainer API)
-- Works for all English ↔ Indic Pralekha pairs
+IndicTrans3-beta Doc-level Fine-tuning with LoRA (4-bit)
+- Uses Pralekha dataset (train/dev)
+- Forward and reverse translation
+- Hugging Face apply_chat_template prompts
+- Causal LM
+- Supports 4-bit quantization
 """
 
-import os, json
-from pathlib import Path
-from typing import List, Dict
+import os, sys
 import torch
+from pathlib import Path
 from datasets import load_dataset, Dataset
 from transformers import (
     AutoTokenizer,
-    AutoModelForSeq2SeqLM,
+    AutoModelForCausalLM,
     TrainingArguments,
-    DataCollatorForSeq2Seq,
-    Seq2SeqTrainer
+    DataCollatorForLanguageModeling,
+    BitsAndBytesConfig
 )
 from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
+from trl import SFTTrainer
 
 # ------------------------------
 # Config
 # ------------------------------
 MODEL_NAME = "ai4bharat/IndicTrans3-beta"
-OUTPUT_DIR = Path("./indictrans3-lora-finetuned")
-LANGUAGE_PAIRS = [
-    "eng_ben", "eng_guj", "eng_hin", "eng_kan", "eng_mal",
-    "eng_mar", "eng_ori", "eng_pan", "eng_tam", "eng_tel", "eng_urd",
-    "ben_eng", "hin_eng", "tam_eng", "urd_eng"
+OUTPUT_DIR = Path("./indictrans3-beta-finetuned")
+FORWARD_PAIRS = [
+    "eng_ben","eng_guj","eng_hin","eng_kan","eng_mal",
+    "eng_mar","eng_ori","eng_pan","eng_tam","eng_tel","eng_urd"
 ]
 MAX_SEQ_LEN = 4096
+PER_DEVICE_BATCH = 1
+GRAD_ACCUM = 8
+EPOCHS = 2
+USE_4BIT = True
+PRALEKHA_CONFIG = "train"  # valid config: alignable/dev/test/train/unalignable
 
 # ------------------------------
-# Utility functions
+# Helper functions
 # ------------------------------
-def build_translation_prompt(src_lang: str, tgt_lang: str, text: str) -> str:
-    """Wraps input into chat-style template for IndicTrans3"""
-    messages = [
-        {"role": "system", "content": f"You are a helpful translation assistant."},
-        {"role": "user", "content": f"Translate this {src_lang} document to {tgt_lang}:\n{text}"}
-    ]
-    return messages
+def build_chat_prompt(src_text, tgt_text, src_lang, tgt_lang):
+    """HuggingFace apply_chat_template style prompt"""
+    return f"""<start_of_turn>user
+Translate this {src_lang} text to {tgt_lang}:
+{src_text}<end_of_turn>
+<start_of_turn>model
+{tgt_text}<end_of_turn>"""
 
-def prepare_dataset(pair: str, split="train", max_samples=None, tokenizer=None):
-    """Load Pralekha and convert to chat-style prompts"""
-    src, tgt = pair.split("_")
-    try:
-        ds = load_dataset("ai4bharat/Pralekha", f"{src}_{tgt}", split=split)
-    except Exception as e:
-        print(f"[WARN] Could not load {pair}: {e}")
-        return []
-
+def load_pralekha_filtered(pair, max_samples=None):
+    """Load Pralekha and filter by language pair"""
+    src_lang, tgt_lang = pair.split("_")
+    ds = load_dataset("ai4bharat/Pralekha", PRALEKHA_CONFIG, streaming=False)
+    # Filter rows matching the source and target languages
+    filtered = [r for r in ds if r["src_lang"]==src_lang and r["tgt_lang"]==tgt_lang]
     if max_samples:
-        ds = ds.select(range(min(max_samples, len(ds))))
+        filtered = filtered[:max_samples]
+    return filtered
 
-    samples = []
-    for row in ds:
-        src_text = row.get("src_txt") or row.get("src_text", "")
-        tgt_text = row.get("tgt_txt") or row.get("tgt_text", "")
-        if not src_text or not tgt_text:
-            continue
-
-        # Build HF chat template prompt
-        messages = build_translation_prompt(src, tgt, src_text)
-        prompt = tokenizer.apply_chat_template(messages, tokenize=False)
-
-        samples.append({
-            "input_text": prompt,
-            "target_text": tgt_text
-        })
-    return samples
+def prepare_training_data(tokenizer, lang_pairs, max_samples=None):
+    all_data = []
+    for pair in lang_pairs:
+        ds = load_pralekha_filtered(pair, max_samples)
+        src_lang, tgt_lang = pair.split("_")
+        for row in ds:
+            src_text = row.get("src_txt") or row.get("src_text") or ""
+            tgt_text = row.get("tgt_txt") or row.get("tgt_text") or ""
+            if not src_text or not tgt_text:
+                continue
+            # Forward
+            prompt_text = build_chat_prompt(src_text, tgt_text, src_lang, tgt_lang)
+            ids = tokenizer(prompt_text, truncation=True, max_length=MAX_SEQ_LEN).input_ids
+            all_data.append({"input_ids": ids, "labels": ids})
+            # Reverse
+            rev_prompt = build_chat_prompt(tgt_text, src_text, tgt_lang, src_lang)
+            rev_ids = tokenizer(rev_prompt, truncation=True, max_length=MAX_SEQ_LEN).input_ids
+            all_data.append({"input_ids": rev_ids, "labels": rev_ids})
+    return Dataset.from_list(all_data)
 
 # ------------------------------
-# Training function
+# Main
 # ------------------------------
-def train_indictrans3(
-    model_name=MODEL_NAME,
-    output_dir=OUTPUT_DIR,
-    language_pairs=LANGUAGE_PAIRS,
-    max_seq_len=MAX_SEQ_LEN,
-    max_train_samples=None
-):
+def main():
     print("[INFO] Loading tokenizer + model...")
-    tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
-    tokenizer.padding_side = "right"
+    tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
     tokenizer.pad_token = tokenizer.eos_token
+    tokenizer.padding_side = "right"
 
-    model = AutoModelForSeq2SeqLM.from_pretrained(
-        model_name,
+    compute_dtype = torch.float16 if torch.cuda.is_available() else torch.float32
+    if USE_4BIT and torch.cuda.is_available():
+        quant_config = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_compute_dtype=compute_dtype,
+            bnb_4bit_quant_type="nf4",
+            bnb_4bit_use_double_quant=True
+        )
+    else:
+        quant_config = None
+
+    model = AutoModelForCausalLM.from_pretrained(
+        MODEL_NAME,
         device_map="auto",
-        trust_remote_code=True
+        trust_remote_code=True,
+        quantization_config=quant_config
     )
+
     model = prepare_model_for_kbit_training(model)
 
-    # LoRA config
     lora_config = LoraConfig(
         r=8,
         lora_alpha=16,
-        target_modules=["q_proj", "v_proj", "k_proj", "o_proj"],
+        target_modules=["q_proj","v_proj","k_proj","o_proj"],
         lora_dropout=0.05,
-        task_type="SEQ_2_SEQ_LM"
+        bias="none",
+        task_type="CAUSAL_LM"
     )
     model = get_peft_model(model, lora_config)
     model.print_trainable_parameters()
 
-    # Load data across pairs
-    all_train_data = []
-    for pair in language_pairs:
-        print(f"[INFO] Loading {pair}...")
-        pair_data = prepare_dataset(pair, "train", max_train_samples, tokenizer)
-        all_train_data.extend(pair_data)
-        print(f"  Added {len(pair_data)} samples")
+    print("[INFO] Preparing training data...")
+    train_dataset = prepare_training_data(tokenizer, FORWARD_PAIRS, max_samples=500)
+    print(f"[INFO] Training samples: {len(train_dataset)}")
 
-    if not all_train_data:
-        raise ValueError("No training data loaded! Check dataset paths.")
-
-    train_dataset = Dataset.from_list(all_train_data)
-
-    # Tokenization fn
-    def tokenize_fn(batch):
-        model_inputs = tokenizer(
-            batch["input_text"],
-            max_length=max_seq_len,
-            truncation=True,
-            padding="max_length"
-        )
-        labels = tokenizer(
-            batch["target_text"],
-            max_length=max_seq_len,
-            truncation=True,
-            padding="max_length"
-        )
-        model_inputs["labels"] = labels["input_ids"]
-        return model_inputs
-
-    train_dataset = train_dataset.map(tokenize_fn, batched=True, remove_columns=["input_text", "target_text"])
-
-    data_collator = DataCollatorForSeq2Seq(tokenizer, return_tensors="pt")
-
-    # Trainer args
     training_args = TrainingArguments(
-        output_dir=str(output_dir),
-        per_device_train_batch_size=1,
-        gradient_accumulation_steps=8,
+        output_dir=str(OUTPUT_DIR),
+        per_device_train_batch_size=PER_DEVICE_BATCH,
+        gradient_accumulation_steps=GRAD_ACCUM,
         learning_rate=2e-4,
-        num_train_epochs=2,
-        save_strategy="epoch",
+        num_train_epochs=EPOCHS,
         logging_steps=50,
-        fp16=False,  # IndicTrans3 (Gemma3 backend) unstable in fp16
-        bf16=torch.cuda.is_bf16_supported(),
+        save_strategy="epoch",
+        evaluation_strategy="no",
+        fp16=(compute_dtype==torch.float16),
+        bf16=False,
+        optim="paged_adamw_8bit" if USE_4BIT else "adamw_torch",
         max_grad_norm=0.3,
-        optim="paged_adamw_8bit",
-        dataloader_pin_memory=False,
-        remove_unused_columns=False
+        report_to="none",
+        run_name="indictrans3-beta-lora",
     )
 
-    trainer = Seq2SeqTrainer(
+    trainer = SFTTrainer(
         model=model,
-        tokenizer=tokenizer,
+        args=training_args,
         train_dataset=train_dataset,
-        data_collator=data_collator,
-        args=training_args
+        tokenizer=tokenizer,
+        max_seq_length=MAX_SEQ_LEN,
+        packing=False,
+        data_collator=DataCollatorForLanguageModeling(tokenizer, mlm=False)
     )
 
     print("[INFO] Starting training...")
     trainer.train()
 
-    print("[INFO] Saving model...")
+    print("[INFO] Saving model + tokenizer + LoRA adapter...")
     trainer.save_model()
-    tokenizer.save_pretrained(output_dir)
+    tokenizer.save_pretrained(OUTPUT_DIR)
+    model.save_pretrained(OUTPUT_DIR)
+    print("[INFO] Fine-tuning complete!")
 
-    print("[INFO] ✅ Training finished!")
-
-# ------------------------------
-# Example usage in Colab
-# ------------------------------
-# train_indictrans3(max_train_samples=500)
+if __name__ == "__main__":
+    main()
