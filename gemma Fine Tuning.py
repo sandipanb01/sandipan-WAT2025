@@ -1,16 +1,28 @@
+# Colab guaranteed setup for bitsandbytes + 4-bit LoRA fine-tuning
+!pip uninstall -y bitsandbytes
+!pip install -U bitsandbytes
+!pip install -U transformers trl accelerate datasets sacrebleu
+
+# Restart the runtime after this to ensure Colab uses the latest bitsandbytes
+#import os
+#os.kill(os.getpid(), 9)  # forces runtime restart
 #!/usr/bin/env python
 """
-Gemma-3 doc-level fine-tuning with LoRA (4-bit) using TRL >=0.9
-- Uses Pralekha dataset (train/dev)
-- Supports Eng→Indic and reverse Indic→Eng by flipping data
+Gemma-3 doc-level fine-tuning (LoRA + 4-bit quantization) on Pralekha dataset
+- Handles Eng->Indic and Indic->Eng
 - Doc-level translation (max_new_tokens=4096)
-- Hugging Face apply_chat_template style prompts
-- Auto-dtype for 4-bit quantization (float16 / bfloat16)
+- Hugging Face chat template prompts
+- Gradient checkpointing + sequence packing for long docs
 """
 
+# ------------------------------
+# Install required packages
+# ------------------------------
+!pip install -q --upgrade transformers trl sacrebleu datasets bitsandbytes accelerate
+
 import os, sys, json
-import torch
 from pathlib import Path
+import torch
 from datasets import load_dataset, Dataset
 from transformers import (
     AutoTokenizer,
@@ -38,63 +50,48 @@ EVAL_SPLIT = "dev"
 EVAL_SAMPLES = 200
 
 # ------------------------------
-# Utility & Builder Functions
+# Utility Functions
 # ------------------------------
-def build_chat_prompt(src_text, tgt_text, src_lang, tgt_lang):
-    return f"""<start_of_turn>user
-Translate this {src_lang} text to {tgt_lang}:
-{src_text}<end_of_turn>
-<start_of_turn>model
-{tgt_text}<end_of_turn>"""
-
-def load_doc_level_dataset(pair, tokenizer, subset=TRAIN_SPLIT, max_samples=None, reverse=False):
-    src, tgt = pair.split("_")
+def build_chat_prompt(tokenizer, src_text, tgt_text, src_lang, tgt_lang):
+    """
+    Returns tokenized input using Hugging Face chat-style template
+    """
+    messages = [
+        {"role": "user", "content": f"Translate this {src_lang} text to {tgt_lang}:\n{src_text}"},
+        {"role": "assistant", "content": tgt_text}
+    ]
+    # Using tokenizer’s chat template method
     try:
-        ds = load_dataset("ai4bharat/Pralekha", subset, split=f"{src}_{tgt}")
-    except Exception as e:
-        print(f"[WARN] Could not load {pair}: {e}")
-        return []
+        return tokenizer.apply_chat_template(messages, padding=True, return_tensors="pt")
+    except AttributeError:
+        # fallback if tokenizer does not support apply_chat_template
+        prompt = f"<start_of_turn>user\nTranslate this {src_lang} text to {tgt_lang}:\n{src_text}<end_of_turn>\n<start_of_turn>model\n{tgt_text}<end_of_turn>"
+        return tokenizer(prompt, return_tensors="pt", padding=True, truncation=True)
 
+def load_dataset_for_pair(pair, subset=TRAIN_SPLIT, max_samples=None, reverse=False):
+    src, tgt = pair.split("_")
+    ds = load_dataset("ai4bharat/Pralekha", subset, split=f"{src}_{tgt}")
     if max_samples:
         ds = ds.select(range(min(max_samples, len(ds))))
-
-    docs = []
-    src_buf, tgt_buf = [], []
+    examples = []
     for row in ds:
         src_text = row.get("src_txt") or row.get("src_text", "")
         tgt_text = row.get("tgt_txt") or row.get("tgt_text", "")
-        if not src_text or not tgt_text:
-            continue
+        if src_text and tgt_text:
+            if reverse:
+                src_text, tgt_text = tgt_text, src_text
+                src, tgt = tgt, src
+            examples.append({"src": src_text, "tgt": tgt_text, "src_lang": src, "tgt_lang": tgt})
+    return examples
 
-        if reverse:
-            src_text, tgt_text = tgt_text, src_text
-            src, tgt = tgt, src
-
-        src_buf.append(src_text)
-        tgt_buf.append(tgt_text)
-        token_count = len(tokenizer(" ".join(src_buf)).input_ids)
-
-        if token_count > (MAX_SEQ_LEN - 200):
-            docs.append({"text": build_chat_prompt(" ".join(src_buf), " ".join(tgt_buf), src, tgt)})
-            src_buf, tgt_buf = [], []
-
-    if src_buf and tgt_buf:
-        docs.append({"text": build_chat_prompt(" ".join(src_buf), " ".join(tgt_buf), src, tgt)})
-
-    return docs
-
-def load_all_training_data(tokenizer, max_samples=None):
+def load_all_training_data(max_samples=None):
     all_data = []
     for pair in FORWARD_PAIRS:
-        print(f"[INFO] Loading {pair} forward...")
-        forward_data = load_doc_level_dataset(pair, tokenizer, TRAIN_SPLIT, max_samples)
-        all_data.extend(forward_data)
-
-        print(f"[INFO] Creating reverse {pair}...")
-        reverse_data = load_doc_level_dataset(pair, tokenizer, TRAIN_SPLIT, max_samples, reverse=True)
-        all_data.extend(reverse_data)
-
-        print(f"  Added {len(forward_data)} forward + {len(reverse_data)} reverse doc-level samples")
+        # Forward: Eng -> Indic
+        all_data.extend(load_dataset_for_pair(pair, TRAIN_SPLIT, max_samples, reverse=False))
+        # Reverse: Indic -> Eng
+        all_data.extend(load_dataset_for_pair(pair, TRAIN_SPLIT, max_samples, reverse=True))
+    print(f"[INFO] Total training examples: {len(all_data)}")
     return all_data
 
 # ------------------------------
@@ -107,13 +104,9 @@ def evaluate_model(model_path, tokenizer, subset=EVAL_SPLIT, max_samples=EVAL_SA
     for pair in FORWARD_PAIRS:
         for reverse in [False, True]:
             src, tgt = pair.split("_")
-            if reverse:
-                src, tgt = tgt, src
-                pair_name = f"{tgt}_{src}"
-            else:
-                pair_name = pair
+            pair_name = f"{src}_{tgt}" if not reverse else f"{tgt}_{src}"
             try:
-                ds = load_dataset("ai4bharat/Pralekha", subset, split=f"{pair}")
+                ds = load_dataset("ai4bharat/Pralekha", subset, split=f"{src}_{tgt}")
             except Exception as e:
                 print(f"[WARN] Skipping {pair_name}: {e}")
                 continue
@@ -124,29 +117,28 @@ def evaluate_model(model_path, tokenizer, subset=EVAL_SPLIT, max_samples=EVAL_SA
                 tgt_text = row.get("tgt_txt") or row.get("tgt_text", "")
                 if reverse:
                     src_text, tgt_text = tgt_text, src_text
-                prompt = f"<start_of_turn>user\nTranslate this {src} text to {tgt}:\n{src_text}<end_of_turn>\n<start_of_turn>model"
-                inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
+                    src, tgt = tgt, src
+                inputs = build_chat_prompt(tokenizer, src_text, "", src, tgt).to(model.device)
                 outputs = model.generate(**inputs, max_new_tokens=MAX_SEQ_LEN)
                 decoded = tokenizer.decode(outputs[0], skip_special_tokens=True)
                 if "<start_of_turn>model" in decoded:
                     decoded = decoded.split("<start_of_turn>model")[-1].strip()
                 if "<end_of_turn>" in decoded:
                     decoded = decoded.split("<end_of_turn>")[0].strip()
-                preds.append(decoded)
-                refs.append(tgt_text)
+                preds.append(decoded.strip())
+                refs.append(tgt_text.strip())
             if preds and refs:
                 bleu = sacrebleu.corpus_bleu(preds, [refs])
                 chrf = sacrebleu.corpus_chrf(preds, [refs])
                 results[pair_name] = {"BLEU": bleu.score, "chrF2": chrf.score}
                 print(f"  {pair_name} BLEU={bleu.score:.2f}, chrF2={chrf.score:.2f}")
-
     out_path = Path(model_path)/"eval_results.json"
     with open(out_path, "w", encoding="utf-8") as f:
         json.dump(results, f, indent=2, ensure_ascii=False)
     print(f"[INFO] Saved evaluation results → {out_path}")
 
 # ------------------------------
-# Main training flow
+# Main Training
 # ------------------------------
 def main():
     print("[INFO] Loading tokenizer...")
@@ -154,16 +146,8 @@ def main():
     tokenizer.pad_token = tokenizer.eos_token
     tokenizer.padding_side = "right"
 
-    # Auto dtype for 4-bit quantization
-    if torch.cuda.is_available():
-        major, _ = torch.cuda.get_device_capability()
-        compute_dtype = torch.bfloat16 if major >= 8 else torch.float16
-        print(f"[INFO] Using dtype: {compute_dtype}")
-    else:
-        compute_dtype = torch.float32
-        print("[WARN] CUDA not available. Training on CPU will be very slow.")
+    compute_dtype = torch.bfloat16 if torch.cuda.is_available() else torch.float32
 
-    # BitsAndBytes 4-bit config
     bnb_config = BitsAndBytesConfig(
         load_in_4bit=True,
         bnb_4bit_quant_type="nf4",
@@ -176,8 +160,7 @@ def main():
         model = AutoModelForCausalLM.from_pretrained(
             MODEL_NAME,
             quantization_config=bnb_config,
-            torch_dtype=compute_dtype,
-            device_map="auto",
+            device_map="auto" if torch.cuda.is_available() else None,
             trust_remote_code=True
         )
     except Exception as e:
@@ -198,7 +181,7 @@ def main():
     model.print_trainable_parameters()
 
     print("[INFO] Loading training data...")
-    training_data = load_all_training_data(tokenizer)
+    training_data = load_all_training_data()
     if len(training_data) == 0:
         print("[ERROR] No training data found!")
         sys.exit(1)
@@ -232,7 +215,7 @@ def main():
         data_collator=DataCollatorForLanguageModeling(tokenizer, mlm=False),
     )
 
-    print("[INFO] Starting training...")
+    print("[INFO] Starting fine-tuning...")
     trainer.train()
 
     print("[INFO] Saving model + tokenizer + LoRA adapter...")
