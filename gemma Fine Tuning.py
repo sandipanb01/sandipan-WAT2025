@@ -95,7 +95,7 @@ filtered_ds = ds.filter(filter_pair)
 def map_to_chat_format(example):
     messages = [
         {"role": "user", "content": f"Translate this {example['src_lang']} text to {example['tgt_lang']}:\n{example['src_txt']}"},
-        {"role": "You are a tarnslation assistant", "content": example['tgt_txt']}
+        {"role": "You are a translation assistant", "content": example['tgt_txt']}
     ]
     return {"text": tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=False)}
 
