@@ -1,11 +1,11 @@
 #!/usr/bin/env python
 """
-Gemma-3 IT fine-tuning on full Pralekha
+Gemma-3 IT fine-tuning on full Pralekha (streaming mode)
 - Eng <-> Indic, all 11 languages
 - LoRA + 4-bit quantization
 - Hugging Face chat template
 - Assistant-only loss
-- Memory-efficient mapping
+- Memory-efficient streaming for large dataset
 """
 
 # ------------------------------
@@ -13,12 +13,15 @@ Gemma-3 IT fine-tuning on full Pralekha
 # ------------------------------
 !pip install -q --upgrade transformers trl sacrebleu datasets bitsandbytes accelerate peft
 
+# ------------------------------
+# Imports
+# ------------------------------
 import torch
 from pathlib import Path
-from datasets import load_dataset
 from transformers import AutoTokenizer, AutoModelForCausalLM, TrainingArguments, DataCollatorForLanguageModeling, BitsAndBytesConfig
 from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
 from trl import SFTTrainer
+from datasets import load_dataset, IterableDataset
 
 # ------------------------------
 # Config
@@ -77,31 +80,31 @@ model = get_peft_model(model, lora_config)
 model.print_trainable_parameters()
 
 # ------------------------------
-# Load full Pralekha and filter by language pairs
+# Load Pralekha in streaming mode
 # ------------------------------
-print("[INFO] Loading full Pralekha train dataset...")
-ds = load_dataset("ai4bharat/Pralekha", "train")
+print("[INFO] Loading Pralekha train dataset in streaming mode...")
+ds_stream = load_dataset("ai4bharat/Pralekha", split="train", streaming=True)
 
-# Filter for our desired language pairs
+# Filter for desired language pairs
 def filter_pair(example):
     pair = example["src_lang"] + "_" + example["tgt_lang"]
     return pair in LANG_PAIRS or pair[::-1] in LANG_PAIRS  # forward + reverse
 
-filtered_ds = ds.filter(filter_pair)
+ds_stream_filtered = ds_stream.filter(filter_pair)
 
 # ------------------------------
-# Apply chat template for SFTTrainer
+# Generator function to yield formatted chat examples
 # ------------------------------
-def map_to_chat_format(example):
-    messages = [
-        {"role": "user", "content": f"Translate this {example['src_lang']} text to {example['tgt_lang']}:\n{example['src_txt']}"},
-        {"role": "You are a translation assistant", "content": example['tgt_txt']}
-    ]
-    return {"text": tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=False)}
+def stream_format_generator(dataset):
+    for example in dataset:
+        messages = [
+            {"role": "user", "content": f"Translate this {example['src_lang']} text to {example['tgt_lang']}:\n{example['src_txt']}"},
+            {"role": "You are a translation assistant", "content": example['tgt_txt']}
+        ]
+        yield {"text": tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=False)}
 
-formatted_ds = filtered_ds.map(map_to_chat_format, batched=False)
-
-print(f"[INFO] Total training examples after filtering: {len(formatted_ds)}")
+# Create streaming Dataset object
+formatted_ds = IterableDataset.from_generator(lambda: stream_format_generator(ds_stream_filtered))
 
 # ------------------------------
 # Training arguments
