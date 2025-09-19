@@ -1,242 +1,156 @@
-#!/usr/bin/env python
-# coding: utf-8
-"""
-Fine-tuning Gemma-3 for IndicDoc 2025
-- Model: google/gemma-3-270m-it (or gemma-3-1b-it if GPU allows)
-- Dataset: ai4bharat/Pralekha
-- All 12 Eng→Indic + 12 Indic→Eng directions
-- Uses HuggingFace tokenizer.apply_chat_template
-- LoRA (4-bit) fine-tuning with TRL
-- Trains only on assistant responses
-- Doc-level translation: max_new_tokens=4096
-- Evaluation: BLEU + chrF2 via sacrebleu
-"""
+# ======================================================
+# Colab-ready LoRA Fine-Tuning Script
+# Gemma-3 270M IT + Pralekha Corpus (Doc-level MT)
+# ======================================================
 
-# ------------------------------
-# Install deps (Colab)
-# ------------------------------
-!pip install -q -U transformers accelerate trl peft bitsandbytes datasets sacrebleu
+# -------------------- Install Packages --------------------
+!pip install -q transformers datasets accelerate bitsandbytes peft
 
-import os
-import json
-import torch
-from pathlib import Path
-from datasets import load_dataset, Dataset
+from datasets import load_dataset
 from transformers import (
     AutoTokenizer,
     AutoModelForCausalLM,
     TrainingArguments,
+    Trainer,
+    DataCollatorForLanguageModeling,
+    set_seed,
+    apply_chat_template,
 )
-from peft import LoraConfig, get_peft_model
-from trl import SFTTrainer
-import sacrebleu
+from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
+import torch
 
-# ------------------------------
-# Config
-# ------------------------------
-MODEL_NAME = "google/gemma-3-270m-it"   # or "google/gemma-3-1b-it"
-OUTPUT_DIR = Path("./gemma3-indicdoc")
-MAX_SEQ_LEN = 4096
-TRAIN_SPLIT = "train"
-EVAL_SPLIT = "dev"
-EVAL_SAMPLES = 200
+# -------------------- Global Config --------------------
+MODEL_NAME = "google/gemma-3-270m-it"
+DATASET_NAME = "ai4bharat/Pralekha"
+OUTPUT_DIR = "/content/gemma3-pralekha-ft"
+MAX_NEW_TOKENS = 4096
+BATCH_SIZE = 2
+EPOCHS = 2
+LR = 2e-4   # higher LR works better with LoRA
+SEED = 42
 
-LANGUAGE_PAIRS = [
-    "eng_ben", "eng_guj", "eng_hin", "eng_kan", "eng_mal", "eng_mar",
-    "eng_ori", "eng_pan", "eng_tam", "eng_tel", "eng_urd",
-    "ben_eng", "guj_eng", "hin_eng", "kan_eng", "mal_eng", "mar_eng",
-    "ori_eng", "pan_eng", "tam_eng", "tel_eng", "urd_eng"
-]
+set_seed(SEED)
 
-# ------------------------------
-# Utility: build chat prompt
-# ------------------------------
-def build_prompt(src_text, src_lang, tgt_lang, tokenizer):
-    """Use HF chat template for consistent prompts."""
-    messages = [
-        {"role": "user", "content": f"Translate this {src_lang} document to {tgt_lang}:\n{src_text}\n"},
-        {"role": "assistant", "content": ""},  # leave empty for training
-    ]
-    return tokenizer.apply_chat_template(
-        messages,
-        tokenize=False,
-        add_generation_prompt=True
-    )
-
-# ------------------------------
-# Streaming dataset loader
-# ------------------------------
-def load_streaming_dataset(tokenizer, split=TRAIN_SPLIT, max_samples=None):
-    """Loads Pralekha in streaming mode and builds SFT-ready dataset."""
-    all_instances = []
-    for pair in LANGUAGE_PAIRS:
-        src, tgt = pair.split("_")
-        print(f"[INFO] Loading {src} → {tgt} ({split}, streaming)...")
-
-        try:
-            ds = load_dataset("ai4bharat/Pralekha", split=pair, data_dir=split, streaming=True)
-        except Exception as e:
-            print(f"  [WARN] Skipping {pair}: {e}")
-            continue
-
-        processed = 0
-        for row in ds:
-            src_txt = row.get("src_txt") or row.get("src_text", "")
-            tgt_txt = row.get("tgt_txt") or row.get("tgt_text", "")
-            if not src_txt or not tgt_txt:
-                continue
-
-            instance = {
-                "messages": [
-                    {"role": "user", "content": f"Translate this {src} document to {tgt}:\n{src_txt}\n"},
-                    {"role": "assistant", "content": tgt_txt},
-                ]
-            }
-            all_instances.append(instance)
-
-            processed += 1
-            if max_samples and processed >= max_samples:
-                break
-
-        print(f"  Added {processed} samples from {pair}")
-
-    return Dataset.from_list(all_instances)
-
-# ------------------------------
-# Evaluation
-# ------------------------------
-def evaluate_model(model_path, tokenizer, lang_pairs, subset=EVAL_SPLIT, max_samples=EVAL_SAMPLES):
-    print("[INFO] Starting evaluation...")
-    model = AutoModelForCausalLM.from_pretrained(
-        model_path,
-        device_map="auto",
-        torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
-    )
-
-    results = {}
-    for pair in lang_pairs:
-        src, tgt = pair.split("_")
-        print(f"[EVAL] {src} → {tgt}")
-        try:
-            ds = load_dataset("ai4bharat/Pralekha", split=pair, data_dir=subset)
-        except Exception as e:
-            print(f"  [WARN] Skipping {pair}: {e}")
-            continue
-        ds = ds.select(range(min(max_samples, len(ds))))
-
-        preds, refs = [], []
-        for row in ds:
-            src_text = row.get("src_txt") or row.get("src_text", "")
-            ref_text = row.get("tgt_txt") or row.get("tgt_text", "")
-            if not src_text or not ref_text:
-                continue
-
-            messages = [
-                {"role": "user", "content": f"Translate this {src} document to {tgt}:\n{src_text}\n"}
-            ]
-            prompt = tokenizer.apply_chat_template(
-                messages,
-                tokenize=False,
-                add_generation_prompt=True
-            )
-            inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
-            outputs = model.generate(**inputs, max_new_tokens=MAX_SEQ_LEN, do_sample=False)
-            decoded = tokenizer.decode(outputs[0], skip_special_tokens=True)
-
-            preds.append(decoded.strip())
-            refs.append(ref_text.strip())
-
-        if preds and refs:
-            bleu = sacrebleu.corpus_bleu(preds, [refs])
-            chrf = sacrebleu.corpus_chrf(preds, [refs])
-            results[pair] = {"BLEU": bleu.score, "chrF2": chrf.score}
-            print(f"  BLEU={bleu.score:.2f}, chrF2={chrf.score:.2f}")
-
-    out_path = Path(model_path) / "eval_results.json"
-    with open(out_path, "w", encoding="utf-8") as f:
-        json.dump(results, f, indent=2, ensure_ascii=False)
-    print(f"[INFO] Saved evaluation → {out_path}")
-
-# ------------------------------
-# Main training flow
-# ------------------------------
-def main():
-    print("[INFO] Loading tokenizer...")
-    tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
+# -------------------- Load Tokenizer + Base Model --------------------
+tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
+if tokenizer.pad_token is None:
     tokenizer.pad_token = tokenizer.eos_token
-    tokenizer.padding_side = "right"
+tokenizer.padding_side = "right"
 
-    # Auto dtype
-    if torch.cuda.is_available():
-        major, _ = torch.cuda.get_device_capability()
-        compute_dtype = torch.bfloat16 if major >= 8 else torch.float16
-        print(f"[INFO] Using dtype: {compute_dtype}")
-    else:
-        compute_dtype = torch.float32
-        print("[WARN] CUDA not available. Training on CPU will be very slow.")
+base_model = AutoModelForCausalLM.from_pretrained(
+    MODEL_NAME,
+    torch_dtype=torch.bfloat16,
+    device_map="auto",
+    load_in_4bit=True,   # memory efficient
+)
 
-    print("[INFO] Loading base model...")
-    model = AutoModelForCausalLM.from_pretrained(
-        MODEL_NAME,
-        torch_dtype=compute_dtype,
-        device_map="auto",
+# Prepare model for LoRA fine-tuning
+base_model = prepare_model_for_kbit_training(base_model)
+
+# -------------------- Apply LoRA --------------------
+lora_config = LoraConfig(
+    r=64,                      # LoRA rank
+    lora_alpha=128,
+    target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],  
+    lora_dropout=0.05,
+    bias="none",
+    task_type="CAUSAL_LM",
+)
+model = get_peft_model(base_model, lora_config)
+
+print("\n[INFO] Trainable parameters with LoRA:")
+model.print_trainable_parameters()
+
+# -------------------- Utility: Build Chat Prompt --------------------
+def build_prompt(source_text, target_text, src_lang, tgt_lang):
+    """
+    Wraps source (user) and target (assistant) into a chat-style prompt
+    using Hugging Face's apply_chat_template.
+    """
+    messages = [
+        {"role": "user", "content": f"Translate the following document from {src_lang} to {tgt_lang}:\n\n{source_text}"},
+        {"role": "assistant", "content": target_text},
+    ]
+    return apply_chat_template(tokenizer, messages, tokenize=False, add_generation_prompt=False)
+
+# -------------------- Preprocessing Function --------------------
+def preprocess_function(examples, src_lang, tgt_lang):
+    sources = examples[src_lang]
+    targets = examples[tgt_lang]
+
+    prompts = [
+        build_prompt(src, tgt, src_lang, tgt_lang)
+        for src, tgt in zip(sources, targets)
+    ]
+
+    model_inputs = tokenizer(
+        prompts,
+        max_length=MAX_NEW_TOKENS,
+        truncation=True,
+        padding="max_length",
     )
 
-    # LoRA config
-    lora_config = LoraConfig(
-        r=8,
-        lora_alpha=16,
-        target_modules=["q_proj", "v_proj", "k_proj", "o_proj"],
-        lora_dropout=0.05,
-        bias="none",
-        task_type="CAUSAL_LM",
+    labels = model_inputs["input_ids"].copy()
+    model_inputs["labels"] = labels
+    return model_inputs
+
+# -------------------- Language Pairs --------------------
+LANGUAGES = ["ben", "guj", "hin", "kan", "mal", "mar", "ori", "pan", "tam", "tel", "urd"]
+LANGUAGE_PAIRS = [(src, "eng") for src in LANGUAGES] + [("eng", tgt) for tgt in LANGUAGES]
+
+# -------------------- Fine-tune Loop --------------------
+for src_lang, tgt_lang in LANGUAGE_PAIRS:
+    print(f"\n[INFO] Training {src_lang} → {tgt_lang} ...")
+
+    # Load dataset (train split only, eval from split)
+    dataset = load_dataset(DATASET_NAME, split="train")
+
+    # Map preprocessing
+    tokenized_dataset = dataset.map(
+        lambda ex: preprocess_function(ex, src_lang, tgt_lang),
+        batched=True,
+        remove_columns=dataset.column_names,
     )
-    model = get_peft_model(model, lora_config)
-    model.print_trainable_parameters()
 
-    print("[INFO] Preparing training data (streaming mode)...")
-    training_data = load_streaming_dataset(tokenizer, TRAIN_SPLIT, max_samples=None)
+    # Train/val split
+    split_dataset = tokenized_dataset.train_test_split(test_size=0.01, seed=SEED)
+    train_dataset = split_dataset["train"]
+    eval_dataset = split_dataset["test"]
 
+    # Data collator
+    data_collator = DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=False)
+
+    # Training args
     training_args = TrainingArguments(
-        output_dir=str(OUTPUT_DIR),
-        per_device_train_batch_size=1,
+        output_dir=f"{OUTPUT_DIR}/{src_lang}-{tgt_lang}",
+        per_device_train_batch_size=BATCH_SIZE,
+        per_device_eval_batch_size=BATCH_SIZE,
         gradient_accumulation_steps=8,
-        learning_rate=2e-4,
-        num_train_epochs=2,
+        learning_rate=LR,
+        num_train_epochs=EPOCHS,
+        weight_decay=0.01,
+        warmup_ratio=0.1,
         logging_steps=50,
         save_strategy="epoch",
-        evaluation_strategy="no",
-        bf16=(compute_dtype == torch.bfloat16),
-        fp16=(compute_dtype == torch.float16),
-        optim="paged_adamw_8bit",
-        warmup_ratio=0.1,
-        lr_scheduler_type="linear",
-        max_grad_norm=0.3,
+        evaluation_strategy="epoch",   # <--- explicit eval_strategy
+        predict_with_generate=True,
+        bf16=True,
         report_to="none",
-        run_name="gemma3-indicdoc",
-        dataloader_pin_memory=False,
+        push_to_hub=False,
     )
 
-    trainer = SFTTrainer(
+    # Trainer
+    trainer = Trainer(
         model=model,
         args=training_args,
-        train_dataset=training_data,
+        train_dataset=train_dataset,
+        eval_dataset=eval_dataset,
+        data_collator=data_collator,
         tokenizer=tokenizer,
-        max_seq_length=MAX_SEQ_LEN,
-        packing=False,  # doc-level, no sentence packing
     )
 
-    print("[INFO] Starting training...")
+    # Train
     trainer.train()
+    trainer.save_model(f"{OUTPUT_DIR}/{src_lang}-{tgt_lang}/final")
 
-    print("[INFO] Saving model + tokenizer + adapter...")
-    trainer.save_model()
-    tokenizer.save_pretrained(OUTPUT_DIR)
-    model.save_pretrained(OUTPUT_DIR)
-
-    print("[INFO] Running evaluation...")
-    evaluate_model(OUTPUT_DIR, tokenizer, LANGUAGE_PAIRS, subset=EVAL_SPLIT, max_samples=EVAL_SAMPLES)
-
-
-if __name__ == "__main__":
-    main()
+print("\n✅ All language pairs finished LoRA fine-tuning.")
