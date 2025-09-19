@@ -1,11 +1,12 @@
 #!/usr/bin/env python
 # coding: utf-8
 """
-- Model: google/gemma-3-1b-it (or gemma-3-270m-it if smaller)
-- Dataset: ai4bharat/Pralekha (streaming mode)
-- Covers all 12 Eng→Indic + 12 Indic→Eng directions
-- Uses HuggingFace `apply_chat_template` (no manual hacks)
-- LoRA (4-bit) fine-tuning with TRL >= 0.9
+Fine-tuning Gemma-3 for IndicDoc 2025
+- Model: google/gemma-3-270m-it (or gemma-3-1b-it if GPU allows)
+- Dataset: ai4bharat/Pralekha
+- All 12 Eng→Indic + 12 Indic→Eng directions
+- Uses HuggingFace tokenizer.apply_chat_template
+- LoRA (4-bit) fine-tuning with TRL
 - Trains only on assistant responses
 - Doc-level translation: max_new_tokens=4096
 - Evaluation: BLEU + chrF2 via sacrebleu
@@ -14,7 +15,7 @@
 # ------------------------------
 # Install deps (Colab)
 # ------------------------------
-!pip install -q transformers accelerate trl peft bitsandbytes datasets sacrebleu
+!pip install -q -U transformers accelerate trl peft bitsandbytes datasets sacrebleu
 
 import os
 import json
@@ -25,7 +26,6 @@ from transformers import (
     AutoTokenizer,
     AutoModelForCausalLM,
     TrainingArguments,
-    apply_chat_template,
 )
 from peft import LoraConfig, get_peft_model
 from trl import SFTTrainer
@@ -34,7 +34,7 @@ import sacrebleu
 # ------------------------------
 # Config
 # ------------------------------
-MODEL_NAME = "google/gemma-3-270m-it "   # or "google/gemma-1b-it"
+MODEL_NAME = "google/gemma-3-270m-it"   # or "google/gemma-3-1b-it"
 OUTPUT_DIR = Path("./gemma3-indicdoc")
 MAX_SEQ_LEN = 4096
 TRAIN_SPLIT = "train"
@@ -55,10 +55,9 @@ def build_prompt(src_text, src_lang, tgt_lang, tokenizer):
     """Use HF chat template for consistent prompts."""
     messages = [
         {"role": "user", "content": f"Translate this {src_lang} document to {tgt_lang}:\n{src_text}\n"},
-        {"role": "assistant", "content": ""},
+        {"role": "assistant", "content": ""},  # leave empty for training
     ]
-    return apply_chat_template(
-        tokenizer,
+    return tokenizer.apply_chat_template(
         messages,
         tokenize=False,
         add_generation_prompt=True
@@ -87,7 +86,6 @@ def load_streaming_dataset(tokenizer, split=TRAIN_SPLIT, max_samples=None):
             if not src_txt or not tgt_txt:
                 continue
 
-            prompt = build_prompt(src_txt, src, tgt, tokenizer)
             instance = {
                 "messages": [
                     {"role": "user", "content": f"Translate this {src} document to {tgt}:\n{src_txt}\n"},
@@ -136,7 +134,11 @@ def evaluate_model(model_path, tokenizer, lang_pairs, subset=EVAL_SPLIT, max_sam
             messages = [
                 {"role": "user", "content": f"Translate this {src} document to {tgt}:\n{src_text}\n"}
             ]
-            prompt = apply_chat_template(tokenizer, messages, tokenize=False, add_generation_prompt=True)
+            prompt = tokenizer.apply_chat_template(
+                messages,
+                tokenize=False,
+                add_generation_prompt=True
+            )
             inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
             outputs = model.generate(**inputs, max_new_tokens=MAX_SEQ_LEN, do_sample=False)
             decoded = tokenizer.decode(outputs[0], skip_special_tokens=True)
@@ -193,7 +195,7 @@ def main():
     model.print_trainable_parameters()
 
     print("[INFO] Preparing training data (streaming mode)...")
-    training_data = load_streaming_dataset(tokenizer, TRAIN_SPLIT, max_samples=None)  # full dataset
+    training_data = load_streaming_dataset(tokenizer, TRAIN_SPLIT, max_samples=None)
 
     training_args = TrainingArguments(
         output_dir=str(OUTPUT_DIR),
