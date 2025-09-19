@@ -1,163 +1,121 @@
-# ======================================================
-# Gemma-IT Fine-tuning for Pralekha (Doc-level Translation)
-# ======================================================
+# ==============================================
+# Colab Fine-tuning Script: Gemma-3-270M + Pralekha
+# ==============================================
 
-# ------------------------------
-# Install dependencies (Colab)
-# ------------------------------
-!pip install -q transformers datasets peft bitsandbytes accelerate trl sacrebleu
+# -------------------- Install Dependencies --------------------
+!pip install -q transformers==4.44.2 trl==0.11.4 peft==0.11.1 bitsandbytes==0.43.3 datasets accelerate sentencepiece
 
-# ------------------------------
-# Imports
-# ------------------------------
-import os
-from pathlib import Path
-import json
+# -------------------- Imports --------------------
 import torch
-from datasets import load_dataset, Dataset
-from transformers import AutoTokenizer, AutoModelForCausalLM, TrainingArguments, apply_chat_template
+from transformers import (
+    AutoModelForCausalLM,
+    AutoTokenizer,
+    BitsAndBytesConfig,
+)
 from peft import LoraConfig, get_peft_model
-from trl import SFTTrainer
-import sacrebleu
+from datasets import load_dataset
+from trl import SFTTrainer, SFTConfig
 
-# ------------------------------
-# Config
-# ------------------------------
-MODEL_NAME = "google/gemma-3-270m-it"
-OUTPUT_DIR = Path("./gemma3-pralekha")
-MAX_SEQ_LEN = 4096
-TRAIN_SPLIT = "train"
-EVAL_SPLIT = "dev"
-EVAL_SAMPLES = 200
+# -------------------- Load Tokenizer --------------------
+model_id = "google/gemma-3-270m"
 
-LANGUAGE_PAIRS = [
-    "eng_ben", "eng_guj", "eng_hin", "eng_kan", "eng_mal", "eng_mar",
-    "eng_ori", "eng_pan", "eng_tam", "eng_tel", "eng_urd",
-    "ben_eng", "guj_eng", "hin_eng", "kan_eng", "mal_eng", "mar_eng",
-    "ori_eng", "pan_eng", "tam_eng", "tel_eng", "urd_eng"
-]
+# Force slow tokenizer to avoid Colab "ModelWrapper" crash
+tokenizer = AutoTokenizer.from_pretrained(model_id, use_fast=False)
+tokenizer.pad_token = tokenizer.eos_token
+tokenizer.padding_side = "right"
 
-# ------------------------------
-# Build prompt utility (doc-level)
-# ------------------------------
-def build_prompt(src_text, src_lang, tgt_lang, target_text):
-    """
-    Build doc-level translation prompt using HF apply_chat_template.
-    Trains only on assistant response.
-    """
-    return apply_chat_template(
-        instruction=f"Translate this document from {src_lang} to {tgt_lang}.",
-        input_text=src_text,
-        output_text=target_text
+
+# -------------------- Load Model with 4-bit Quantization --------------------
+bnb_config = BitsAndBytesConfig(
+    load_in_4bit=True,
+    bnb_4bit_use_double_quant=True,
+    bnb_4bit_quant_type="nf4",
+    bnb_4bit_compute_dtype=torch.bfloat16,
+)
+
+model = AutoModelForCausalLM.from_pretrained(
+    model_id,
+    quantization_config=bnb_config,
+    device_map="auto"
+)
+
+# -------------------- Apply LoRA --------------------
+lora_config = LoraConfig(
+    r=8,
+    lora_alpha=16,
+    lora_dropout=0.05,
+    target_modules=["q_proj", "v_proj"],  # standard for transformers
+    task_type="CAUSAL_LM",
+)
+model = get_peft_model(model, lora_config)
+
+# -------------------- Load Dataset --------------------
+print("[INFO] Loading Pralekha train split...")
+ds = load_dataset("ai4bharat/Pralekha", "train", split="train")
+
+print("[INFO] Example row:", ds[0])
+
+# -------------------- Preprocessing --------------------
+def preprocess(batch):
+    sources = batch["src_txt"]
+    targets = batch["tgt_txt"]
+
+    conversations = []
+    for src, tgt in zip(sources, targets):
+        conversations.append(
+            [
+                {"role": "user", "content": src},
+                {"role": "assistant", "content": tgt},
+            ]
+        )
+
+    tokenized = tokenizer.apply_chat_template(
+        conversations,
+        tokenize=True,
+        truncation=True,
+        max_length=1024,
+        return_tensors=None,
     )
+    return {"input_ids": tokenized}
 
-# ------------------------------
-# Load dataset (streaming)
-# ------------------------------
-def load_training_dataset(tokenizer, split=TRAIN_SPLIT):
-    all_instances = []
+print("[INFO] Tokenizing dataset...")
+tokenized_ds = ds.map(
+    preprocess,
+    batched=True,
+    remove_columns=["src_lang", "src_txt", "tgt_lang", "tgt_txt"],  # ✅ only valid cols
+)
 
-    for pair in LANGUAGE_PAIRS:
-        src, tgt = pair.split("_")
-        print(f"[INFO] Loading {src} → {tgt} ({split})...")
-        try:
-            ds = load_dataset("ai4bharat/Pralekha", split=split)
-        except Exception as e:
-            print(f"  [WARN] Skipping {pair}: {e}")
-            continue
+print("[INFO] Tokenized example:", tokenized_ds[0])
 
-        for row in ds:
-            src_text = row.get(f"doc.{src}_2_{tgt}")
-            tgt_text = row.get(f"doc.{src}_2_{tgt}")  # assistant output only
-            if not src_text or not tgt_text:
-                continue
+# -------------------- Training Config --------------------
+training_config = SFTConfig(
+    output_dir="./gemma3-pralekha-ft",
+    per_device_train_batch_size=2,
+    gradient_accumulation_steps=8,
+    learning_rate=2e-4,
+    num_train_epochs=1,
+    logging_steps=10,
+    save_steps=200,
+    save_total_limit=2,
+    fp16=True,
+    optim="paged_adamw_32bit",
+    report_to="none",
+)
 
-            prompt = build_prompt(src_text, src, tgt, tgt_text)
-            all_instances.append({"prompt": prompt})
+# -------------------- Trainer --------------------
+trainer = SFTTrainer(
+    model=model,
+    tokenizer=tokenizer,
+    train_dataset=tokenized_ds,
+    args=training_config,
+    packing=True,  # efficient for long sequences
+)
 
-    return Dataset.from_list(all_instances)
+# -------------------- Train --------------------
+trainer.train()
 
-# ------------------------------
-# Main training function
-# ------------------------------
-def main():
-    print("[INFO] Loading tokenizer...")
-    tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, trust_remote_code=True)
-    tokenizer.pad_token = tokenizer.eos_token
-    tokenizer.padding_side = "right"
+# -------------------- Save --------------------
+trainer.save_model("./gemma3-pralekha-ft")
+tokenizer.save_pretrained("./gemma3-pralekha-ft")
 
-    print("[INFO] Loading model...")
-    model = AutoModelForCausalLM.from_pretrained(
-        MODEL_NAME,
-        device_map="auto",
-        torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
-        trust_remote_code=True
-    )
-
-    # ------------------------------
-    # LoRA Config
-    # ------------------------------
-    lora_config = LoraConfig(
-        r=16,
-        lora_alpha=32,
-        target_modules=["q_proj", "v_proj"],
-        lora_dropout=0.05,
-        bias="none",
-        task_type="CAUSAL_LM"
-    )
-    model = get_peft_model(model, lora_config)
-    model.print_trainable_parameters()
-
-    # ------------------------------
-    # Load training data
-    # ------------------------------
-    print("[INFO] Loading training dataset...")
-    train_dataset = load_training_dataset(tokenizer, TRAIN_SPLIT)
-
-    # ------------------------------
-    # Training Arguments
-    # ------------------------------
-    training_args = TrainingArguments(
-        output_dir=str(OUTPUT_DIR),
-        per_device_train_batch_size=1,
-        gradient_accumulation_steps=8,
-        learning_rate=2e-4,
-        num_train_epochs=3,
-        logging_steps=50,
-        save_strategy="epoch",
-        eval_strategy="no",
-        fp16=torch.cuda.is_available(),
-        bf16=torch.cuda.is_available(),
-        report_to="none",
-        run_name="gemma3-pralekha"
-    )
-
-    # ------------------------------
-    # SFT Trainer
-    # ------------------------------
-    trainer = SFTTrainer(
-        model=model,
-        train_dataset=train_dataset,
-        tokenizer=tokenizer,
-        max_seq_length=MAX_SEQ_LEN,
-        packing=False,  # doc-level
-        args=training_args,
-        peft_config=lora_config,
-        max_new_tokens=MAX_SEQ_LEN  # ensure full document translation
-    )
-
-    # ------------------------------
-    # Start training
-    # ------------------------------
-    print("[INFO] Starting fine-tuning...")
-    trainer.train()
-
-    print("[INFO] Saving model and tokenizer...")
-    trainer.save_model()
-    tokenizer.save_pretrained(OUTPUT_DIR)
-    model.save_pretrained(OUTPUT_DIR)
-
-    print("[INFO] Fine-tuning complete!")
-
-if __name__ == "__main__":
-    main()
+print("[INFO] Training complete. Model saved at ./gemma3-pralekha-ft")
