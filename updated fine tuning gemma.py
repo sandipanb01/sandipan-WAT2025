@@ -1,11 +1,6 @@
 # ======================================================
-# Gemma-IT Fine-tuning for Pralekha
+# Gemma-IT Fine-tuning for Pralekha (Memory-Safe Version)
 # ======================================================
-
-# ------------------------------
-# Install dependencies
-# ------------------------------
-#!pip install -q transformers==4.44.2 datasets==2.21.0 peft==0.12.0 bitsandbytes accelerate trl sacrebleu
 
 import os
 from pathlib import Path
@@ -22,57 +17,27 @@ import sacrebleu
 # ------------------------------
 MODEL_NAME = "google/gemma-3-270m-it"
 OUTPUT_DIR = Path("./gemma3-pralekha")
-MAX_SEQ_LEN = 4096
+MAX_SEQ_LEN = 1024       # Reduced for memory
 TRAIN_SPLIT = "train"
 EVAL_SPLIT = "dev"
 EVAL_SAMPLES = 200
 
 LANGUAGE_PAIRS = [
-    "eng_ben",
-    "eng_guj",
-    "eng_hin",
-    "eng_kan",
-    "eng_mal",
-    "eng_mar",
-    "eng_ori",
-    "eng_pan",
-    "eng_tam",
-    "eng_tel",
-    "eng_urd",
-    "ben_eng",
-    "guj_eng",
-    "hin_eng",
-    "kan_eng",
-    "mal_eng",
-    "mar_eng",
-    "ori_eng",
-    "pan_eng",
-    "tam_eng",
-    "tel_eng",
-    "urd_eng",
+    "eng_ben", "eng_guj", "eng_hin", "eng_kan", "eng_mal", "eng_mar",
+    "eng_ori", "eng_pan", "eng_tam", "eng_tel", "eng_urd",
+    "ben_eng", "guj_eng", "hin_eng", "kan_eng", "mal_eng", "mar_eng",
+    "ori_eng", "pan_eng", "tam_eng", "tel_eng", "urd_eng",
 ]
-
 
 # ------------------------------
 # Build prompt utility
 # ------------------------------
 def build_prompt(src_text, src_lang, tgt_lang, tokenizer):
-    """
-    Builds document-level translation prompt using the HF chat template format.
-    Trains only on assistant responses.
-    """
     messages = [
-        {
-            "role": "user",
-            "content": f"Translate this {src_lang} document to {tgt_lang}:\n{src_text}\n",
-        },
-        {"role": "assistant", "content": ""},
+        {"role": "user", "content": f"Translate this {src_lang} document to {tgt_lang}:\n{src_text}\n"},
+        {"role": "assistant", "content": ""}
     ]
-    # Hugging Face chat template
-    return tokenizer.apply_chat_template(
-        messages, add_generation_prompt=True, tokenize=False
-    )
-
+    return tokenizer.apply_chat_template(messages, add_generation_prompt=True, tokenize=False)
 
 # ------------------------------
 # Streaming dataset loader
@@ -83,9 +48,7 @@ def load_streaming_dataset(tokenizer, split=TRAIN_SPLIT, max_samples=None):
     for pair in LANGUAGE_PAIRS:
         src, tgt = pair.split("_")
         print(f"[INFO] Loading {src} → {tgt} ({split})...")
-        ds = load_dataset(
-            "ai4bharat/Pralekha", split=split, data_dir=split, streaming=False
-        )
+        ds = load_dataset("ai4bharat/Pralekha", split=split, data_dir=split, streaming=False)
 
         processed = 0
         for row in ds:
@@ -94,18 +57,24 @@ def load_streaming_dataset(tokenizer, split=TRAIN_SPLIT, max_samples=None):
             if not src_txt or not tgt_txt:
                 continue
 
+            # Encode prompt and labels
             prompt = build_prompt(src_txt, src, tgt, tokenizer)
+            encoded = tokenizer(prompt, max_length=MAX_SEQ_LEN, truncation=True)
+            labels = [-100] * len(encoded["input_ids"])
+
+            # Only compute loss on assistant tokens
+            assistant_tokens = tokenizer(tgt_txt, max_length=MAX_SEQ_LEN, truncation=True)["input_ids"]
+            start_idx = len(encoded["input_ids"]) - len(assistant_tokens)
+            start_idx = max(0, start_idx)
+            for i in range(start_idx, len(encoded["input_ids"])):
+                labels[i] = encoded["input_ids"][i]
+
             instance = {
-                "messages": [
-                    {
-                        "role": "user",
-                        "content": f"Translate this {src} document to {tgt}:\n{src_txt}\n",
-                    },
-                    {"role": "assistant", "content": tgt_txt},
-                ]
+                "input_ids": encoded["input_ids"],
+                "attention_mask": encoded["attention_mask"],
+                "labels": labels
             }
             all_instances.append(instance)
-
             processed += 1
             if max_samples and processed >= max_samples:
                 break
@@ -114,19 +83,17 @@ def load_streaming_dataset(tokenizer, split=TRAIN_SPLIT, max_samples=None):
 
     return Dataset.from_list(all_instances)
 
-
 # ------------------------------
 # Evaluation
 # ------------------------------
-def evaluate_model(
-    model_path, tokenizer, lang_pairs, subset=EVAL_SPLIT, max_samples=EVAL_SAMPLES
-):
+def evaluate_model(model_path, tokenizer, lang_pairs, subset=EVAL_SPLIT, max_samples=EVAL_SAMPLES):
     print("[INFO] Starting evaluation...")
     model = AutoModelForCausalLM.from_pretrained(
         model_path,
         device_map="auto",
         torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
         trust_remote_code=True,
+        attn_implementation="eager"  # memory-efficient
     )
 
     results = {}
@@ -148,19 +115,10 @@ def evaluate_model(
             if not src_text or not ref_text:
                 continue
 
-            messages = [
-                {
-                    "role": "user",
-                    "content": f"Translate this {src} document to {tgt}:\n{src_text}\n",
-                }
-            ]
-            prompt = tokenizer.chat_prepare_for_model(
-                messages, add_generation_prompt=True, tokenize=False
-            )
+            messages = [{"role": "user", "content": f"Translate this {src} document to {tgt}:\n{src_text}\n"}]
+            prompt = tokenizer.chat_prepare_for_model(messages, add_generation_prompt=True, tokenize=False)
             inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
-            outputs = model.generate(
-                **inputs, max_new_tokens=MAX_SEQ_LEN, do_sample=False
-            )
+            outputs = model.generate(**inputs, max_new_tokens=MAX_SEQ_LEN, do_sample=False)
             decoded = tokenizer.decode(outputs[0], skip_special_tokens=True)
 
             preds.append(decoded.strip())
@@ -177,19 +135,15 @@ def evaluate_model(
         json.dump(results, f, indent=2, ensure_ascii=False)
     print(f"[INFO] Saved evaluation → {out_path}")
 
-
 # ------------------------------
 # Main training flow
 # ------------------------------
 def main():
     print("[INFO] Loading tokenizer...")
-    tokenizer = AutoTokenizer.from_pretrained(
-        MODEL_NAME, trust_remote_code=True, from_slow=True
-    )
+    tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, trust_remote_code=True, from_slow=True)
     tokenizer.pad_token = tokenizer.eos_token
     tokenizer.padding_side = "right"
 
-    # Auto dtype
     if torch.cuda.is_available():
         major, _ = torch.cuda.get_device_capability()
         compute_dtype = torch.bfloat16 if major >= 8 else torch.float16
@@ -200,10 +154,14 @@ def main():
 
     print("[INFO] Loading base model...")
     model = AutoModelForCausalLM.from_pretrained(
-        MODEL_NAME, torch_dtype=compute_dtype, device_map="auto", trust_remote_code=True
+        MODEL_NAME,
+        torch_dtype=compute_dtype,
+        device_map="auto",
+        trust_remote_code=True,
+        attn_implementation="eager"
     )
 
-    # LoRA config
+    # LoRA configuration
     lora_config = LoraConfig(
         r=8,
         lora_alpha=16,
@@ -215,13 +173,13 @@ def main():
     model = get_peft_model(model, lora_config)
     model.print_trainable_parameters()
 
-    print("[INFO] Preparing training data (streaming mode)...")
+    print("[INFO] Preparing training data...")
     training_data = load_streaming_dataset(tokenizer, TRAIN_SPLIT, max_samples=100)
 
     training_args = TrainingArguments(
         output_dir=str(OUTPUT_DIR),
         per_device_train_batch_size=1,
-        gradient_accumulation_steps=8,
+        gradient_accumulation_steps=4,   # reduced for memory
         learning_rate=2e-4,
         num_train_epochs=2,
         logging_steps=50,
@@ -229,7 +187,7 @@ def main():
         eval_strategy="no",
         bf16=(compute_dtype == torch.bfloat16),
         fp16=(compute_dtype == torch.float16),
-        optim="adamw_torch",
+        optim="paged_adamw_32bit",       # memory-efficient optimizer
         warmup_ratio=0.1,
         lr_scheduler_type="linear",
         max_grad_norm=0.3,
@@ -242,8 +200,7 @@ def main():
         model=model,
         args=training_args,
         train_dataset=training_data,
-        # max_seq_length=MAX_SEQ_LEN,
-        # packing=False,  # doc-level translation
+        max_seq_length=MAX_SEQ_LEN,  # prevent SFT warning
     )
 
     print("[INFO] Starting training...")
@@ -255,14 +212,7 @@ def main():
     model.save_pretrained(OUTPUT_DIR)
 
     print("[INFO] Running evaluation...")
-    evaluate_model(
-        OUTPUT_DIR,
-        tokenizer,
-        LANGUAGE_PAIRS,
-        subset=EVAL_SPLIT,
-        max_samples=EVAL_SAMPLES,
-    )
-
+    evaluate_model(OUTPUT_DIR, tokenizer, LANGUAGE_PAIRS, subset=EVAL_SPLIT, max_samples=EVAL_SAMPLES)
 
 if __name__ == "__main__":
     main()
