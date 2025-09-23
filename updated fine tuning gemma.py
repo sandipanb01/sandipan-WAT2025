@@ -1,11 +1,11 @@
 # ======================================================
-# Gemma-IT Fine-tuning for Pralekha (eng ↔ hin only)
+# Gemma-IT Fine-tuning for Pralekha
 # ======================================================
 
 # ------------------------------
 # Install dependencies
 # ------------------------------
-#!pip install -q transformers==4.45.0 datasets==2.21.0 peft==0.12.0 bitsandbytes accelerate trl sacrebleu
+#!pip install -q transformers==4.44.2 datasets==2.21.0 peft==0.12.0 bitsandbytes accelerate trl sacrebleu
 
 import os
 from pathlib import Path
@@ -21,17 +21,37 @@ import sacrebleu
 # Config
 # ------------------------------
 MODEL_NAME = "google/gemma-3-270m-it"
-OUTPUT_DIR = Path("./gemma3-pralekha-enhi")
+OUTPUT_DIR = Path("./gemma3-pralekha")
 MAX_SEQ_LEN = 4096
 TRAIN_SPLIT = "train"
 EVAL_SPLIT = "dev"
 EVAL_SAMPLES = 200
 
-# 🔹 Only eng ↔ hin
 LANGUAGE_PAIRS = [
+    "eng_ben",
+    "eng_guj",
     "eng_hin",
+    "eng_kan",
+    "eng_mal",
+    "eng_mar",
+    "eng_ori",
+    "eng_pan",
+    "eng_tam",
+    "eng_tel",
+    "eng_urd",
+    "ben_eng",
+    "guj_eng",
     "hin_eng",
+    "kan_eng",
+    "mal_eng",
+    "mar_eng",
+    "ori_eng",
+    "pan_eng",
+    "tam_eng",
+    "tel_eng",
+    "urd_eng",
 ]
+
 
 # ------------------------------
 # Build prompt utility
@@ -46,11 +66,13 @@ def build_prompt(src_text, src_lang, tgt_lang, tokenizer):
             "role": "user",
             "content": f"Translate this {src_lang} document to {tgt_lang}:\n{src_text}\n",
         },
-        {"role": "assistant", "content": ""},  # placeholder for training
+        {"role": "assistant", "content": ""},
     ]
+    # Hugging Face chat template
     return tokenizer.apply_chat_template(
         messages, add_generation_prompt=True, tokenize=False
     )
+
 
 # ------------------------------
 # Streaming dataset loader
@@ -72,7 +94,7 @@ def load_streaming_dataset(tokenizer, split=TRAIN_SPLIT, max_samples=None):
             if not src_txt or not tgt_txt:
                 continue
 
-            # Training instance
+            prompt = build_prompt(src_txt, src, tgt, tokenizer)
             instance = {
                 "messages": [
                     {
@@ -91,6 +113,7 @@ def load_streaming_dataset(tokenizer, split=TRAIN_SPLIT, max_samples=None):
         print(f"  Added {processed} samples from {pair}")
 
     return Dataset.from_list(all_instances)
+
 
 # ------------------------------
 # Evaluation
@@ -131,7 +154,7 @@ def evaluate_model(
                     "content": f"Translate this {src} document to {tgt}:\n{src_text}\n",
                 }
             ]
-            prompt = tokenizer.apply_chat_template(
+            prompt = tokenizer.chat_prepare_for_model(
                 messages, add_generation_prompt=True, tokenize=False
             )
             inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
@@ -153,6 +176,7 @@ def evaluate_model(
     with open(out_path, "w", encoding="utf-8") as f:
         json.dump(results, f, indent=2, ensure_ascii=False)
     print(f"[INFO] Saved evaluation → {out_path}")
+
 
 # ------------------------------
 # Main training flow
@@ -191,8 +215,8 @@ def main():
     model = get_peft_model(model, lora_config)
     model.print_trainable_parameters()
 
-    print("[INFO] Preparing training data...")
-    training_data = load_streaming_dataset(tokenizer, TRAIN_SPLIT, max_samples=None)  # full set
+    print("[INFO] Preparing training data (streaming mode)...")
+    training_data = load_streaming_dataset(tokenizer, TRAIN_SPLIT, max_samples=100)
 
     training_args = TrainingArguments(
         output_dir=str(OUTPUT_DIR),
@@ -210,7 +234,7 @@ def main():
         lr_scheduler_type="linear",
         max_grad_norm=0.3,
         report_to="none",
-        run_name="gemma3-pralekha-enhi",
+        run_name="gemma3-pralekha",
         dataloader_pin_memory=False,
     )
 
@@ -218,6 +242,8 @@ def main():
         model=model,
         args=training_args,
         train_dataset=training_data,
+        # max_seq_length=MAX_SEQ_LEN,
+        # packing=False,  # doc-level translation
     )
 
     print("[INFO] Starting training...")
@@ -236,6 +262,7 @@ def main():
         subset=EVAL_SPLIT,
         max_samples=EVAL_SAMPLES,
     )
+
 
 if __name__ == "__main__":
     main()
