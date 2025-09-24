@@ -1,8 +1,8 @@
 # ======================================================
-# Gemma-IT Fine-tuning for Pralekha (Zero-shot / One-shot)
+# Gemma-IT Fine-tuning for Pralekha (One-shot + Plots + Download)
 # ======================================================
 
-import os
+import os, json
 from pathlib import Path
 import torch
 from datasets import load_dataset, Dataset
@@ -10,14 +10,7 @@ from transformers import AutoTokenizer, AutoModelForCausalLM
 from peft import LoraConfig, get_peft_model
 from trl import SFTTrainer, SFTConfig
 import sacrebleu
-
-# ------------------------------
-# TorchDynamo + deterministic fixes
-# ------------------------------
-torch._dynamo.reset()
-torch._dynamo.disable()
-torch.backends.cudnn.benchmark = False
-torch.backends.cudnn.deterministic = True
+import matplotlib.pyplot as plt
 
 # ------------------------------
 # Config
@@ -27,17 +20,13 @@ OUTPUT_DIR = Path("./gemma3-pralekha")
 MAX_SEQ_LEN = 1024
 TRAIN_SPLIT = "train"
 EVAL_SPLIT = "dev"
+
 LANGUAGE_PAIRS = ["eng_hin", "hin_eng"]
 TRAIN_SAMPLES = 100
 EVAL_SAMPLES = 10
 
-# Toggle evaluation mode
-# "zero_shot" → model sees only raw source
-# "one_shot" → model sees HF chat prompt once before generating
-EVAL_MODE = "one_shot"  # or "zero_shot"
-
 # ------------------------------
-# Build prompt utility (HF Chat Template)
+# Build HF Chat Prompt
 # ------------------------------
 def build_prompt(src_text, src_lang, tgt_lang, tokenizer):
     messages = [
@@ -55,12 +44,7 @@ def load_streaming_dataset(tokenizer, split="train", max_samples=100):
         src, tgt = pair.split("_")
         actual_split = "train" if split == "dev" else split
 
-        try:
-            ds = load_dataset("ai4bharat/Pralekha", split=actual_split, data_dir=actual_split, streaming=False)
-        except Exception as e:
-            print(f"[WARN] cannot load split={split} for pair {pair}: {e}")
-            continue
-
+        ds = load_dataset("ai4bharat/Pralekha", split=actual_split, data_dir=actual_split, streaming=False)
         added = 0
         for i, row in enumerate(ds):
             if split == "dev" and i < 1000:
@@ -71,10 +55,10 @@ def load_streaming_dataset(tokenizer, split="train", max_samples=100):
             if not src_txt or not tgt_txt:
                 continue
 
+            # Build prompt via HF chat template
             prompt_ids = tokenizer(build_prompt(src_txt, src, tgt, tokenizer), add_special_tokens=False)["input_ids"]
             target_ids = tokenizer(tgt_txt, truncation=True, max_length=MAX_SEQ_LEN)["input_ids"]
 
-            # Safe concatenation
             input_ids = (prompt_ids + target_ids)[:MAX_SEQ_LEN]
             attention_mask = [1] * len(input_ids)
             prompt_len = min(len(prompt_ids), len(input_ids))
@@ -87,30 +71,23 @@ def load_streaming_dataset(tokenizer, split="train", max_samples=100):
                 "labels": labels,
                 "src_txt": src_txt,
                 "tgt_txt": tgt_txt,
-                "src_lang": src,
-                "tgt_lang": tgt
             })
-
             added += 1
             if max_samples and added >= max_samples:
                 break
     return Dataset.from_list(examples)
 
 # ------------------------------
-# Training
+# Training function
 # ------------------------------
 def train_model():
-    print("[INFO] Loading tokenizer...")
     tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, trust_remote_code=True, from_slow=True)
     tokenizer.pad_token = tokenizer.eos_token
     tokenizer.padding_side = "right"
 
     compute_dtype = torch.float32
-    print(f"[INFO] Using compute dtype: {compute_dtype}")
-
-    print("[INFO] Loading base model...")
     model = AutoModelForCausalLM.from_pretrained(
-        MODEL_NAME, torch_dtype=compute_dtype, device_map="auto", trust_remote_code=True
+        MODEL_NAME, torch_dtype=compute_dtype, device_map="auto", trust_remote_code=True, attn_implementation="eager"
     )
 
     lora_config = LoraConfig(
@@ -120,7 +97,6 @@ def train_model():
     model = get_peft_model(model, lora_config)
     model.print_trainable_parameters()
 
-    print("[INFO] Building datasets...")
     training_data = load_streaming_dataset(tokenizer, split=TRAIN_SPLIT, max_samples=TRAIN_SAMPLES)
     eval_data = load_streaming_dataset(tokenizer, split=EVAL_SPLIT, max_samples=EVAL_SAMPLES)
 
@@ -133,7 +109,8 @@ def train_model():
         logging_steps=1,
         save_strategy="epoch",
         eval_strategy="no",
-        bf16=False, fp16=False,
+        bf16=False,
+        fp16=False,
         optim="paged_adamw_32bit",
         warmup_ratio=0.1,
         lr_scheduler_type="linear",
@@ -145,53 +122,73 @@ def train_model():
         packing=False,
     )
 
-    trainer = SFTTrainer(model=model, args=training_config, train_dataset=training_data, tokenizer=tokenizer)
+    trainer = SFTTrainer(
+        model=model,
+        args=training_config,
+        train_dataset=training_data,
+        tokenizer=tokenizer,
+    )
 
-    print("[INFO] Starting training...")
     trainer.train()
-
-    # Save model + tokenizer
     trainer.model.save_pretrained(OUTPUT_DIR)
     tokenizer.save_pretrained(OUTPUT_DIR)
 
-    return model, tokenizer, eval_data
+    return model, tokenizer, eval_data, trainer
 
 # ------------------------------
 # Evaluation
 # ------------------------------
-def evaluate_model(model, tokenizer, eval_data, mode="one_shot"):
-    print(f"[INFO] Starting {mode} evaluation...")
+def evaluate_model(model, tokenizer, eval_data):
     device = "cuda" if torch.cuda.is_available() else "cpu"
     model.to(device)
     model.eval()
-
     preds, refs = [], []
+    total_loss = 0
 
     for ex in eval_data:
-        if mode == "zero_shot":
-            input_ids = torch.tensor([tokenizer(ex["src_txt"], add_special_tokens=True)["input_ids"]]).to(device)
-            attention_mask = torch.ones_like(input_ids)
-        else:  # one_shot
-            input_ids = torch.tensor([tokenizer(build_prompt(ex["src_txt"], ex["src_lang"], ex["tgt_lang"], tokenizer), add_special_tokens=False)["input_ids"]]).to(device)
-            attention_mask = torch.ones_like(input_ids)
+        input_ids = torch.tensor([ex["input_ids"]]).to(device)
+        attention_mask = torch.tensor([ex["attention_mask"]]).to(device)
+        labels = torch.tensor([ex["labels"]]).to(device)
 
         with torch.no_grad():
-            generated = model.generate(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                max_new_tokens=128,
-                do_sample=False
-            )
-        pred_text = tokenizer.decode(generated[0], skip_special_tokens=True)
-        preds.append(pred_text)
-        refs.append(ex["tgt_txt"])
+            outputs = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
+            total_loss += outputs.loss.item()
+            generated = model.generate(input_ids=input_ids, attention_mask=attention_mask, max_new_tokens=64)
+            preds.append(tokenizer.decode(generated[0], skip_special_tokens=True))
+            refs.append(ex["tgt_txt"])
 
-    chrf2 = sacrebleu.corpus_chrf(preds, [refs])
-    print(f"[RESULT] chrF2 Score ({mode}): {chrf2.score:.2f}")
+    avg_loss = total_loss / len(eval_data) if eval_data else 0
+    chrf = sacrebleu.corpus_chrf(preds, [refs])
+    print(f"[RESULT] Avg Eval Loss: {avg_loss:.4f}, chrF: {chrf.score:.2f}")
 
 # ------------------------------
-# Run
+# Plot & download
+# ------------------------------
+def plot_and_download_metrics(trainer):
+    logs = trainer.state.log_history
+    steps = [l.get("step") for l in logs if "loss" in l]
+    losses = [l.get("loss") for l in logs if "loss" in l]
+    grad_norms = [l.get("grad_norm") for l in logs if "grad_norm" in l]
+    lr = [l.get("learning_rate") for l in logs if "learning_rate" in l]
+
+    plt.figure(figsize=(15,4))
+    plt.subplot(1,3,1)
+    plt.plot(steps, losses, label="Loss"); plt.xlabel("Step"); plt.ylabel("Loss"); plt.title("Training Loss")
+    plt.subplot(1,3,2)
+    plt.plot(steps[:len(grad_norms)], grad_norms, label="Grad Norm", color="orange"); plt.xlabel("Step"); plt.title("Grad Norm")
+    plt.subplot(1,3,3)
+    plt.plot(steps[:len(lr)], lr, label="LR", color="green"); plt.xlabel("Step"); plt.title("Learning Rate")
+    plt.tight_layout()
+    plt.show()
+
+    # Save images
+    plt.savefig("training_metrics.png")
+    print("✅ Training metrics saved as 'training_metrics.png'. Download via Colab Files tab.")
+
+# ------------------------------
+# Main
 # ------------------------------
 if __name__ == "__main__":
-    model, tokenizer, eval_data = train_model()
-    evaluate_model(model, tokenizer, eval_data, mode=EVAL_MODE)
+    model, tokenizer, eval_data, trainer = train_model()
+    evaluate_model(model, tokenizer, eval_data)
+    plot_and_download_metrics(trainer)
