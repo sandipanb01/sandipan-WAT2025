@@ -63,8 +63,10 @@ def load_streaming_dataset(tokenizer, split="train", max_samples=100, one_shot=T
             ds = load_dataset("ai4bharat/Pralekha", split=actual_split, streaming=True, data_dir=actual_split)
             count = 0
             for row in ds:
-                # Filter only English↔Hindi examples
+                # Filter: only English↔Hindi and skip corrupted (src==tgt)
                 if row.get("src_lang") not in ["eng", "hin"] or row.get("tgt_lang") not in ["eng", "hin"]:
+                    continue
+                if row["src_lang"] == row["tgt_lang"]:
                     continue
                 src_txt = row.get("src_txt") or row.get("src_text") or ""
                 tgt_txt = row.get("tgt_txt") or row.get("tgt_text") or ""
@@ -73,29 +75,32 @@ def load_streaming_dataset(tokenizer, split="train", max_samples=100, one_shot=T
                 if random.randint(0, count) == 0:
                     one_shot_example = (src_txt, tgt_txt)
                 count += 1
-                if count >= 500:  # limit to first 500 rows for speed
+                if count >= 500:
                     break
 
         # Load streaming dataset again for actual examples
         ds = load_dataset("ai4bharat/Pralekha", split=actual_split, streaming=True, data_dir=actual_split)
         added = 0
         for row in ds:
-            # Filter only English↔Hindi
+            # Filter only English↔Hindi, skip corrupted
             if row.get("src_lang") not in ["eng", "hin"] or row.get("tgt_lang") not in ["eng", "hin"]:
+                continue
+            if row["src_lang"] == row["tgt_lang"]:
                 continue
             src_txt = row.get("src_txt") or row.get("src_text") or ""
             tgt_txt = row.get("tgt_txt") or row.get("tgt_text") or ""
             if not src_txt or not tgt_txt:
                 continue
 
+            # Build prompt
             if one_shot:
                 prompt_ids = tokenizer(
-                    build_prompt(src_txt, src, tgt, one_shot_example, tokenizer),
+                    build_prompt(src_txt, row["src_lang"], row["tgt_lang"], one_shot_example, tokenizer),
                     add_special_tokens=False
                 )["input_ids"]
             else:
                 prompt_ids = tokenizer(
-                    build_prompt(src_txt, src, tgt, ("", ""), tokenizer),
+                    build_prompt(src_txt, row["src_lang"], row["tgt_lang"], ("", ""), tokenizer),
                     add_special_tokens=False
                 )["input_ids"]
 
@@ -109,13 +114,16 @@ def load_streaming_dataset(tokenizer, split="train", max_samples=100, one_shot=T
             labels = [-100] * prompt_len + input_ids[prompt_len:]
             labels = labels[:MAX_SEQ_LEN]
 
+            # Infer true direction from row
+            direction = f"{row['src_lang']}_{row['tgt_lang']}"
+
             examples.append({
                 "input_ids": input_ids,
                 "attention_mask": attention_mask,
                 "labels": labels,
                 "src_txt": src_txt,
                 "tgt_txt": tgt_txt,
-                "direction": pair
+                "direction": direction
             })
             added += 1
             if max_samples and added >= max_samples:
