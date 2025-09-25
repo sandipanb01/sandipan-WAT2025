@@ -21,6 +21,7 @@ MAX_SEQ_LEN = 1024
 TRAIN_SPLIT = "train"
 EVAL_SPLIT = "dev"
 
+# Only English↔Hindi
 LANGUAGE_PAIRS = ["eng_hin", "hin_eng"]
 TRAIN_SAMPLES = 100
 EVAL_SAMPLES = 10
@@ -47,7 +48,7 @@ def build_prompt(src_text, src_lang, tgt_lang, example_pair, tokenizer):
     return tokenizer.apply_chat_template(messages, add_generation_prompt=True, tokenize=False)
 
 # ------------------------------
-# Dataset builder (streaming, memory-safe random one-shot)
+# Dataset builder (streaming, memory-safe random one-shot, filtered for English↔Hindi)
 # ------------------------------
 def load_streaming_dataset(tokenizer, split="train", max_samples=100, one_shot=True):
     examples = []
@@ -62,6 +63,9 @@ def load_streaming_dataset(tokenizer, split="train", max_samples=100, one_shot=T
             ds = load_dataset("ai4bharat/Pralekha", split=actual_split, streaming=True, data_dir=actual_split)
             count = 0
             for row in ds:
+                # Filter only English↔Hindi examples
+                if row.get("src_lang") not in ["eng", "hin"] or row.get("tgt_lang") not in ["eng", "hin"]:
+                    continue
                 src_txt = row.get("src_txt") or row.get("src_text") or ""
                 tgt_txt = row.get("tgt_txt") or row.get("tgt_text") or ""
                 if not src_txt or not tgt_txt:
@@ -76,6 +80,9 @@ def load_streaming_dataset(tokenizer, split="train", max_samples=100, one_shot=T
         ds = load_dataset("ai4bharat/Pralekha", split=actual_split, streaming=True, data_dir=actual_split)
         added = 0
         for row in ds:
+            # Filter only English↔Hindi
+            if row.get("src_lang") not in ["eng", "hin"] or row.get("tgt_lang") not in ["eng", "hin"]:
+                continue
             src_txt = row.get("src_txt") or row.get("src_text") or ""
             tgt_txt = row.get("tgt_txt") or row.get("tgt_text") or ""
             if not src_txt or not tgt_txt:
@@ -236,7 +243,7 @@ def evaluate_model(model, tokenizer, eval_data, save_jsonl=True, jsonl_path="eva
                 f.write(json.dumps({"src": s, "pred": p, "ref": r, "direction": d}, ensure_ascii=False) + "\n")
         print(f"✅ Saved predictions to {jsonl_path}")
 
-        # Print JSONL
+        # Optional: print JSONL for inspection
         print("\n=== JSONL Translation Output ===")
         with open(jsonl_path, "r", encoding="utf-8") as f:
             for line in f:
@@ -273,3 +280,20 @@ if __name__ == "__main__":
     model, tokenizer, eval_data, trainer = train_model()
     evaluate_model(model, tokenizer, eval_data, max_new_tokens=512)
     plot_and_download_metrics(trainer)
+# ------------------------------
+# Colab: View JSONL predictions in a table
+# ------------------------------
+import pandas as pd
+
+jsonl_path = "eval_predictions.jsonl"
+
+# Load JSONL into a DataFrame
+data = []
+with open(jsonl_path, "r", encoding="utf-8") as f:
+    for line in f:
+        data.append(json.loads(line))
+
+df = pd.DataFrame(data)
+
+# Display first 20 rows nicely
+df.head(20)
