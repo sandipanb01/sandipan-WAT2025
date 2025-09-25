@@ -1,8 +1,8 @@
 # ======================================================
-# Gemma-IT Fine-tuning for Pralekha (One-shot + Plots + Download)
+# Gemma-IT Fine-tuning for Pralekha (Random One-shot + Streaming + English↔Hindi + Clean Outputs + Plots + Download)
 # ======================================================
 
-import os, json
+import os, json, random
 from pathlib import Path
 import torch
 from datasets import load_dataset, Dataset
@@ -25,40 +25,77 @@ LANGUAGE_PAIRS = ["eng_hin", "hin_eng"]
 TRAIN_SAMPLES = 100
 EVAL_SAMPLES = 10
 
+LANG_CODE_MAP = {
+    "eng": "English",
+    "hin": "Hindi"
+}
+
 # ------------------------------
-# Build HF Chat Prompt
+# Build HF Chat Prompt (Random One-shot)
 # ------------------------------
-def build_prompt(src_text, src_lang, tgt_lang, tokenizer):
+def build_prompt(src_text, src_lang, tgt_lang, example_pair, tokenizer):
+    example_src, example_tgt = example_pair
+    src_lang_name = LANG_CODE_MAP.get(src_lang, src_lang)
+    tgt_lang_name = LANG_CODE_MAP.get(tgt_lang, tgt_lang)
+    
     messages = [
-        {"role": "user", "content": f"Translate this {src_lang} document to {tgt_lang}:\n{src_text}\n"},
+        {"role": "user", "content": f"Translate this {src_lang_name} text to {tgt_lang_name}:\n{example_src}"},
+        {"role": "assistant", "content": f"{example_tgt}"},
+        {"role": "user", "content": f"Now translate this {src_lang_name} text to {tgt_lang_name}:\n{src_text}"},
         {"role": "assistant", "content": ""}
     ]
     return tokenizer.apply_chat_template(messages, add_generation_prompt=True, tokenize=False)
 
 # ------------------------------
-# Dataset builder
+# Dataset builder (streaming, memory-safe random one-shot)
 # ------------------------------
-def load_streaming_dataset(tokenizer, split="train", max_samples=100):
+def load_streaming_dataset(tokenizer, split="train", max_samples=100, one_shot=True):
     examples = []
+
     for pair in LANGUAGE_PAIRS:
         src, tgt = pair.split("_")
         actual_split = "train" if split == "dev" else split
 
-        ds = load_dataset("ai4bharat/Pralekha", split=actual_split, data_dir=actual_split, streaming=False)
-        added = 0
-        for i, row in enumerate(ds):
-            if split == "dev" and i < 1000:
-                continue
+        # Preselect one-shot example using reservoir sampling
+        one_shot_example = ("", "")
+        if one_shot:
+            ds = load_dataset("ai4bharat/Pralekha", split=actual_split, streaming=True, data_dir=actual_split)
+            count = 0
+            for row in ds:
+                src_txt = row.get("src_txt") or row.get("src_text") or ""
+                tgt_txt = row.get("tgt_txt") or row.get("tgt_text") or ""
+                if not src_txt or not tgt_txt:
+                    continue
+                if random.randint(0, count) == 0:
+                    one_shot_example = (src_txt, tgt_txt)
+                count += 1
+                if count >= 500:  # limit to first 500 rows for speed
+                    break
 
+        # Load streaming dataset again for actual examples
+        ds = load_dataset("ai4bharat/Pralekha", split=actual_split, streaming=True, data_dir=actual_split)
+        added = 0
+        for row in ds:
             src_txt = row.get("src_txt") or row.get("src_text") or ""
             tgt_txt = row.get("tgt_txt") or row.get("tgt_text") or ""
             if not src_txt or not tgt_txt:
                 continue
 
-            # Build prompt via HF chat template
-            prompt_ids = tokenizer(build_prompt(src_txt, src, tgt, tokenizer), add_special_tokens=False)["input_ids"]
+            if one_shot:
+                prompt_ids = tokenizer(
+                    build_prompt(src_txt, src, tgt, one_shot_example, tokenizer),
+                    add_special_tokens=False
+                )["input_ids"]
+            else:
+                prompt_ids = tokenizer(
+                    build_prompt(src_txt, src, tgt, ("", ""), tokenizer),
+                    add_special_tokens=False
+                )["input_ids"]
+
             target_ids = tokenizer(tgt_txt, truncation=True, max_length=MAX_SEQ_LEN)["input_ids"]
 
+            if len(prompt_ids) >= MAX_SEQ_LEN:
+                prompt_ids = prompt_ids[-(MAX_SEQ_LEN - 10):]
             input_ids = (prompt_ids + target_ids)[:MAX_SEQ_LEN]
             attention_mask = [1] * len(input_ids)
             prompt_len = min(len(prompt_ids), len(input_ids))
@@ -71,10 +108,12 @@ def load_streaming_dataset(tokenizer, split="train", max_samples=100):
                 "labels": labels,
                 "src_txt": src_txt,
                 "tgt_txt": tgt_txt,
+                "direction": pair
             })
             added += 1
             if max_samples and added >= max_samples:
                 break
+
     return Dataset.from_list(examples)
 
 # ------------------------------
@@ -97,8 +136,8 @@ def train_model():
     model = get_peft_model(model, lora_config)
     model.print_trainable_parameters()
 
-    training_data = load_streaming_dataset(tokenizer, split=TRAIN_SPLIT, max_samples=TRAIN_SAMPLES)
-    eval_data = load_streaming_dataset(tokenizer, split=EVAL_SPLIT, max_samples=EVAL_SAMPLES)
+    training_data = load_streaming_dataset(tokenizer, split=TRAIN_SPLIT, max_samples=TRAIN_SAMPLES, one_shot=True)
+    eval_data = load_streaming_dataset(tokenizer, split=EVAL_SPLIT, max_samples=EVAL_SAMPLES, one_shot=True)
 
     training_config = SFTConfig(
         output_dir=str(OUTPUT_DIR),
@@ -136,30 +175,73 @@ def train_model():
     return model, tokenizer, eval_data, trainer
 
 # ------------------------------
-# Evaluation
+# Evaluation (Clean predictions + CHRF per direction)
 # ------------------------------
-def evaluate_model(model, tokenizer, eval_data):
+def evaluate_model(model, tokenizer, eval_data, save_jsonl=True, jsonl_path="eval_predictions.jsonl", max_new_tokens=512):
     device = "cuda" if torch.cuda.is_available() else "cpu"
     model.to(device)
     model.eval()
-    preds, refs = [], []
+    preds, refs, dirs, srcs = [], [], [], []
     total_loss = 0
 
-    for ex in eval_data:
-        input_ids = torch.tensor([ex["input_ids"]]).to(device)
-        attention_mask = torch.tensor([ex["attention_mask"]]).to(device)
-        labels = torch.tensor([ex["labels"]]).to(device)
+    torch._dynamo.reset()
+    with torch.inference_mode():
+        for ex in eval_data:
+            input_ids = torch.tensor([ex["input_ids"]], device=device)
+            attention_mask = torch.tensor([ex["attention_mask"]], device=device)
+            labels = torch.tensor([ex["labels"]], device=device)
 
-        with torch.no_grad():
             outputs = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
             total_loss += outputs.loss.item()
-            generated = model.generate(input_ids=input_ids, attention_mask=attention_mask, max_new_tokens=64)
-            preds.append(tokenizer.decode(generated[0], skip_special_tokens=True))
+
+            generated = model.generate(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                max_new_tokens=max_new_tokens,
+                do_sample=False,
+                repetition_penalty=2.0
+            )
+            gen_text = tokenizer.decode(generated[0], skip_special_tokens=True)
+
+            # Remove prompt prefix
+            prompt_text = tokenizer.decode(input_ids[0], skip_special_tokens=True)
+            pred_only = gen_text[len(prompt_text):].strip()
+            if pred_only.lower().startswith("assistant:"):
+                pred_only = pred_only[len("assistant:"):].strip()
+
+            preds.append(pred_only)
             refs.append(ex["tgt_txt"])
+            srcs.append(ex["src_txt"])
+            dirs.append(ex["direction"])
 
     avg_loss = total_loss / len(eval_data) if eval_data else 0
-    chrf = sacrebleu.corpus_chrf(preds, [refs])
-    print(f"[RESULT] Avg Eval Loss: {avg_loss:.4f}, chrF: {chrf.score:.2f}")
+    print(f"[RESULT] Avg Eval Loss: {avg_loss:.4f}")
+
+    # CHRF per direction
+    total_chrf = []
+    for pair in LANGUAGE_PAIRS:
+        pair_preds = [p for p, d in zip(preds, dirs) if d==pair]
+        pair_refs = [[r] for r, d in zip(refs, dirs) if d==pair]
+        if pair_preds:
+            chrf = sacrebleu.corpus_chrf(pair_preds, pair_refs)
+            total_chrf.append(chrf.score)
+            print(f"[RESULT] {pair} chrF: {chrf.score:.2f}")
+    if total_chrf:
+        print(f"[RESULT] Avg chrF (both directions): {sum(total_chrf)/len(total_chrf):.2f}")
+
+    # Save JSONL
+    if save_jsonl:
+        with open(jsonl_path, "w", encoding="utf-8") as f:
+            for s, p, r, d in zip(srcs, preds, refs, dirs):
+                f.write(json.dumps({"src": s, "pred": p, "ref": r, "direction": d}, ensure_ascii=False) + "\n")
+        print(f"✅ Saved predictions to {jsonl_path}")
+
+        # Print JSONL
+        print("\n=== JSONL Translation Output ===")
+        with open(jsonl_path, "r", encoding="utf-8") as f:
+            for line in f:
+                print(line.strip())
+        print("=== End of JSONL ===")
 
 # ------------------------------
 # Plot & download
@@ -181,7 +263,6 @@ def plot_and_download_metrics(trainer):
     plt.tight_layout()
     plt.show()
 
-    # Save images
     plt.savefig("training_metrics.png")
     print("✅ Training metrics saved as 'training_metrics.png'. Download via Colab Files tab.")
 
@@ -190,5 +271,5 @@ def plot_and_download_metrics(trainer):
 # ------------------------------
 if __name__ == "__main__":
     model, tokenizer, eval_data, trainer = train_model()
-    evaluate_model(model, tokenizer, eval_data)
+    evaluate_model(model, tokenizer, eval_data, max_new_tokens=512)
     plot_and_download_metrics(trainer)
