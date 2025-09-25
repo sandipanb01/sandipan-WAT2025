@@ -297,3 +297,5 @@ df = pd.DataFrame(data)
 
 # Display first 20 rows nicely
 df.head(20)
+    
+    
