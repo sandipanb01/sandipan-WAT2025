@@ -11,3 +11,5 @@
     peft==0.13.2 \
     bitsandbytes \
     accelerate
+pip install git+https://github.com/Unbabel/COMET.git
+!pip install evaluate
