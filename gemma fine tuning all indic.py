@@ -1,302 +1,267 @@
+# -*- coding: utf-8 -*-
 # ======================================================
-# Gemma-IT Fine-tuning for Pralekha (Random One-shot + Streaming + English↔Indian + Clean Outputs + Plots + Download)
+# ✅ Gemma-IT Fine-tuning for Pralekha (Full Corpus + Streaming + Batched Eval + Safe on T4)
 # ======================================================
 
-import os, json, random
+import os, json, zipfile
 from pathlib import Path
 import torch
-from datasets import load_dataset, Dataset
+from datasets import load_dataset, get_dataset_split_names
+from torch.utils.data import IterableDataset
 from transformers import AutoTokenizer, AutoModelForCausalLM
 from peft import LoraConfig, get_peft_model
 from trl import SFTTrainer, SFTConfig
-import sacrebleu
+import sacrebleu, evaluate
 import matplotlib.pyplot as plt
-import pandas as pd
+from itertools import islice
 
-# ------------------------------
-# Config
 # ------------------------------
 MODEL_NAME = "google/gemma-3-270m-it"
-OUTPUT_DIR = Path("./gemma3-pralekha")
+OUTPUT_DIR = Path("./gemma3-pralekha-full")
+OUTPUT_DIR.mkdir(exist_ok=True, parents=True)
 MAX_SEQ_LEN = 1024
-TRAIN_SPLIT = "train"
-EVAL_SPLIT = "dev"
+BATCH_SIZE = 8  # for batched evaluation
+TRAIN_SAMPLES_PER_PAIR = None  # None = full corpus streaming
 
-# Indian languages in Pralekha
-INDIAN_LANGS = ["hin", "ben", "tam", "tel", "mal", "kan", "mar", "guj", "urd", "pan", "ori", "asm", "kok", "mai", "san", "nep"]
+INDIAN_LANGS = ["hin","ben","tam","tel","mal","kan","mar","guj","urd","pan","ori"]
 LANG_CODE_MAP = {
-    "eng": "English",
-    "hin": "Hindi",
-    "ben": "Bengali",
-    "tam": "Tamil",
-    "tel": "Telugu",
-    "mal": "Malayalam",
-    "kan": "Kannada",
-    "mar": "Marathi",
-    "guj": "Gujarati",
-    "urd": "Urdu",
-    "pan": "Punjabi",
-    "ori": "Odia",
-    "asm": "Assamese",
-    "kok": "Konkani",
-    "mai": "Maithili",
-    "san": "Sanskrit",
-    "nep": "Nepali"
+    "eng":"English","hin":"Hindi","ben":"Bengali","tam":"Tamil","tel":"Telugu",
+    "mal":"Malayalam","kan":"Kannada","mar":"Marathi","guj":"Gujarati",
+    "urd":"Urdu","pan":"Punjabi","ori":"Odia"
 }
 
-TRAIN_SAMPLES_PER_PAIR = 50
-EVAL_SAMPLES_PER_PAIR = 10
-
-# ------------------------------
-# Build HF Chat Prompt (Random One-shot)
 # ------------------------------
 def build_prompt(src_text, src_lang, tgt_lang, example_pair, tokenizer):
     example_src, example_tgt = example_pair
-    src_lang_name = LANG_CODE_MAP.get(src_lang, src_lang)
-    tgt_lang_name = LANG_CODE_MAP.get(tgt_lang, tgt_lang)
-    
+    src_name = LANG_CODE_MAP.get(src_lang, src_lang)
+    tgt_name = LANG_CODE_MAP.get(tgt_lang, tgt_lang)
     messages = [
-        {"role": "user", "content": f"Translate this {src_lang_name} text to {tgt_lang_name}:\n{example_src}"},
-        {"role": "assistant", "content": f"{example_tgt}"},
-        {"role": "user", "content": f"Now translate this {src_lang_name} text to {tgt_lang_name}:\n{src_text}"},
+        {"role": "user", "content": f"Translate this {src_name} text to {tgt_name}:\n{example_src}"},
+        {"role": "assistant", "content": example_tgt},
+        {"role": "user", "content": f"Now translate this {src_name} text to {tgt_name}:\n{src_text}"},
         {"role": "assistant", "content": ""}
     ]
     return tokenizer.apply_chat_template(messages, add_generation_prompt=True, tokenize=False)
 
 # ------------------------------
-# Dataset builder (all English↔Indic pairs)
-# ------------------------------
-def load_streaming_dataset(tokenizer, split="train", samples_per_pair=50, one_shot=True):
-    examples = []
-    actual_split = "train" if split == "dev" else split
+def stream_examples(tokenizer, samples_per_pair=TRAIN_SAMPLES_PER_PAIR):
+    """Stream all language directions from full Pralekha corpus."""
+    dataset_name = "ai4bharat/Pralekha"
+    config_name = "train"
+    available_splits = get_dataset_split_names(dataset_name, config_name)
 
-    # For each English↔Indic pair
-    for lang in INDIAN_LANGS:
-        # Preselect one-shot example
-        one_shot_example = ("", "")
-        if one_shot:
-            ds = load_dataset("ai4bharat/Pralekha", split=actual_split, streaming=True, data_dir=actual_split)
-            count = 0
-            for row in ds:
-                sl, tl = row.get("src_lang"), row.get("tgt_lang")
-                if not sl or not tl or sl == tl:
-                    continue
-                if not ((sl == "eng" and tl == lang) or (sl == lang and tl == "eng")):
-                    continue
-                src_txt = row.get("src_txt") or row.get("src_text") or ""
-                tgt_txt = row.get("tgt_txt") or row.get("tgt_text") or ""
-                if not src_txt or not tgt_txt:
-                    continue
-                if random.randint(0, count) == 0:
-                    one_shot_example = (src_txt, tgt_txt)
-                count += 1
-                if count >= 500:
-                    break
+    for split_name in available_splits:
+        parts = split_name.split("_")
+        if len(parts) != 2:
+            continue
+        sl, tl = parts
+        if sl not in INDIAN_LANGS + ["eng"] or tl not in INDIAN_LANGS + ["eng"]:
+            continue
+        lang = tl if sl == "eng" else sl
+        if lang not in INDIAN_LANGS:
+            continue
 
-        # Stream actual examples for this pair
-        ds = load_dataset("ai4bharat/Pralekha", split=actual_split, streaming=True, data_dir=actual_split)
-        added = 0
+        ds = load_dataset(dataset_name, split=split_name, streaming=True, name=config_name)
+
+        # one-shot example
+        one_shot = ("", "")
         for row in ds:
-            sl, tl = row.get("src_lang"), row.get("tgt_lang")
-            if not sl or not tl or sl == tl:
-                continue
-            if not ((sl == "eng" and tl == lang) or (sl == lang and tl == "eng")):
-                continue
-            src_txt = row.get("src_txt") or row.get("src_text") or ""
-            tgt_txt = row.get("tgt_txt") or row.get("tgt_text") or ""
-            if not src_txt or not tgt_txt:
-                continue
-
-            # Determine direction
-            eng, indic = (src_txt, tgt_txt) if sl == "eng" else (tgt_txt, src_txt)
-
-            for src, tgt, direction in [(eng, indic, f"eng_{lang}"), (indic, eng, f"{lang}_eng")]:
-                prompt = build_prompt(src, direction.split("_")[0], direction.split("_")[1],
-                                      one_shot_example if one_shot else ("", ""), tokenizer)
-                prompt_ids = tokenizer(prompt, add_special_tokens=False)["input_ids"]
-                target_ids = tokenizer(tgt, truncation=True, max_length=MAX_SEQ_LEN)["input_ids"]
-
-                if len(prompt_ids) >= MAX_SEQ_LEN:
-                    prompt_ids = prompt_ids[-(MAX_SEQ_LEN - 10):]
-                input_ids = (prompt_ids + target_ids)[:MAX_SEQ_LEN]
-                attention_mask = [1] * len(input_ids)
-                prompt_len = min(len(prompt_ids), len(input_ids))
-                labels = [-100] * prompt_len + input_ids[prompt_len:]
-                labels = labels[:MAX_SEQ_LEN]
-
-                examples.append({
-                    "input_ids": input_ids,
-                    "attention_mask": attention_mask,
-                    "labels": labels,
-                    "src_txt": src,
-                    "tgt_txt": tgt,
-                    "direction": direction
-                })
-
-            added += 1
-            if samples_per_pair and added >= samples_per_pair:
+            src_txt = row.get("src_txt") or ""
+            tgt_txt = row.get("tgt_txt") or ""
+            if len(src_txt.split()) > 5 and len(tgt_txt.split()) > 5:
+                one_shot = (src_txt, tgt_txt)
                 break
 
-    return Dataset.from_list(examples)
+        # re-open for actual streaming
+        ds = load_dataset(dataset_name, split=split_name, streaming=True, name=config_name)
+        added = 0
+        for row in ds:
+            src_txt, tgt_txt = row.get("src_txt",""), row.get("tgt_txt","")
+            if not src_txt or not tgt_txt:
+                continue
+            eng, indic = (src_txt, tgt_txt) if sl == "eng" else (tgt_txt, src_txt)
+            for src, tgt, direction in [(eng, indic, f"eng_{lang}"), (indic, eng, f"{lang}_eng")]:
+                yield {
+                    "input_text": build_prompt(src, direction.split("_")[0], direction.split("_")[1], one_shot, tokenizer),
+                    "target_text": tgt,
+                    "direction": direction
+                }
+            added += 1
+            if samples_per_pair and added >= samples_per_pair // len(available_splits):
+                break
 
 # ------------------------------
-# Training function
+class PralekhaIterableDataset(IterableDataset):
+    def __init__(self, tokenizer, max_seq_len=MAX_SEQ_LEN, samples_per_pair=TRAIN_SAMPLES_PER_PAIR):
+        self.tokenizer = tokenizer
+        self.max_seq_len = max_seq_len
+        self.samples_per_pair = samples_per_pair
+        self.expected_examples = len(INDIAN_LANGS) * 2 * (samples_per_pair or 50000)
+
+    def __iter__(self):
+        for ex in stream_examples(self.tokenizer, samples_per_pair=self.samples_per_pair):
+            prompt_ids = self.tokenizer(ex["input_text"], truncation=True, max_length=self.max_seq_len, add_special_tokens=False)["input_ids"]
+            target_ids = self.tokenizer(ex["target_text"], truncation=True, max_length=self.max_seq_len)["input_ids"]
+            input_ids = (prompt_ids + target_ids)[:self.max_seq_len]
+            attention_mask = [1]*len(input_ids)
+            labels = [-100]*len(prompt_ids) + target_ids
+            labels = labels[:self.max_seq_len]
+            yield {"input_ids": input_ids, "attention_mask": attention_mask, "labels": labels}
+
 # ------------------------------
-def train_model():
-    tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, trust_remote_code=True, from_slow=True)
+def prepare_model():
+    tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, trust_remote_code=True)
     tokenizer.pad_token = tokenizer.eos_token
     tokenizer.padding_side = "right"
+    tokenizer.model_input_names = ["input_ids", "attention_mask"]
 
-    compute_dtype = torch.float32
     model = AutoModelForCausalLM.from_pretrained(
-        MODEL_NAME, torch_dtype=compute_dtype, device_map="auto", trust_remote_code=True, attn_implementation="eager"
+        MODEL_NAME,
+        torch_dtype=torch.bfloat16 if torch.cuda.is_available() else torch.float16,
+        device_map="auto",
+        attn_implementation="eager"
     )
 
-    lora_config = LoraConfig(
-        r=16, lora_alpha=16, target_modules=["q_proj","v_proj","k_proj","o_proj"],
+    lora_cfg = LoraConfig(
+        r=16, lora_alpha=16,
+        target_modules=["q_proj","v_proj","k_proj","o_proj"],
         lora_dropout=0.05, bias="none", task_type="CAUSAL_LM"
     )
-    model = get_peft_model(model, lora_config)
-    model.print_trainable_parameters()
+    return get_peft_model(model, lora_cfg), tokenizer
 
-    training_data = load_streaming_dataset(tokenizer, split=TRAIN_SPLIT, samples_per_pair=TRAIN_SAMPLES_PER_PAIR, one_shot=True)
-    eval_data = load_streaming_dataset(tokenizer, split=EVAL_SPLIT, samples_per_pair=EVAL_SAMPLES_PER_PAIR, one_shot=True)
+# ------------------------------
+def train_model():
+    model, tokenizer = prepare_model()
+    train_dataset = PralekhaIterableDataset(tokenizer)
 
-    training_config = SFTConfig(
+    trainer_cfg = SFTConfig(
         output_dir=str(OUTPUT_DIR),
         per_device_train_batch_size=1,
-        gradient_accumulation_steps=1,
-        learning_rate=2e-4,
-        num_train_epochs=2,
-        logging_steps=1,
-        save_strategy="epoch",
-        eval_strategy="no",
-        bf16=False,
-        fp16=False,
-        optim="paged_adamw_32bit",
-        warmup_ratio=0.1,
-        lr_scheduler_type="linear",
-        max_grad_norm=0.3,
-        report_to="none",
-        run_name="gemma3-pralekha",
-        dataloader_pin_memory=False,
+        gradient_accumulation_steps=4,
+        learning_rate=1.5e-4,
+        num_train_epochs=1,
         max_seq_length=MAX_SEQ_LEN,
-        packing=False,
+        logging_steps=10,
+        save_strategy="epoch",
+        report_to="none",
+        max_steps=None,  # Streaming full dataset
     )
 
-    trainer = SFTTrainer(
-        model=model,
-        args=training_config,
-        train_dataset=training_data,
-        tokenizer=tokenizer,
-    )
-
+    trainer = SFTTrainer(model=model, args=trainer_cfg, train_dataset=train_dataset, tokenizer=tokenizer)
     trainer.train()
-    trainer.model.save_pretrained(OUTPUT_DIR)
+    model.save_pretrained(OUTPUT_DIR)
     tokenizer.save_pretrained(OUTPUT_DIR)
-
-    return model, tokenizer, eval_data, trainer
+    return model, tokenizer, trainer
 
 # ------------------------------
-# Evaluation (Clean predictions + CHRF per direction)
+def batch_iterable(iterable, n=BATCH_SIZE):
+    it = iter(iterable)
+    while True:
+        batch = list(islice(it, n))
+        if not batch:
+            break
+        yield batch
+
 # ------------------------------
-def evaluate_model(model, tokenizer, eval_data, save_jsonl=True, jsonl_path="eval_predictions.jsonl", max_new_tokens=512):
+def evaluate_model(model, tokenizer, max_new_tokens=128):
+    """Memory-safe streaming evaluation with incremental BLEU, chrF, and COMET."""
     device = "cuda" if torch.cuda.is_available() else "cpu"
     model.to(device)
     model.eval()
-    preds, refs, dirs, srcs = [], [], [], []
-    total_loss = 0
+    comet = evaluate.load("comet")
+    dataset_name = "ai4bharat/Pralekha"
+    config_name = "dev"
+    available_splits = get_dataset_split_names(dataset_name, config_name)
 
-    torch._dynamo.reset()
-    with torch.inference_mode():
-        for ex in eval_data:
-            input_ids = torch.tensor([ex["input_ids"]], device=device)
-            attention_mask = torch.tensor([ex["attention_mask"]], device=device)
-            labels = torch.tensor([ex["labels"]], device=device)
+    # Prepare files and metric accumulators per direction
+    out_files = {}
+    metric_accumulators = {}
+    for lang in INDIAN_LANGS:
+        for direction in [f"eng_{lang}", f"{lang}_eng"]:
+            path = OUTPUT_DIR / f"{direction}.jsonl"
+            out_files[direction] = open(path, "w", encoding="utf-8")
+            metric_accumulators[direction] = {
+                "preds": [],
+                "refs": [],
+                "comet_scores": []
+            }
 
-            outputs = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
-            total_loss += outputs.loss.item()
+    # Stream dataset
+    for split_name in available_splits:
+        parts = split_name.split("_")
+        if len(parts) != 2: continue
+        sl, tl = parts
+        if sl not in INDIAN_LANGS+["eng"] or tl not in INDIAN_LANGS+["eng"]: continue
+        lang = tl if sl=="eng" else sl
+        if lang not in INDIAN_LANGS: continue
 
-            generated = model.generate(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                max_new_tokens=max_new_tokens,
-                do_sample=False,
-                repetition_penalty=2.0
-            )
-            gen_text = tokenizer.decode(generated[0], skip_special_tokens=True)
+        ds = load_dataset(dataset_name, split=split_name, streaming=True, name=config_name)
+        for row in ds:
+            src_txt, tgt_txt = row.get("src_txt",""), row.get("tgt_txt","")
+            if not src_txt or not tgt_txt: continue
+            eng, indic = (src_txt, tgt_txt) if sl=="eng" else (tgt_txt, src_txt)
 
-            # Remove prompt prefix
-            prompt_text = tokenizer.decode(input_ids[0], skip_special_tokens=True)
-            pred_only = gen_text[len(prompt_text):].strip()
-            if pred_only.lower().startswith("assistant:"):
-                pred_only = pred_only[len("assistant:"):].strip()
+            for src, tgt, direction in [(eng, indic, f"eng_{lang}"), (indic, eng, f"{lang}_eng")]:
+                prompt = build_prompt(src, direction.split("_")[0], direction.split("_")[1], ("Example source","Example target"), tokenizer)
+                enc = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=MAX_SEQ_LEN).to(device)
+                with torch.no_grad():
+                    output = model.generate(**enc, max_new_tokens=max_new_tokens)
+                pred_text = tokenizer.decode(output[0], skip_special_tokens=True).strip()
 
-            preds.append(pred_only)
-            refs.append(ex["tgt_txt"])
-            srcs.append(ex["src_txt"])
-            dirs.append(ex["direction"])
+                # Write prediction to file
+                out_files[direction].write(json.dumps([pred_text], ensure_ascii=False)+"\n")
 
-    avg_loss = total_loss / len(eval_data) if eval_data else 0
-    print(f"[RESULT] Avg Eval Loss: {avg_loss:.4f}")
+                # Incremental metrics
+                metric_accumulators[direction]["preds"].append(pred_text)
+                metric_accumulators[direction]["refs"].append(tgt)
+                if len(metric_accumulators[direction]["preds"]) % 32 == 0:
+                    batch_preds = metric_accumulators[direction]["preds"]
+                    batch_refs = metric_accumulators[direction]["refs"]
+                    batch_comet = comet.compute(predictions=batch_preds, references=batch_refs, sources=[""]*len(batch_refs))["mean_score"]
+                    metric_accumulators[direction]["comet_scores"].append(batch_comet)
+                    metric_accumulators[direction]["preds"] = []
+                    metric_accumulators[direction]["refs"] = []
 
-    # CHRF per direction
-    total_chrf = []
-    for d in set(dirs):
-        pair_preds = [p for p, dd in zip(preds, dirs) if dd==d]
-        pair_refs = [[r] for r, dd in zip(refs, dirs) if dd==d]
-        if pair_preds:
-            chrf = sacrebleu.corpus_chrf(pair_preds, pair_refs)
-            total_chrf.append(chrf.score)
-            print(f"[RESULT] {d} chrF: {chrf.score:.2f}")
-    if total_chrf:
-        print(f"[RESULT] Avg chrF (all English↔Indic directions): {sum(total_chrf)/len(total_chrf):.2f}")
+    # Close files
+    for f in out_files.values():
+        f.close()
 
-    # Save JSONL
-    if save_jsonl:
-        with open(jsonl_path, "w", encoding="utf-8") as f:
-            for s, p, r, d in zip(srcs, preds, refs, dirs):
-                f.write(json.dumps({"src": s, "pred": p, "ref": r, "direction": d}, ensure_ascii=False) + "\n")
-        print(f"✅ Saved predictions to {jsonl_path}")
+    # Zip submission
+    zip_path = OUTPUT_DIR / "submission.zip"
+    with zipfile.ZipFile(zip_path, "w") as zf:
+        for lang in INDIAN_LANGS:
+            for direction in [f"eng_{lang}", f"{lang}_eng"]:
+                path = OUTPUT_DIR / f"{direction}.jsonl"
+                zf.write(path, path.name)
+    print(f"✅ Submission saved at {zip_path}")
+
+    # Final metric computation
+    print("\n📊 Evaluation Metrics per direction:")
+    for lang in INDIAN_LANGS:
+        for direction in [f"eng_{lang}", f"{lang}_eng"]:
+            preds = metric_accumulators[direction]["preds"]
+            refs = metric_accumulators[direction]["refs"]
+            comet_scores = metric_accumulators[direction]["comet_scores"]
+            if preds and refs:
+                bleu = sacrebleu.corpus_bleu(preds,[refs]).score
+                chrf = sacrebleu.corpus_chrf(preds,[[r] for r in refs]).score
+                comet_final = 0 if not comet_scores else sum(comet_scores)/len(comet_scores)
+                print(f"[{direction}] BLEU={bleu:.2f}  chrF={chrf:.2f}  COMET={comet_final:.2f}")
 
 # ------------------------------
-# Plot & download
-# ------------------------------
-def plot_and_download_metrics(trainer):
+def plot_training_metrics(trainer):
     logs = trainer.state.log_history
     steps = [l.get("step") for l in logs if "loss" in l]
     losses = [l.get("loss") for l in logs if "loss" in l]
-    grad_norms = [l.get("grad_norm") for l in logs if "grad_norm" in l]
-    lr = [l.get("learning_rate") for l in logs if "learning_rate" in l]
-
-    plt.figure(figsize=(15,4))
-    plt.subplot(1,3,1)
-    plt.plot(steps, losses, label="Loss"); plt.xlabel("Step"); plt.ylabel("Loss"); plt.title("Training Loss")
-    plt.subplot(1,3,2)
-    if grad_norms: plt.plot(steps[:len(grad_norms)], grad_norms, label="Grad Norm", color="orange"); plt.xlabel("Step"); plt.title("Grad Norm")
-    plt.subplot(1,3,3)
-    if lr: plt.plot(steps[:len(lr)], lr, label="LR", color="green"); plt.xlabel("Step"); plt.title("Learning Rate")
+    plt.figure(figsize=(8,4))
+    plt.plot(steps, losses)
+    plt.xlabel("Step"); plt.ylabel("Loss"); plt.title("Training Loss")
     plt.tight_layout()
-    plt.show()
+    plt.savefig(OUTPUT_DIR/"training_metrics.png")
+    print("📈 Training metrics saved.")
 
-    plt.savefig("training_metrics.png")
-    print("✅ Training metrics saved as 'training_metrics.png'. Download via Colab Files tab.")
-
-# ------------------------------
-# Main
 # ------------------------------
 if __name__ == "__main__":
-    model, tokenizer, eval_data, trainer = train_model()
-    evaluate_model(model, tokenizer, eval_data, max_new_tokens=512)
-    plot_and_download_metrics(trainer)
-
-# ------------------------------
-# Colab: View JSONL predictions in a table
-# ------------------------------
-jsonl_path = "eval_predictions.jsonl"
-data = []
-with open(jsonl_path, "r", encoding="utf-8") as f:
-    for line in f:
-        data.append(json.loads(line))
-df = pd.DataFrame(data)
-df.head(20)
+    model, tokenizer, trainer = train_model()
+    evaluate_model(model, tokenizer)
+    plot_training_metrics(trainer)
