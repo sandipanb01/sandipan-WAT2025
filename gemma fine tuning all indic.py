@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 # ======================================================
-# ✅ Gemma-3 270M Fine-tuning + Evaluation for Pralekha
-# (Fast batched evaluation + Top-10 preview + T4-safe + ZIP + Metrics)
+# ✅ Universal Fine-tuning + Evaluation for any Hugging Face instruct/casual LM
+# (Streaming, LoRA, Fast Evaluation, Metrics, Top-10 Preview)
 # ======================================================
 
 import os, json, zipfile, math, warnings
@@ -19,18 +19,17 @@ from tqdm import tqdm
 from IPython.display import display, Markdown
 
 # ------------------------------ CONFIG
-MODEL_NAME = "google/gemma-3-270m-it"
-OUTPUT_DIR = Path("/content/gemma_pralekha_output")
+MODEL_NAME = "google/gemma-3-270m-it"   # replace with any HF causal/instruct LM
+OUTPUT_DIR = Path("/content/universal_output")
 OUTPUT_DIR.mkdir(exist_ok=True, parents=True)
 
 MAX_SEQ_LEN = 1024
 BATCH_SIZE = 1
 GRAD_ACCUM = 4
-MAX_TRAIN_STEPS = 500
-JSONL_CHUNK = 1000
-EVAL_BATCH_SIZE = 4
-FULL_DATASET = False #Set True for full Pralekha
-MAX_COLAB_SAMPLES = 10000  # ≈ set None for full Pralekha
+MAX_TRAIN_STEPS = 500  # super-optimal steps
+EVAL_BATCH_SIZE = 8 #set to 4
+FULL_DATASET = False #set True for full data
+MAX_COLAB_SAMPLES = 500  # set None for full Pralekha
 
 INDIAN_LANGS = ["hin","ben","tam","tel","mal","kan","mar","guj","urd","pan","ori"]
 LANG_MAP = {
@@ -39,16 +38,22 @@ LANG_MAP = {
     "guj":"Gujarati","urd":"Urdu","pan":"Punjabi","ori":"Odia"
 }
 
-# ------------------------------ PROMPT BUILDER
-def build_prompt(src, src_lang, tgt_lang, example, tokenizer):
+# ------------------------------ UNIVERSAL PROMPT BUILDER
+def build_prompt(src, src_lang, tgt_lang, example, tokenizer=None):
+    """
+    Works for any model. If tokenizer has apply_chat_template, uses it. Else fallback.
+    """
     ex_src, ex_tgt = example
-    msgs = [
-        {"role":"user","content":f"Translate this {LANG_MAP[src_lang]} text to {LANG_MAP[tgt_lang]}:\n{ex_src}"},
-        {"role":"assistant","content":ex_tgt},
-        {"role":"user","content":f"Now translate this {LANG_MAP[src_lang]} text to {LANG_MAP[tgt_lang]}:\n{src}"},
-        {"role":"assistant","content":""}
-    ]
-    return tokenizer.apply_chat_template(msgs, add_generation_prompt=True, tokenize=False)
+    if tokenizer and hasattr(tokenizer, "apply_chat_template"):
+        msgs = [
+            {"role":"user","content":f"Translate this {LANG_MAP[src_lang]} text to {LANG_MAP[tgt_lang]}:\n{ex_src}"},
+            {"role":"assistant","content":ex_tgt},
+            {"role":"user","content":f"Now translate this {LANG_MAP[src_lang]} text to {LANG_MAP[tgt_lang]}:\n{src}"},
+            {"role":"assistant","content":""}
+        ]
+        return tokenizer.apply_chat_template(msgs, add_generation_prompt=True, tokenize=False)
+    else:
+        return f"Example translation ({LANG_MAP[src_lang]} → {LANG_MAP[tgt_lang]}):\n{ex_src} → {ex_tgt}\n\nTranslate this {LANG_MAP[src_lang]} text to {LANG_MAP[tgt_lang]}:\n{src}"
 
 # ------------------------------ STREAMING DATASET
 def stream_examples(tokenizer, max_samples=None):
@@ -101,15 +106,26 @@ class PralekhaDataset(IterableDataset):
             yield {"input_ids": inp, "attention_mask":[1]*len(inp), "labels": lbl}
 
 # ------------------------------ MODEL PREP
+def detect_lora_modules(model):
+    # universal detection of QKV modules
+    modules = []
+    for n,m in model.named_modules():
+        n_lower = n.lower()
+        if any(x in n_lower for x in ["q_proj","k_proj","v_proj","o_proj","attn.wq","attn.wk","attn.wv","attn.wo"]):
+            modules.append(n.split(".")[-1])
+    return list(set(modules))
+
 def prepare_model():
     tok = AutoTokenizer.from_pretrained(MODEL_NAME, trust_remote_code=True)
     if tok.pad_token is None: tok.pad_token = tok.eos_token
-    model = AutoModelForCausalLM.from_pretrained(
-        MODEL_NAME, torch_dtype=torch.float32, device_map="auto"
-    )
+    model = AutoModelForCausalLM.from_pretrained(MODEL_NAME, torch_dtype=torch.float32, device_map="auto")
+
+    target_modules = detect_lora_modules(model)
+    print(f"⚡ LoRA target modules detected: {target_modules}")
+
     lora_cfg = LoraConfig(
         r=16, lora_alpha=16,
-        target_modules=["q_proj","v_proj","k_proj","o_proj"],
+        target_modules=target_modules,
         lora_dropout=0.05, task_type="CAUSAL_LM"
     )
     return get_peft_model(model, lora_cfg), tok
@@ -119,10 +135,15 @@ def train_model(max_samples=None):
     model, tok = prepare_model()
     ds = PralekhaDataset(tok, max_samples=max_samples)
     cfg = SFTConfig(
-        output_dir=str(OUTPUT_DIR), per_device_train_batch_size=BATCH_SIZE,
-        gradient_accumulation_steps=GRAD_ACCUM, learning_rate=1.5e-4,
-        num_train_epochs=1, max_steps=MAX_TRAIN_STEPS,
-        logging_steps=10, save_strategy="no", report_to="none"
+        output_dir=str(OUTPUT_DIR),
+        per_device_train_batch_size=BATCH_SIZE,
+        gradient_accumulation_steps=GRAD_ACCUM,
+        learning_rate=1.5e-4,
+        num_train_epochs=1,
+        max_steps=MAX_TRAIN_STEPS,
+        logging_steps=10,
+        save_strategy="no",
+        report_to="none"
     )
     trainer = SFTTrainer(model=model, args=cfg, train_dataset=ds, tokenizer=tok)
     trainer.train()
@@ -130,12 +151,12 @@ def train_model(max_samples=None):
     tok.save_pretrained(OUTPUT_DIR)
     return model, tok, trainer
 
-# ------------------------------ EVALUATION (FAST BATCHED + TOP-10 PREVIEW)
+# ------------------------------ EVALUATION (Fast + Top-10 Preview)
 def evaluate_model(model, tok, max_new_tokens=128, max_samples_per_split=None, batch_size=EVAL_BATCH_SIZE):
     warnings.filterwarnings("ignore", message="Setting `pad_token_id` to `eos_token_id`")
     device = "cuda" if torch.cuda.is_available() else "cpu"
     model.to(device).eval()
-    comet = evaluate.load("comet")
+    #comet = evaluate.load("comet") #Plz uncomment this
 
     preds, refs = {}, {}
     for lang in INDIAN_LANGS:
@@ -182,9 +203,9 @@ def evaluate_model(model, tok, max_new_tokens=128, max_samples_per_split=None, b
     sub_zip = OUTPUT_DIR / "submission.zip"
     with zipfile.ZipFile(sub_zip,"w") as zf:
         for d in preds:
-            n_chunks = math.ceil(len(preds[d])/JSONL_CHUNK)
+            n_chunks = math.ceil(len(preds[d])/1000)
             for i in range(n_chunks):
-                chunk = preds[d][i*JSONL_CHUNK:(i+1)*JSONL_CHUNK]
+                chunk = preds[d][i*1000:(i+1)*1000]
                 if not chunk: continue
                 fp = OUTPUT_DIR / f"{d.replace('_','_2_')}_{i+1}.jsonl"
                 with open(fp,"w",encoding="utf-8") as f:
@@ -198,7 +219,7 @@ def evaluate_model(model, tok, max_new_tokens=128, max_samples_per_split=None, b
         if not preds[d]: continue
         bleu_scores[d] = sacrebleu.corpus_bleu(preds[d],[refs[d]]).score
         chrf_scores[d] = sacrebleu.corpus_chrf(preds[d],[[r] for r in refs[d]]).score
-        comet_scores[d] = comet.compute(predictions=preds[d], references=refs[d], sources=[""]*len(refs[d]))["mean_score"]
+        #comet_scores[d] = comet.compute(predictions=preds[d], references=refs[d], sources=[""]*len(refs[d]))["mean_score"] #Plz Uncommnet this
 
     # ---------------- PLOTS
     for metric, scores in [("BLEU",bleu_scores),("chrF",chrf_scores),("COMET",comet_scores)]:
@@ -242,9 +263,45 @@ if __name__ == "__main__":
 
     # 2️⃣ Evaluate
     bleu, chrf, comet = evaluate_model(
-        model, tok, max_samples_per_split=None if FULL_DATASET else 500,
+        model, tok, max_samples_per_split=None if FULL_DATASET else 200,
         batch_size=EVAL_BATCH_SIZE
-    )
+    ) #replace else 200 by 1000
 
     # 3️⃣ Plot training curve
     plot_training(trainer)
+
+# ======================================================
+# 📊 Display BLEU, chrF, COMET Scores in Table Format
+# ======================================================
+import pandas as pd
+from IPython.display import display, Markdown
+
+# (Reuse the dictionaries returned by evaluate_model)
+# If you've just run the evaluation, 'bleu', 'chrf', 'comet' should already exist.
+# Otherwise, you can reload them manually from your saved data if needed.
+
+# Combine metrics into one DataFrame
+data = []
+for d in sorted(set(list(bleu.keys()) + list(chrf.keys()) + list(comet.keys()))):
+    data.append({
+        "Direction": d,
+        "BLEU": round(bleu.get(d, 0.0), 2),
+        "chrF": round(chrf.get(d, 0.0), 2),
+        "COMET": round(comet.get(d, 0.0), 4) if comet else "N/A"
+    })
+
+df_metrics = pd.DataFrame(data).sort_values("Direction").reset_index(drop=True)
+
+# Display as markdown + interactive table
+display(Markdown("## 📋 Translation Quality Metrics per Direction"))
+display(df_metrics.style.background_gradient(cmap="YlGnBu", subset=["BLEU","chrF"]))
+
+# Compute overall averages
+avg_bleu = sum(bleu.values()) / len(bleu) if bleu else 0
+avg_chrf = sum(chrf.values()) / len(chrf) if chrf else 0
+avg_comet = sum(comet.values()) / len(comet) if comet else 0
+
+print("\n🧮 Averages Across All Directions:")
+print(f"  ➤ Mean BLEU  : {avg_bleu:.2f}")
+print(f"  ➤ Mean chrF  : {avg_chrf:.2f}")
+print(f"  ➤ Mean COMET : {avg_comet:.4f}")
