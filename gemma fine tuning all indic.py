@@ -30,7 +30,7 @@ MAX_TRAIN_STEPS = 500
 JSONL_CHUNK = 1000
 EVAL_BATCH_SIZE = 4
 FULL_DATASET = False #Set True for full Pralekha
-MAX_COLAB_SAMPLES = 2500  # ≈ set None for full Pralekha
+MAX_COLAB_SAMPLES = 10000  # ≈ set None for full Pralekha
 
 INDIAN_LANGS = ["hin","ben","tam","tel","mal","kan","mar","guj","urd","pan","ori"]
 LANG_MAP = {
