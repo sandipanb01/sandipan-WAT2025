@@ -215,7 +215,7 @@ def evaluate_model(model, tok, max_new_tokens=256, max_samples_per_split=None, b
     for d in preds:
         if not preds[d]: continue
         bleu_scores[d] = sacrebleu.corpus_bleu(preds[d],[refs[d]]).score
-        chrf_scores[d] = sacrebleu.corpus_chrf(preds[d],[refs[d]]).score  
+        chrf_scores[d] = sacrebleu.corpus_chrf(preds[d], [[r] for r in refs[d]]).score 
         comet_scores[d] = comet.compute(
             predictions=preds[d],
             references=refs[d],
