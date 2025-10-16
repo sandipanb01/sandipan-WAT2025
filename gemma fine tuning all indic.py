@@ -27,7 +27,7 @@ MAX_SEQ_LEN = 1024
 BATCH_SIZE = 1
 GRAD_ACCUM = 4
 MAX_TRAIN_STEPS = 1000 #super-optimal step size
-EVAL_BATCH_SIZE = 8
+EVAL_BATCH_SIZE = 8 #you can also set to 4
 FULL_DATASET = False #set to True for full Pralekha
 MAX_COLAB_SAMPLES = 50000 #set to None for full Pralekha
 
