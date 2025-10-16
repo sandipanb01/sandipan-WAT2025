@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 # ======================================================
-# ✅ Universal Fine-tuning + Evaluation for any Hugging Face instruct/casual LM
+# ✅ Universal Fine-tuning + Evaluation for any Hugging Face instruct/causal LM
 # (Streaming, LoRA, Fast Evaluation, Metrics, Top-10 Preview)
 # ======================================================
 
@@ -26,10 +26,10 @@ OUTPUT_DIR.mkdir(exist_ok=True, parents=True)
 MAX_SEQ_LEN = 1024
 BATCH_SIZE = 1
 GRAD_ACCUM = 4
-MAX_TRAIN_STEPS = 500  # super-optimal steps
-EVAL_BATCH_SIZE = 8 #set to 4
-FULL_DATASET = False #set True for full data
-MAX_COLAB_SAMPLES = 500  # set None for full Pralekha
+MAX_TRAIN_STEPS = 1000 #super-optimal step size
+EVAL_BATCH_SIZE = 8
+FULL_DATASET = False #set to True for full Pralekha
+MAX_COLAB_SAMPLES = 50000 #set to None for full Pralekha
 
 INDIAN_LANGS = ["hin","ben","tam","tel","mal","kan","mar","guj","urd","pan","ori"]
 LANG_MAP = {
@@ -40,9 +40,6 @@ LANG_MAP = {
 
 # ------------------------------ UNIVERSAL PROMPT BUILDER
 def build_prompt(src, src_lang, tgt_lang, example, tokenizer=None):
-    """
-    Works for any model. If tokenizer has apply_chat_template, uses it. Else fallback.
-    """
     ex_src, ex_tgt = example
     if tokenizer and hasattr(tokenizer, "apply_chat_template"):
         msgs = [
@@ -70,7 +67,6 @@ def stream_examples(tokenizer, max_samples=None):
         if lang not in INDIAN_LANGS: continue
 
         ds = load_dataset(dataset_name, split=split, streaming=True, name=config_name)
-        # One-shot exemplar
         one_shot = ("","")
         for row in islice(ds, 50):
             s,t = row.get("src_txt",""), row.get("tgt_txt","")
@@ -107,7 +103,6 @@ class PralekhaDataset(IterableDataset):
 
 # ------------------------------ MODEL PREP
 def detect_lora_modules(model):
-    # universal detection of QKV modules
     modules = []
     for n,m in model.named_modules():
         n_lower = n.lower()
@@ -152,11 +147,12 @@ def train_model(max_samples=None):
     return model, tok, trainer
 
 # ------------------------------ EVALUATION (Fast + Top-10 Preview)
-def evaluate_model(model, tok, max_new_tokens=128, max_samples_per_split=None, batch_size=EVAL_BATCH_SIZE):
+def evaluate_model(model, tok, max_new_tokens=256, max_samples_per_split=None, batch_size=EVAL_BATCH_SIZE):  
     warnings.filterwarnings("ignore", message="Setting `pad_token_id` to `eos_token_id`")
     device = "cuda" if torch.cuda.is_available() else "cpu"
     model.to(device).eval()
-    #comet = evaluate.load("comet") #Plz uncomment this
+
+    comet = evaluate.load("comet")  
 
     preds, refs = {}, {}
     for lang in INDIAN_LANGS:
@@ -196,7 +192,8 @@ def evaluate_model(model, tok, max_new_tokens=128, max_samples_per_split=None, b
                     out = model.generate(**enc, max_new_tokens=max_new_tokens, pad_token_id=tok.pad_token_id)
                 decs = tok.batch_decode(out, skip_special_tokens=True)
                 for dirn, pred, ref in zip(batch_dirs,decs,batch_refs):
-                    preds[dirn].append(pred); refs[dirn].append(ref)
+                    preds[dirn].append(pred.strip())
+                    refs[dirn].append(ref.strip())
                 batch_prompts, batch_refs, batch_dirs = [], [], []
 
     # ---------------- SAVE JSONL FILES
@@ -218,8 +215,12 @@ def evaluate_model(model, tok, max_new_tokens=128, max_samples_per_split=None, b
     for d in preds:
         if not preds[d]: continue
         bleu_scores[d] = sacrebleu.corpus_bleu(preds[d],[refs[d]]).score
-        chrf_scores[d] = sacrebleu.corpus_chrf(preds[d],[[r] for r in refs[d]]).score
-        #comet_scores[d] = comet.compute(predictions=preds[d], references=refs[d], sources=[""]*len(refs[d]))["mean_score"] #Plz Uncommnet this
+        chrf_scores[d] = sacrebleu.corpus_chrf(preds[d],[refs[d]]).score  
+        comet_scores[d] = comet.compute(
+            predictions=preds[d],
+            references=refs[d],
+            sources=[""]*len(refs[d])
+        )["mean_score"]
 
     # ---------------- PLOTS
     for metric, scores in [("BLEU",bleu_scores),("chrF",chrf_scores),("COMET",comet_scores)]:
@@ -263,9 +264,10 @@ if __name__ == "__main__":
 
     # 2️⃣ Evaluate
     bleu, chrf, comet = evaluate_model(
-        model, tok, max_samples_per_split=None if FULL_DATASET else 200,
+        model, tok,
+        max_samples_per_split=None if FULL_DATASET else 1000,  
         batch_size=EVAL_BATCH_SIZE
-    ) #replace else 200 by 1000
+    )
 
     # 3️⃣ Plot training curve
     plot_training(trainer)
@@ -276,11 +278,6 @@ if __name__ == "__main__":
 import pandas as pd
 from IPython.display import display, Markdown
 
-# (Reuse the dictionaries returned by evaluate_model)
-# If you've just run the evaluation, 'bleu', 'chrf', 'comet' should already exist.
-# Otherwise, you can reload them manually from your saved data if needed.
-
-# Combine metrics into one DataFrame
 data = []
 for d in sorted(set(list(bleu.keys()) + list(chrf.keys()) + list(comet.keys()))):
     data.append({
@@ -291,12 +288,9 @@ for d in sorted(set(list(bleu.keys()) + list(chrf.keys()) + list(comet.keys())))
     })
 
 df_metrics = pd.DataFrame(data).sort_values("Direction").reset_index(drop=True)
-
-# Display as markdown + interactive table
 display(Markdown("## 📋 Translation Quality Metrics per Direction"))
 display(df_metrics.style.background_gradient(cmap="YlGnBu", subset=["BLEU","chrF"]))
 
-# Compute overall averages
 avg_bleu = sum(bleu.values()) / len(bleu) if bleu else 0
 avg_chrf = sum(chrf.values()) / len(chrf) if chrf else 0
 avg_comet = sum(comet.values()) / len(comet) if comet else 0
