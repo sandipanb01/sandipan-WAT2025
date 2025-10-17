@@ -1,309 +1,524 @@
+# -*- coding: utf-8 -*-
 # ======================================================
-# Gemma-IT Fine-tuning for Pralekha (Random One-shot + Streaming + English↔Hindi + Clean Outputs + Plots + Download)
+# ✅ Universal Fine-tuning + Evaluation for any Hugging Face instruct/causal LM
+# (Streaming, LoRA, Fast Evaluation, Metrics, Top-10 Preview)
 # ======================================================
 
-import os, json, random
+import os, json, zipfile, math, warnings
 from pathlib import Path
+from itertools import islice
 import torch
-from datasets import load_dataset, Dataset
+from datasets import load_dataset, get_dataset_split_names
+from torch.utils.data import IterableDataset
 from transformers import AutoTokenizer, AutoModelForCausalLM
 from peft import LoraConfig, get_peft_model
 from trl import SFTTrainer, SFTConfig
-import sacrebleu
+import sacrebleu, evaluate
 import matplotlib.pyplot as plt
+from tqdm import tqdm
+from IPython.display import display, Markdown
 
-# ------------------------------
-# Config
-# ------------------------------
-MODEL_NAME = "google/gemma-3-270m-it"
-OUTPUT_DIR = Path("./gemma3-pralekha")
+# ------------------------------ CONFIG
+MODEL_NAME = "google/gemma-3-270m-it"   # replace with any HF causal/instruct LM
+OUTPUT_DIR = Path("/content/universal_output")
+OUTPUT_DIR.mkdir(exist_ok=True, parents=True)
+
 MAX_SEQ_LEN = 1024
-TRAIN_SPLIT = "train"
-EVAL_SPLIT = "dev"
+BATCH_SIZE = 1
+GRAD_ACCUM = 4
+MAX_TRAIN_STEPS = 500 #super-optimal step size
+EVAL_BATCH_SIZE = 8 #you can also set to 4
+FULL_DATASET = False #set to True for full Pralekha
+MAX_COLAB_SAMPLES = 50000 #set to None for full Pralekha
 
-# Only English↔Hindi
-LANGUAGE_PAIRS = ["eng_hin", "hin_eng"]
-TRAIN_SAMPLES = 100
-EVAL_SAMPLES = 10
-
-LANG_CODE_MAP = {
-    "eng": "English",
-    "hin": "Hindi"
+INDIAN_LANGS = ["hin","ben","tam","tel","mal","kan","mar","guj","urd","pan","ori"]
+LANG_MAP = {
+    "eng":"English","hin":"Hindi","ben":"Bengali","tam":"Tamil",
+    "tel":"Telugu","mal":"Malayalam","kan":"Kannada","mar":"Marathi",
+    "guj":"Gujarati","urd":"Urdu","pan":"Punjabi","ori":"Odia"
 }
 
-# ------------------------------
-# Build HF Chat Prompt (Random One-shot)
-# ------------------------------
-def build_prompt(src_text, src_lang, tgt_lang, example_pair, tokenizer):
-    example_src, example_tgt = example_pair
-    src_lang_name = LANG_CODE_MAP.get(src_lang, src_lang)
-    tgt_lang_name = LANG_CODE_MAP.get(tgt_lang, tgt_lang)
-    
-    messages = [
-        {"role": "user", "content": f"Translate this {src_lang_name} text to {tgt_lang_name}:\n{example_src}"},
-        {"role": "assistant", "content": f"{example_tgt}"},
-        {"role": "user", "content": f"Now translate this {src_lang_name} text to {tgt_lang_name}:\n{src_text}"},
-        {"role": "assistant", "content": ""}
-    ]
-    return tokenizer.apply_chat_template(messages, add_generation_prompt=True, tokenize=False)
+# ------------------------------ UNIVERSAL PROMPT BUILDER
+def build_prompt(src, src_lang, tgt_lang, example, tokenizer=None):
+    ex_src, ex_tgt = example
+    if tokenizer and hasattr(tokenizer, "apply_chat_template"):
+        msgs = [
+            {"role":"user","content":f"Translate this {LANG_MAP[src_lang]} text to {LANG_MAP[tgt_lang]}:\n{ex_src}"},
+            {"role":"assistant","content":ex_tgt},
+            {"role":"user","content":f"Now translate this {LANG_MAP[src_lang]} text to {LANG_MAP[tgt_lang]}:\n{src}"},
+            {"role":"assistant","content":""}
+        ]
+        return tokenizer.apply_chat_template(msgs, add_generation_prompt=True, tokenize=False)
+    else:
+        return f"Example translation ({LANG_MAP[src_lang]} → {LANG_MAP[tgt_lang]}):\n{ex_src} → {ex_tgt}\n\nTranslate this {LANG_MAP[src_lang]} text to {LANG_MAP[tgt_lang]}:\n{src}"
 
-# ------------------------------
-# Dataset builder (streaming, memory-safe random one-shot, filtered for English↔Hindi)
-# ------------------------------
-def load_streaming_dataset(tokenizer, split="train", max_samples=100, one_shot=True):
-    examples = []
+# ------------------------------ STREAMING DATASET
+def stream_examples(tokenizer, max_samples=None):
+    dataset_name = "ai4bharat/Pralekha"
+    config_name = "train"
+    splits = get_dataset_split_names(dataset_name, config_name)
 
-    for pair in LANGUAGE_PAIRS:
-        src, tgt = pair.split("_")
-        actual_split = "train" if split == "dev" else split
+    for split in splits:
+        parts = split.split("_")
+        if len(parts)!=2: continue
+        sl, tl = parts
+        if sl not in INDIAN_LANGS+["eng"] or tl not in INDIAN_LANGS+["eng"]: continue
+        lang = tl if sl=="eng" else sl
+        if lang not in INDIAN_LANGS: continue
 
-        # Preselect one-shot example using reservoir sampling
-        one_shot_example = ("", "")
-        if one_shot:
-            ds = load_dataset("ai4bharat/Pralekha", split=actual_split, streaming=True, data_dir=actual_split)
-            count = 0
-            for row in ds:
-                # Filter: only English↔Hindi and skip corrupted (src==tgt)
-                if row.get("src_lang") not in ["eng", "hin"] or row.get("tgt_lang") not in ["eng", "hin"]:
-                    continue
-                if row["src_lang"] == row["tgt_lang"]:
-                    continue
-                src_txt = row.get("src_txt") or row.get("src_text") or ""
-                tgt_txt = row.get("tgt_txt") or row.get("tgt_text") or ""
-                if not src_txt or not tgt_txt:
-                    continue
-                if random.randint(0, count) == 0:
-                    one_shot_example = (src_txt, tgt_txt)
-                count += 1
-                if count >= 500:
-                    break
+        ds = load_dataset(dataset_name, split=split, streaming=True, name=config_name)
+        one_shot = ("","")
+        for row in islice(ds, 50):
+            s,t = row.get("src_txt",""), row.get("tgt_txt","")
+            if len(s.split())>5 and len(t.split())>5:
+                one_shot = (s,t); break
 
-        # Load streaming dataset again for actual examples
-        ds = load_dataset("ai4bharat/Pralekha", split=actual_split, streaming=True, data_dir=actual_split)
-        added = 0
+        ds = load_dataset(dataset_name, split=split, streaming=True, name=config_name)
+        count = 0
         for row in ds:
-            # Filter only English↔Hindi, skip corrupted
-            if row.get("src_lang") not in ["eng", "hin"] or row.get("tgt_lang") not in ["eng", "hin"]:
-                continue
-            if row["src_lang"] == row["tgt_lang"]:
-                continue
-            src_txt = row.get("src_txt") or row.get("src_text") or ""
-            tgt_txt = row.get("tgt_txt") or row.get("tgt_text") or ""
-            if not src_txt or not tgt_txt:
-                continue
+            if max_samples and count >= max_samples: break
+            s, t = row.get("src_txt",""), row.get("tgt_txt","")
+            if not s or not t: continue
+            eng, indic = (s,t) if sl=="eng" else (t,s)
+            for s_txt,t_txt,dirn in [(eng,indic,f"eng_{lang}"),(indic,eng,f"{lang}_eng")]:
+                yield {
+                    "input_text": build_prompt(s_txt, dirn.split("_")[0], dirn.split("_")[1], one_shot, tokenizer),
+                    "target_text": t_txt, "direction": dirn
+                }
+            count += 1
 
-            # Build prompt
-            if one_shot:
-                prompt_ids = tokenizer(
-                    build_prompt(src_txt, row["src_lang"], row["tgt_lang"], one_shot_example, tokenizer),
-                    add_special_tokens=False
-                )["input_ids"]
-            else:
-                prompt_ids = tokenizer(
-                    build_prompt(src_txt, row["src_lang"], row["tgt_lang"], ("", ""), tokenizer),
-                    add_special_tokens=False
-                )["input_ids"]
+# ------------------------------ ITERABLE WRAPPER
+class PralekhaDataset(IterableDataset):
+    def __init__(self, tokenizer, max_samples=None):
+        self.tok = tokenizer
+        self.max_samples = max_samples
+    def __iter__(self):
+        for ex in stream_examples(self.tok, self.max_samples):
+            s_enc = self.tok(ex["input_text"], truncation=True, max_length=MAX_SEQ_LEN, add_special_tokens=False)
+            t_enc = self.tok(ex["target_text"], truncation=True, max_length=MAX_SEQ_LEN, add_special_tokens=True)
+            inp = (s_enc["input_ids"] + t_enc["input_ids"])[:MAX_SEQ_LEN]
+            lbl = ([-100]*len(s_enc["input_ids"]) +
+                   [min(i,self.tok.vocab_size-1) for i in t_enc["input_ids"]])[:MAX_SEQ_LEN]
+            yield {"input_ids": inp, "attention_mask":[1]*len(inp), "labels": lbl}
 
-            target_ids = tokenizer(tgt_txt, truncation=True, max_length=MAX_SEQ_LEN)["input_ids"]
+# ------------------------------ MODEL PREP
+def detect_lora_modules(model):
+    modules = []
+    for n,m in model.named_modules():
+        n_lower = n.lower()
+        if any(x in n_lower for x in ["q_proj","k_proj","v_proj","o_proj","attn.wq","attn.wk","attn.wv","attn.wo"]):
+            modules.append(n.split(".")[-1])
+    return list(set(modules))
 
-            if len(prompt_ids) >= MAX_SEQ_LEN:
-                prompt_ids = prompt_ids[-(MAX_SEQ_LEN - 10):]
-            input_ids = (prompt_ids + target_ids)[:MAX_SEQ_LEN]
-            attention_mask = [1] * len(input_ids)
-            prompt_len = min(len(prompt_ids), len(input_ids))
-            labels = [-100] * prompt_len + input_ids[prompt_len:]
-            labels = labels[:MAX_SEQ_LEN]
+def prepare_model():
+    tok = AutoTokenizer.from_pretrained(MODEL_NAME, trust_remote_code=True)
+    if tok.pad_token is None: tok.pad_token = tok.eos_token
+    model = AutoModelForCausalLM.from_pretrained(MODEL_NAME, torch_dtype=torch.float32, device_map="auto")
 
-            # Infer true direction from row
-            direction = f"{row['src_lang']}_{row['tgt_lang']}"
+    target_modules = detect_lora_modules(model)
+    print(f"⚡ LoRA target modules detected: {target_modules}")
 
-            examples.append({
-                "input_ids": input_ids,
-                "attention_mask": attention_mask,
-                "labels": labels,
-                "src_txt": src_txt,
-                "tgt_txt": tgt_txt,
-                "direction": direction
-            })
-            added += 1
-            if max_samples and added >= max_samples:
-                break
-
-    return Dataset.from_list(examples)
-
-# ------------------------------
-# Training function
-# ------------------------------
-def train_model():
-    tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, trust_remote_code=True, from_slow=True)
-    tokenizer.pad_token = tokenizer.eos_token
-    tokenizer.padding_side = "right"
-
-    compute_dtype = torch.float32
-    model = AutoModelForCausalLM.from_pretrained(
-        MODEL_NAME, torch_dtype=compute_dtype, device_map="auto", trust_remote_code=True, attn_implementation="eager"
+    lora_cfg = LoraConfig(
+        r=16, lora_alpha=16,
+        target_modules=target_modules,
+        lora_dropout=0.05, task_type="CAUSAL_LM"
     )
+    return get_peft_model(model, lora_cfg), tok
 
-    lora_config = LoraConfig(
-        r=16, lora_alpha=16, target_modules=["q_proj","v_proj","k_proj","o_proj"],
-        lora_dropout=0.05, bias="none", task_type="CAUSAL_LM"
-    )
-    model = get_peft_model(model, lora_config)
-    model.print_trainable_parameters()
-
-    training_data = load_streaming_dataset(tokenizer, split=TRAIN_SPLIT, max_samples=TRAIN_SAMPLES, one_shot=True)
-    eval_data = load_streaming_dataset(tokenizer, split=EVAL_SPLIT, max_samples=EVAL_SAMPLES, one_shot=True)
-
-    training_config = SFTConfig(
+# ------------------------------ TRAINING
+def train_model(max_samples=None):
+    model, tok = prepare_model()
+    ds = PralekhaDataset(tok, max_samples=max_samples)
+    cfg = SFTConfig(
         output_dir=str(OUTPUT_DIR),
-        per_device_train_batch_size=1,
-        gradient_accumulation_steps=1,
-        learning_rate=2e-4,
-        num_train_epochs=2,
-        logging_steps=1,
-        save_strategy="epoch",
-        eval_strategy="no",
-        bf16=False,
-        fp16=False,
-        optim="paged_adamw_32bit",
-        warmup_ratio=0.1,
-        lr_scheduler_type="linear",
-        max_grad_norm=0.3,
-        report_to="none",
-        run_name="gemma3-pralekha",
-        dataloader_pin_memory=False,
-        max_seq_length=MAX_SEQ_LEN,
-        packing=False,
+        per_device_train_batch_size=BATCH_SIZE,
+        gradient_accumulation_steps=GRAD_ACCUM,
+        learning_rate=1.5e-4,
+        num_train_epochs=1,
+        max_steps=MAX_TRAIN_STEPS,
+        logging_steps=10,
+        save_strategy="no",
+        report_to="none"
     )
-
-    trainer = SFTTrainer(
-        model=model,
-        args=training_config,
-        train_dataset=training_data,
-        tokenizer=tokenizer,
-    )
-
+    trainer = SFTTrainer(model=model, args=cfg, train_dataset=ds, tokenizer=tok)
     trainer.train()
-    trainer.model.save_pretrained(OUTPUT_DIR)
-    tokenizer.save_pretrained(OUTPUT_DIR)
+    model.save_pretrained(OUTPUT_DIR)
+    tok.save_pretrained(OUTPUT_DIR)
+    return model, tok, trainer
 
-    return model, tokenizer, eval_data, trainer
-
-# ------------------------------
-# Evaluation (Clean predictions + CHRF per direction)
-# ------------------------------
-def evaluate_model(model, tokenizer, eval_data, save_jsonl=True, jsonl_path="eval_predictions.jsonl", max_new_tokens=512):
+# ------------------------------ EVALUATION (Fast + Top-10 Preview)
+def evaluate_model(model, tok, max_new_tokens=256, max_samples_per_split=None, batch_size=EVAL_BATCH_SIZE):  
+    warnings.filterwarnings("ignore", message="Setting `pad_token_id` to `eos_token_id`")
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    model.to(device)
-    model.eval()
-    preds, refs, dirs, srcs = [], [], [], []
-    total_loss = 0
+    model.to(device).eval()
 
-    torch._dynamo.reset()
-    with torch.inference_mode():
-        for ex in eval_data:
-            input_ids = torch.tensor([ex["input_ids"]], device=device)
-            attention_mask = torch.tensor([ex["attention_mask"]], device=device)
-            labels = torch.tensor([ex["labels"]], device=device)
+    comet = evaluate.load("comet")  
 
-            outputs = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
-            total_loss += outputs.loss.item()
+    preds, refs = {}, {}
+    for lang in INDIAN_LANGS:
+        for d in [f"eng_{lang}", f"{lang}_eng"]:
+            preds[d], refs[d] = [], []
 
-            generated = model.generate(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                max_new_tokens=max_new_tokens,
-                do_sample=False,
-                repetition_penalty=2.0
-            )
-            gen_text = tokenizer.decode(generated[0], skip_special_tokens=True)
+    splits = get_dataset_split_names("ai4bharat/Pralekha","dev")
+    print("\n🔍 Starting batched evaluation...\n")
 
-            # Remove prompt prefix
-            prompt_text = tokenizer.decode(input_ids[0], skip_special_tokens=True)
-            pred_only = gen_text[len(prompt_text):].strip()
-            if pred_only.lower().startswith("assistant:"):
-                pred_only = pred_only[len("assistant:"):].strip()
+    # Get model size for adaptive generation
+    num_params = getattr(model.config, "num_parameters", 0)
 
-            preds.append(pred_only)
-            refs.append(ex["tgt_txt"])
-            srcs.append(ex["src_txt"])
-            dirs.append(ex["direction"])
+    for split in tqdm(splits, desc="Evaluating language pairs"):
+        parts = split.split("_")
+        if len(parts)!=2: continue
+        sl, tl = parts
+        if sl not in INDIAN_LANGS+["eng"] or tl not in INDIAN_LANGS+["eng"]: continue
+        lang = tl if sl=="eng" else sl
+        if lang not in INDIAN_LANGS: continue
 
-    avg_loss = total_loss / len(eval_data) if eval_data else 0
-    print(f"[RESULT] Avg Eval Loss: {avg_loss:.4f}")
+        ds = load_dataset("ai4bharat/Pralekha", split=split, streaming=True, name="dev")
+        batch_prompts, batch_refs, batch_dirs, count = [], [], [], 0
 
-    # CHRF per direction
-    total_chrf = []
-    for pair in LANGUAGE_PAIRS:
-        pair_preds = [p for p, d in zip(preds, dirs) if d==pair]
-        pair_refs = [[r] for r, d in zip(refs, dirs) if d==pair]
-        if pair_preds:
-            chrf = sacrebleu.corpus_chrf(pair_preds, pair_refs)
-            total_chrf.append(chrf.score)
-            print(f"[RESULT] {pair} chrF: {chrf.score:.2f}")
-    if total_chrf:
-        print(f"[RESULT] Avg chrF (both directions): {sum(total_chrf)/len(total_chrf):.2f}")
+        for row in ds:
+            if max_samples_per_split and count >= max_samples_per_split: break
+            s, t = row.get("src_txt",""), row.get("tgt_txt","")
+            if not s or not t: continue
+            eng, indic = (s,t) if sl=="eng" else (t,s)
+            batch_prompts += [
+                build_prompt(eng,"eng",lang,("Example","Example"),tok),
+                build_prompt(indic,lang,"eng",("Example","Example"),tok)
+            ]
+            batch_refs += [indic, eng]
+            batch_dirs += [f"eng_{lang}", f"{lang}_eng"]
+            count += 1
 
-    # Save JSONL
-    if save_jsonl:
-        with open(jsonl_path, "w", encoding="utf-8") as f:
-            for s, p, r, d in zip(srcs, preds, refs, dirs):
-                f.write(json.dumps({"src": s, "pred": p, "ref": r, "direction": d}, ensure_ascii=False) + "\n")
-        print(f"✅ Saved predictions to {jsonl_path}")
+            if len(batch_prompts) >= batch_size:
+                enc = tok(batch_prompts, return_tensors="pt", padding=True, truncation=True, max_length=MAX_SEQ_LEN).to(device)
+                with torch.no_grad():
+                    # ----------------- Adaptive Generation -----------------
+                    if num_params <= 500_000_000:
+                        # Small models → beam search
+                        out = model.generate(
+                            **enc,
+                            max_new_tokens=max_new_tokens,
+                            pad_token_id=tok.pad_token_id,
+                            num_beams=4,
+                            early_stopping=True
+                        )
+                    elif num_params <= 3_000_000_000:
+                        # Medium models → moderate beams
+                        out = model.generate(
+                            **enc,
+                            max_new_tokens=max_new_tokens,
+                            pad_token_id=tok.pad_token_id,
+                            num_beams=2,
+                            early_stopping=True
+                        )
+                    else:
+                        # Large models → sampling
+                        out = model.generate(
+                            **enc,
+                            max_new_tokens=max_new_tokens,
+                            pad_token_id=tok.pad_token_id,
+                            do_sample=True,
+                            top_k=50,
+                            top_p=0.95
+                        )
+                decs = tok.batch_decode(out, skip_special_tokens=True)
+                for dirn, pred, ref in zip(batch_dirs,decs,batch_refs):
+                    preds[dirn].append(pred.strip())
+                    refs[dirn].append(ref.strip())
+                batch_prompts, batch_refs, batch_dirs = [], [], []
 
-        # Optional: print JSONL for inspection
-        print("\n=== JSONL Translation Output ===")
-        with open(jsonl_path, "r", encoding="utf-8") as f:
-            for line in f:
-                print(line.strip())
-        print("=== End of JSONL ===")
+    # ---------------- SAVE JSONL FILES
+    sub_zip = OUTPUT_DIR / "submission.zip"
+    with zipfile.ZipFile(sub_zip,"w") as zf:
+        for d in preds:
+            n_chunks = math.ceil(len(preds[d])/1000)
+            for i in range(n_chunks):
+                chunk = preds[d][i*1000:(i+1)*1000]
+                if not chunk: continue
+                fp = OUTPUT_DIR / f"{d.replace('_','_2_')}_{i+1}.jsonl"
+                with open(fp,"w",encoding="utf-8") as f:
+                    for p in chunk: f.write(json.dumps([p],ensure_ascii=False)+"\n")
+                zf.write(fp, fp.name)
+    print(f"\n✅ Submission ZIP saved: {sub_zip}")
 
-# ------------------------------
-# Plot & download
-# ------------------------------
-def plot_and_download_metrics(trainer):
+    # ---------------- METRICS
+    bleu_scores, chrf_scores, comet_scores = {}, {}, {}
+    for d in preds:
+        if not preds[d]: continue
+        bleu_scores[d] = sacrebleu.corpus_bleu(preds[d],[refs[d]]).score
+        chrf_scores[d] = sacrebleu.corpus_chrf(preds[d], [[r] for r in refs[d]]).score 
+        comet_scores[d] = comet.compute(predictions=preds[d], references=refs[d], sources=[""]*len(refs[d]))["mean_score"]
+
+    # ---------------- PLOTS
+    for metric, scores in [("BLEU",bleu_scores),("chrF",chrf_scores),("COMET",comet_scores)]:
+        plt.figure(figsize=(10,5))
+        langs, vals = list(scores.keys()), [scores[k] for k in scores]
+        plt.bar(langs,vals)
+        plt.title(f"{metric} Scores per Direction")
+        plt.xticks(rotation=45,ha="right"); plt.tight_layout()
+        plt.savefig(OUTPUT_DIR / f"{metric.lower()}_scores.png"); plt.close()
+    print("📈 Metrics plots saved.")
+
+    # ---------------- TOP-10 SAMPLE PREVIEWS
+    print("\n🔠 Sample Translations (Top 10 per direction):\n")
+    for d in preds.keys():
+        display(Markdown(f"### {d.upper()}"))
+        for i in range(min(10,len(preds[d]))):
+            display(Markdown(f"**Ref:** {refs[d][i]}  \n**Pred:** {preds[d][i]}"))
+
+    return bleu_scores, chrf_scores, comet_scores
+
+
+# ------------------------------ TRAIN CURVE
+def plot_training(trainer):
     logs = trainer.state.log_history
-    steps = [l.get("step") for l in logs if "loss" in l]
-    losses = [l.get("loss") for l in logs if "loss" in l]
-    grad_norms = [l.get("grad_norm") for l in logs if "grad_norm" in l]
-    lr = [l.get("learning_rate") for l in logs if "learning_rate" in l]
-
-    plt.figure(figsize=(15,4))
-    plt.subplot(1,3,1)
-    plt.plot(steps, losses, label="Loss"); plt.xlabel("Step"); plt.ylabel("Loss"); plt.title("Training Loss")
-    plt.subplot(1,3,2)
-    plt.plot(steps[:len(grad_norms)], grad_norms, label="Grad Norm", color="orange"); plt.xlabel("Step"); plt.title("Grad Norm")
-    plt.subplot(1,3,3)
-    plt.plot(steps[:len(lr)], lr, label="LR", color="green"); plt.xlabel("Step"); plt.title("Learning Rate")
+    steps = [l["step"] for l in logs if "loss" in l]
+    losses = [l["loss"] for l in logs if "loss" in l]
+    plt.figure(figsize=(8,4))
+    plt.plot(steps,losses)
+    plt.xlabel("Step"); plt.ylabel("Loss")
+    plt.title("Training Loss Trend")
     plt.tight_layout()
-    plt.show()
+    plt.savefig(OUTPUT_DIR / "training_loss.png")
+    print("📉 Training loss curve saved.")
 
-    plt.savefig("training_metrics.png")
-    print("✅ Training metrics saved as 'training_metrics.png'. Download via Colab Files tab.")
-
-# ------------------------------
-# Main
-# ------------------------------
+# ------------------------------ MAIN
 if __name__ == "__main__":
-    model, tokenizer, eval_data, trainer = train_model()
-    evaluate_model(model, tokenizer, eval_data, max_new_tokens=512)
-    plot_and_download_metrics(trainer)
-# ------------------------------
-# Colab: View JSONL predictions in a table
-# ------------------------------
+    os.environ["CUDA_LAUNCH_BLOCKING"]="1"
+    max_samples = None if FULL_DATASET else MAX_COLAB_SAMPLES
+
+    # 1️⃣ Train
+    model, tok, trainer = train_model(max_samples=max_samples)
+
+    # 2️⃣ Evaluate
+    bleu, chrf, comet = evaluate_model(
+        model, tok,
+        max_samples_per_split=None if FULL_DATASET else 200,  
+        batch_size=EVAL_BATCH_SIZE
+    ) #set 200 to 1k
+
+    # 3️⃣ Plot training curve
+    plot_training(trainer)
+
+# ======================================================
+# 📊 Display BLEU, chrF, COMET Scores in Table Format
+# ======================================================
 import pandas as pd
+from IPython.display import display, Markdown
 
-jsonl_path = "eval_predictions.jsonl"
-
-# Load JSONL into a DataFrame
 data = []
-with open(jsonl_path, "r", encoding="utf-8") as f:
-    for line in f:
-        data.append(json.loads(line))
+for d in sorted(set(list(bleu.keys()) + list(chrf.keys()) + list(comet.keys()))):
+    data.append({
+        "Direction": d,
+        "BLEU": round(bleu.get(d, 0.0), 2),
+        "chrF": round(chrf.get(d, 0.0), 2),
+        "COMET": round(comet.get(d, 0.0), 4) if comet else "N/A"
+    })
 
-df = pd.DataFrame(data)
+df_metrics = pd.DataFrame(data).sort_values("Direction").reset_index(drop=True)
+display(Markdown("## 📋 Translation Quality Metrics per Direction"))
+display(df_metrics.style.background_gradient(cmap="YlGnBu", subset=["BLEU","chrF"]))
 
-# Display first 20 rows nicely
-df.head(20)
+avg_bleu = sum(bleu.values()) / len(bleu) if bleu else 0
+avg_chrf = sum(chrf.values()) / len(chrf) if chrf else 0
+avg_comet = sum(comet.values()) / len(comet) if comet else 0
+
+print("\n🧮 Averages Across All Directions:")
+print(f"  ➤ Mean BLEU  : {avg_bleu:.2f}")
+print(f"  ➤ Mean chrF  : {avg_chrf:.2f}")
+print(f"  ➤ Mean COMET : {avg_comet:.4f}")
+# ======================================================
+# 📉 Enhanced Training & Learning Metrics Visualization (Smoothed + Detailed)
+# ======================================================
+
+import matplotlib.pyplot as plt
+import pandas as pd
+import numpy as np
+from IPython.display import Image, display
+from pathlib import Path
+
+OUTPUT_DIR = Path("/content/universal_output")
+OUTPUT_DIR.mkdir(exist_ok=True, parents=True)
+
+# Ensure trainer exists and has logs
+if "trainer" not in locals():
+    raise ValueError("❌ Trainer not found — please run training first.")
+
+logs = trainer.state.log_history
+df = pd.DataFrame(logs)
+
+if df.empty:
+    raise ValueError("⚠️ No training logs found. Try increasing logging_steps in your config.")
+
+# Rolling average for smoothing (window = 10)
+df["loss_smooth"] = df["loss"].rolling(window=10, min_periods=1).mean()
+
+# ----------------- Plot 1: Training Loss (Raw + Smoothed)
+plt.figure(figsize=(8, 4))
+plt.plot(df["step"], df["loss"], label="Raw Loss", alpha=0.5, color="gray")
+plt.plot(df["step"], df["loss_smooth"], label="Smoothed Loss (rolling avg)", color="blue", linewidth=2)
+plt.xlabel("Step")
+plt.ylabel("Loss")
+plt.title("Training Loss Over Steps (Raw + Smoothed)")
+plt.legend()
+plt.tight_layout()
+loss_path = OUTPUT_DIR / "training_loss_smooth.png"
+plt.savefig(loss_path)
+plt.close()
+display(Image(filename=loss_path))
+
+# ----------------- Plot 2: Learning Rate Trend
+if "learning_rate" in df.columns:
+    plt.figure(figsize=(8, 4))
+    plt.plot(df["step"], df["learning_rate"], label="Learning Rate", color="orange")
+    plt.xlabel("Step")
+    plt.ylabel("LR")
+    plt.title("Learning Rate Schedule")
+    plt.legend()
+    plt.tight_layout()
+    lr_path = OUTPUT_DIR / "learning_rate_trend.png"
+    plt.savefig(lr_path)
+    plt.close()
+    display(Image(filename=lr_path))
+
+# ----------------- Plot 3: Loss per Epoch (Scatter + Smooth Mean)
+if "epoch" in df.columns:
+    plt.figure(figsize=(8, 4))
+    plt.scatter(df["epoch"], df["loss"], color="green", s=20, alpha=0.6, label="Raw Loss per Epoch")
+    epoch_means = df.groupby("epoch")["loss"].mean()
+    plt.plot(epoch_means.index, epoch_means.values, color="red", linewidth=2, label="Mean Loss per Epoch")
+    plt.xlabel("Epoch")
+    plt.ylabel("Loss")
+    plt.title("Loss per Epoch (Raw + Mean)")
+    plt.legend()
+    plt.tight_layout()
+    epoch_path = OUTPUT_DIR / "epoch_loss_trend.png"
+    plt.savefig(epoch_path)
+    plt.close()
+    display(Image(filename=epoch_path))
+
+# ----------------- Plot 4: Optional — Loss Derivative (Change Rate)
+if len(df) > 5:
+    df["loss_derivative"] = np.gradient(df["loss_smooth"])
+    plt.figure(figsize=(8, 4))
+    plt.plot(df["step"], df["loss_derivative"], color="purple", label="d(Loss)/d(Step)")
+    plt.xlabel("Step")
+    plt.ylabel("Loss Change")
+    plt.title("Loss Change Rate (Convergence Behavior)")
+    plt.axhline(0, color="black", linestyle="--", alpha=0.5)
+    plt.legend()
+    plt.tight_layout()
+    der_path = OUTPUT_DIR / "loss_derivative_curve.png"
+    plt.savefig(der_path)
+    plt.close()
+    display(Image(filename=der_path))
+
+print("\n✅ All enhanced training metric plots saved to:", OUTPUT_DIR)
+# ======================================================
+# 📊 Metrics Summary + Separate Plots for BLEU, chrF, COMET (Safe Version)
+# ======================================================
+import matplotlib.pyplot as plt
+import pandas as pd
+from IPython.display import display, Markdown
+from pathlib import Path
+
+# Ensure metric dictionaries exist safely
+bleu = locals().get("bleu", {})
+chrf = locals().get("chrf", {})
+comet = locals().get("comet", {})
+
+# If comet is still a metric object (not a dict of scores), ignore it
+if not isinstance(comet, dict):
+    print("⚠️ COMET metric not computed yet — skipping COMET plots.")
+    comet_scores = {}
+else:
+    comet_scores = comet
+
+# Create DataFrame
+data = []
+for d in sorted(set(list(bleu.keys()) + list(chrf.keys()) + list(comet_scores.keys()))):
+    data.append({
+        "Direction": d,
+        "BLEU": round(bleu.get(d, 0.0), 2),
+        "chrF": round(chrf.get(d, 0.0), 2),
+        "COMET": round(comet_scores.get(d, 0.0), 4) if comet_scores else "N/A"
+    })
+
+df_metrics = pd.DataFrame(data).sort_values("Direction").reset_index(drop=True)
+
+# Display Metrics Table
+display(Markdown("## 📋 Translation Quality Metrics per Direction"))
+display(df_metrics.style.background_gradient(cmap="YlGnBu", subset=["BLEU","chrF"]))
+
+# Compute Averages
+avg_bleu = sum(bleu.values()) / len(bleu) if bleu else 0
+avg_chrf = sum(chrf.values()) / len(chrf) if chrf else 0
+avg_comet = sum(comet_scores.values()) / len(comet_scores) if comet_scores else 0
+
+print("\n🧮 Averages Across All Directions:")
+print(f"  ➤ Mean BLEU  : {avg_bleu:.2f}")
+print(f"  ➤ Mean chrF  : {avg_chrf:.2f}")
+print(f"  ➤ Mean COMET : {avg_comet:.4f}")
+
+# ======================================================
+# 📈 Separate Plots for BLEU, chrF, COMET
+# ======================================================
+plot_dir = OUTPUT_DIR / "metric_plots"
+plot_dir.mkdir(exist_ok=True, parents=True)
+
+def plot_metric(metric_name, scores_dict):
+    if not scores_dict:
+        print(f"⚠️ No {metric_name} scores available.")
+        return
+    plt.figure(figsize=(10,5))
+    langs, vals = list(scores_dict.keys()), [scores_dict[k] for k in scores_dict]
+    plt.bar(langs, vals)
+    plt.title(f"{metric_name} Scores per Direction")
+    plt.xlabel("Language Direction")
+    plt.ylabel(metric_name)
+    plt.xticks(rotation=45, ha="right")
+    plt.tight_layout()
+    path = plot_dir / f"{metric_name.lower()}_per_direction.png"
+    plt.savefig(path)
+    plt.close()
+    print(f"✅ Saved {metric_name} plot → {path}")
+
+plot_metric("BLEU", bleu)
+plot_metric("chrF", chrf)
+plot_metric("COMET", comet_scores)
+# ======================================================
+# 📈 Separate Plots for BLEU, chrF, COMET (Optional)
+# ======================================================
+plot_dir = OUTPUT_DIR / "metric_plots"
+plot_dir.mkdir(exist_ok=True, parents=True)
+
+def plot_metric(metric_name, scores_dict):
+    if not scores_dict:
+        print(f"⚠️ No {metric_name} scores available.")
+        return
     
+    langs, vals = list(scores_dict.keys()), [scores_dict[k] for k in scores_dict]
     
+    plt.figure(figsize=(12,6))
+    plt.bar(langs, vals, color='skyblue')
+    plt.title(f"{metric_name} Scores per Direction", fontsize=16)
+    plt.xlabel("Language Direction", fontsize=12)
+    plt.ylabel(metric_name, fontsize=12)
+    plt.xticks(rotation=45, ha="right")
+    plt.grid(axis='y', linestyle='--', alpha=0.7)
+    plt.tight_layout()
+    
+    # Show plot inline in Colab
+    plt.show()
+    
+    # Save plot
+    path = plot_dir / f"{metric_name.lower()}_per_direction.png"
+    plt.savefig(path)
+    plt.close()
+    print(f"✅ Saved {metric_name} plot → {path}")
+
+# Plot all metrics
+plot_metric("BLEU", bleu)
+plot_metric("chrF", chrf)
+plot_metric("COMET", comet_scores)
+
