@@ -26,7 +26,7 @@ OUTPUT_DIR.mkdir(exist_ok=True, parents=True)
 MAX_SEQ_LEN = 1024
 BATCH_SIZE = 1
 GRAD_ACCUM = 4
-MAX_TRAIN_STEPS = 1000 #super-optimal step size
+MAX_TRAIN_STEPS = 500 #super-optimal step size
 EVAL_BATCH_SIZE = 8 #you can also set to 4
 FULL_DATASET = False #set to True for full Pralekha
 MAX_COLAB_SAMPLES = 50000 #set to None for full Pralekha
@@ -262,9 +262,9 @@ if __name__ == "__main__":
     # 2️⃣ Evaluate
     bleu, chrf, comet = evaluate_model(
         model, tok,
-        max_samples_per_split=None if FULL_DATASET else 1000,  
+        max_samples_per_split=None if FULL_DATASET else 200,  
         batch_size=EVAL_BATCH_SIZE
-    )
+    ) #set 200 to 1k
 
     # 3️⃣ Plot training curve
     plot_training(trainer)
