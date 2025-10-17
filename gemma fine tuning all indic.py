@@ -296,3 +296,90 @@ print("\n🧮 Averages Across All Directions:")
 print(f"  ➤ Mean BLEU  : {avg_bleu:.2f}")
 print(f"  ➤ Mean chrF  : {avg_chrf:.2f}")
 print(f"  ➤ Mean COMET : {avg_comet:.4f}")
+# ======================================================
+# 📉 Enhanced Training & Learning Metrics Visualization (Smoothed + Detailed)
+# ======================================================
+
+import matplotlib.pyplot as plt
+import pandas as pd
+import numpy as np
+from IPython.display import Image, display
+from pathlib import Path
+
+OUTPUT_DIR = Path("/content/universal_output")
+OUTPUT_DIR.mkdir(exist_ok=True, parents=True)
+
+# Ensure trainer exists and has logs
+if "trainer" not in locals():
+    raise ValueError("❌ Trainer not found — please run training first.")
+
+logs = trainer.state.log_history
+df = pd.DataFrame(logs)
+
+if df.empty:
+    raise ValueError("⚠️ No training logs found. Try increasing logging_steps in your config.")
+
+# Rolling average for smoothing (window = 10)
+df["loss_smooth"] = df["loss"].rolling(window=10, min_periods=1).mean()
+
+# ----------------- Plot 1: Training Loss (Raw + Smoothed)
+plt.figure(figsize=(8, 4))
+plt.plot(df["step"], df["loss"], label="Raw Loss", alpha=0.5, color="gray")
+plt.plot(df["step"], df["loss_smooth"], label="Smoothed Loss (rolling avg)", color="blue", linewidth=2)
+plt.xlabel("Step")
+plt.ylabel("Loss")
+plt.title("Training Loss Over Steps (Raw + Smoothed)")
+plt.legend()
+plt.tight_layout()
+loss_path = OUTPUT_DIR / "training_loss_smooth.png"
+plt.savefig(loss_path)
+plt.close()
+display(Image(filename=loss_path))
+
+# ----------------- Plot 2: Learning Rate Trend
+if "learning_rate" in df.columns:
+    plt.figure(figsize=(8, 4))
+    plt.plot(df["step"], df["learning_rate"], label="Learning Rate", color="orange")
+    plt.xlabel("Step")
+    plt.ylabel("LR")
+    plt.title("Learning Rate Schedule")
+    plt.legend()
+    plt.tight_layout()
+    lr_path = OUTPUT_DIR / "learning_rate_trend.png"
+    plt.savefig(lr_path)
+    plt.close()
+    display(Image(filename=lr_path))
+
+# ----------------- Plot 3: Loss per Epoch (Scatter + Smooth Mean)
+if "epoch" in df.columns:
+    plt.figure(figsize=(8, 4))
+    plt.scatter(df["epoch"], df["loss"], color="green", s=20, alpha=0.6, label="Raw Loss per Epoch")
+    epoch_means = df.groupby("epoch")["loss"].mean()
+    plt.plot(epoch_means.index, epoch_means.values, color="red", linewidth=2, label="Mean Loss per Epoch")
+    plt.xlabel("Epoch")
+    plt.ylabel("Loss")
+    plt.title("Loss per Epoch (Raw + Mean)")
+    plt.legend()
+    plt.tight_layout()
+    epoch_path = OUTPUT_DIR / "epoch_loss_trend.png"
+    plt.savefig(epoch_path)
+    plt.close()
+    display(Image(filename=epoch_path))
+
+# ----------------- Plot 4: Optional — Loss Derivative (Change Rate)
+if len(df) > 5:
+    df["loss_derivative"] = np.gradient(df["loss_smooth"])
+    plt.figure(figsize=(8, 4))
+    plt.plot(df["step"], df["loss_derivative"], color="purple", label="d(Loss)/d(Step)")
+    plt.xlabel("Step")
+    plt.ylabel("Loss Change")
+    plt.title("Loss Change Rate (Convergence Behavior)")
+    plt.axhline(0, color="black", linestyle="--", alpha=0.5)
+    plt.legend()
+    plt.tight_layout()
+    der_path = OUTPUT_DIR / "loss_derivative_curve.png"
+    plt.savefig(der_path)
+    plt.close()
+    display(Image(filename=der_path))
+
+print("\n✅ All enhanced training metric plots saved to:", OUTPUT_DIR)
