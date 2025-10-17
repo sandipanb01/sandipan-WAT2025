@@ -383,3 +383,76 @@ if len(df) > 5:
     display(Image(filename=der_path))
 
 print("\n✅ All enhanced training metric plots saved to:", OUTPUT_DIR)
+# ======================================================
+# 📊 Metrics Summary + Separate Plots for BLEU, chrF, COMET (Safe Version)
+# ======================================================
+import matplotlib.pyplot as plt
+import pandas as pd
+from IPython.display import display, Markdown
+from pathlib import Path
+
+# Ensure metric dictionaries exist safely
+bleu = locals().get("bleu", {})
+chrf = locals().get("chrf", {})
+comet = locals().get("comet", {})
+
+# If comet is still a metric object (not a dict of scores), ignore it
+if not isinstance(comet, dict):
+    print("⚠️ COMET metric not computed yet — skipping COMET plots.")
+    comet_scores = {}
+else:
+    comet_scores = comet
+
+# Create DataFrame
+data = []
+for d in sorted(set(list(bleu.keys()) + list(chrf.keys()) + list(comet_scores.keys()))):
+    data.append({
+        "Direction": d,
+        "BLEU": round(bleu.get(d, 0.0), 2),
+        "chrF": round(chrf.get(d, 0.0), 2),
+        "COMET": round(comet_scores.get(d, 0.0), 4) if comet_scores else "N/A"
+    })
+
+df_metrics = pd.DataFrame(data).sort_values("Direction").reset_index(drop=True)
+
+# Display Metrics Table
+display(Markdown("## 📋 Translation Quality Metrics per Direction"))
+display(df_metrics.style.background_gradient(cmap="YlGnBu", subset=["BLEU","chrF"]))
+
+# Compute Averages
+avg_bleu = sum(bleu.values()) / len(bleu) if bleu else 0
+avg_chrf = sum(chrf.values()) / len(chrf) if chrf else 0
+avg_comet = sum(comet_scores.values()) / len(comet_scores) if comet_scores else 0
+
+print("\n🧮 Averages Across All Directions:")
+print(f"  ➤ Mean BLEU  : {avg_bleu:.2f}")
+print(f"  ➤ Mean chrF  : {avg_chrf:.2f}")
+print(f"  ➤ Mean COMET : {avg_comet:.4f}")
+
+# ======================================================
+# 📈 Separate Plots for BLEU, chrF, COMET
+# ======================================================
+plot_dir = OUTPUT_DIR / "metric_plots"
+plot_dir.mkdir(exist_ok=True, parents=True)
+
+def plot_metric(metric_name, scores_dict):
+    if not scores_dict:
+        print(f"⚠️ No {metric_name} scores available.")
+        return
+    plt.figure(figsize=(10,5))
+    langs, vals = list(scores_dict.keys()), [scores_dict[k] for k in scores_dict]
+    plt.bar(langs, vals)
+    plt.title(f"{metric_name} Scores per Direction")
+    plt.xlabel("Language Direction")
+    plt.ylabel(metric_name)
+    plt.xticks(rotation=45, ha="right")
+    plt.tight_layout()
+    path = plot_dir / f"{metric_name.lower()}_per_direction.png"
+    plt.savefig(path)
+    plt.close()
+    print(f"✅ Saved {metric_name} plot → {path}")
+
+plot_metric("BLEU", bleu)
+plot_metric("chrF", chrf)
+plot_metric("COMET", comet_scores)
+
