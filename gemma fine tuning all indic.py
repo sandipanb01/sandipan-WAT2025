@@ -455,4 +455,40 @@ def plot_metric(metric_name, scores_dict):
 plot_metric("BLEU", bleu)
 plot_metric("chrF", chrf)
 plot_metric("COMET", comet_scores)
+# ======================================================
+# 📈 Separate Plots for BLEU, chrF, COMET (Optional)
+# ======================================================
+plot_dir = OUTPUT_DIR / "metric_plots"
+plot_dir.mkdir(exist_ok=True, parents=True)
+
+def plot_metric(metric_name, scores_dict):
+    if not scores_dict:
+        print(f"⚠️ No {metric_name} scores available.")
+        return
+    
+    langs, vals = list(scores_dict.keys()), [scores_dict[k] for k in scores_dict]
+    
+    plt.figure(figsize=(12,6))
+    plt.bar(langs, vals, color='skyblue')
+    plt.title(f"{metric_name} Scores per Direction", fontsize=16)
+    plt.xlabel("Language Direction", fontsize=12)
+    plt.ylabel(metric_name, fontsize=12)
+    plt.xticks(rotation=45, ha="right")
+    plt.grid(axis='y', linestyle='--', alpha=0.7)
+    plt.tight_layout()
+    
+    # Show plot inline in Colab
+    plt.show()
+    
+    # Save plot
+    path = plot_dir / f"{metric_name.lower()}_per_direction.png"
+    plt.savefig(path)
+    plt.close()
+    print(f"✅ Saved {metric_name} plot → {path}")
+
+# Plot all metrics
+plot_metric("BLEU", bleu)
+plot_metric("chrF", chrf)
+plot_metric("COMET", comet_scores)
+
 
