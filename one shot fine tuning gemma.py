@@ -28,10 +28,10 @@ OUTPUT_DIR.mkdir(exist_ok=True, parents=True)
 MAX_SEQ_LEN = 1024
 BATCH_SIZE = 1
 GRAD_ACCUM = 4
-MAX_TRAIN_STEPS = 500
-EVAL_BATCH_SIZE = 8
-FULL_DATASET = False
-MAX_COLAB_SAMPLES = 50000
+MAX_TRAIN_STEPS = 500 #super-optimal step size
+EVAL_BATCH_SIZE = 8 #you can also set to 4
+FULL_DATASET = False #set to True for full Pralekha
+MAX_COLAB_SAMPLES = 50000 #set to None for full Pralekha
 
 INDIAN_LANGS = ["hin","ben","tam","tel","mal","kan","mar","guj","urd","pan","ori"]
 LANG_MAP = {
