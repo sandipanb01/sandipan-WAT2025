@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 # ======================================================
-# ✅ Universal Fine-tuning + Fully Streaming Evaluation for any Hugging Face LM
-# Includes: Streaming Training, LoRA, Fully Streaming Evaluation, Metrics, Top-10 Preview, Enhanced Plots
+# ✅ Universal Fine-tuning + Fully Streaming Evaluation for Hugging Face LMs
+# Includes: LoRA, Streaming Training & Evaluation, Dynamic 1-shot prompts, Metrics, Top-10 Preview, Enhanced Plots
 # ======================================================
 
 import os, json, zipfile, math, warnings
@@ -15,10 +15,10 @@ from peft import LoraConfig, get_peft_model
 from trl import SFTTrainer, SFTConfig
 import sacrebleu, evaluate
 import matplotlib.pyplot as plt
-from tqdm import tqdm
-from IPython.display import display, Markdown, Image
+from IPython.display import display, Markdown
 import pandas as pd
 import numpy as np
+from tqdm import tqdm
 
 # ------------------------------ CONFIG
 MODEL_NAME = "google/gemma-3-270m-it"
@@ -28,10 +28,10 @@ OUTPUT_DIR.mkdir(exist_ok=True, parents=True)
 MAX_SEQ_LEN = 1024
 BATCH_SIZE = 1
 GRAD_ACCUM = 4
-MAX_TRAIN_STEPS = 500 #super-optimal step size
-EVAL_BATCH_SIZE = 8 #you can also set to 4
-FULL_DATASET = False #set to True for full Pralekha
-MAX_COLAB_SAMPLES = 50000 #set to None for full Pralekha
+MAX_TRAIN_STEPS = 500
+EVAL_BATCH_SIZE = 8
+FULL_DATASET = False
+MAX_COLAB_SAMPLES = 50000
 
 INDIAN_LANGS = ["hin","ben","tam","tel","mal","kan","mar","guj","urd","pan","ori"]
 LANG_MAP = {
@@ -146,7 +146,7 @@ def evaluate_model_streaming(model, tok, max_new_tokens=256, max_samples_per_spl
     splits = get_dataset_split_names("ai4bharat/Pralekha", "dev")
     for split in tqdm(splits, desc="Evaluating language pairs"):
         parts = split.split("_")
-        if len(parts)!=2: continue
+        if len(parts) != 2: continue
         sl, tl = parts
         if sl not in INDIAN_LANGS+["eng"] or tl not in INDIAN_LANGS+["eng"]: continue
         lang = tl if sl=="eng" else sl
@@ -155,19 +155,29 @@ def evaluate_model_streaming(model, tok, max_new_tokens=256, max_samples_per_spl
         ds_stream = load_dataset("ai4bharat/Pralekha", split=split, streaming=True, name="dev")
         batch_prompts, batch_refs, batch_dirs, count = [], [], [], 0
 
+        # 1-shot dynamic example
+        one_shot = None
+        for ex in islice(ds_stream, 50):
+            s_, t_ = ex.get("src_txt",""), ex.get("tgt_txt","")
+            if s_ and t_ and len(s_.split())>5 and len(t_.split())>5:
+                one_shot = (s_, t_)
+                break
+        if one_shot is None: one_shot = ("","")
+
         for row in ds_stream:
             if max_samples_per_split and count >= max_samples_per_split: break
             s, t = row.get("src_txt",""), row.get("tgt_txt","")
             if not s or not t: continue
             eng, indic = (s,t) if sl=="eng" else (t,s)
-            batch_prompts += [build_prompt(eng,"eng",lang,("Example","Example"),tok),
-                              build_prompt(indic,lang,"eng",("Example","Example"),tok)]
+            batch_prompts += [build_prompt(eng,"eng",lang,one_shot,tok),
+                              build_prompt(indic,lang,"eng",one_shot,tok)]
             batch_refs += [indic, eng]
             batch_dirs += [f"eng_{lang}", f"{lang}_eng"]
             count += 1
 
             if len(batch_prompts) >= batch_size:
-                enc = tok(batch_prompts, return_tensors="pt", padding=True, truncation=True, max_length=MAX_SEQ_LEN).to(device)
+                enc = tok(batch_prompts, return_tensors="pt", padding=True, truncation=True, max_length=MAX_SEQ_LEN)
+                enc = {k: v.to(device) for k,v in enc.items()}
                 with torch.no_grad():
                     out = model.generate(**enc, max_new_tokens=max_new_tokens, pad_token_id=tok.pad_token_id)
                 decs = tok.batch_decode(out, skip_special_tokens=True)
@@ -177,7 +187,8 @@ def evaluate_model_streaming(model, tok, max_new_tokens=256, max_samples_per_spl
                 batch_prompts, batch_refs, batch_dirs = [], [], []
 
         if batch_prompts:
-            enc = tok(batch_prompts, return_tensors="pt", padding=True, truncation=True, max_length=MAX_SEQ_LEN).to(device)
+            enc = tok(batch_prompts, return_tensors="pt", padding=True, truncation=True, max_length=MAX_SEQ_LEN)
+            enc = {k: v.to(device) for k,v in enc.items()}
             with torch.no_grad():
                 out = model.generate(**enc, max_new_tokens=max_new_tokens, pad_token_id=tok.pad_token_id)
             decs = tok.batch_decode(out, skip_special_tokens=True)
@@ -232,7 +243,7 @@ if __name__ == "__main__":
         for i in range(min(10,len(preds[d]))):
             display(Markdown(f"**Ref:** {refs[d][i]}  \n**Pred:** {preds[d][i]}"))
 
-    # 4️⃣ Display metrics table
+    # 4️⃣ Metrics table
     data = []
     for d in sorted(set(list(bleu.keys()) + list(chrf.keys()) + list(comet.keys()))):
         data.append({"Direction": d,
@@ -243,7 +254,7 @@ if __name__ == "__main__":
     display(Markdown("## 📋 Translation Quality Metrics per Direction"))
     display(df_metrics.style.background_gradient(cmap="YlGnBu", subset=["BLEU","chrF"]))
 
-    # 5️⃣ Enhanced training plots
+    # 5️⃣ Training plots
     logs = trainer.state.log_history
     df = pd.DataFrame(logs)
     if not df.empty:
