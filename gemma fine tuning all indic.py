@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 # ======================================================
 # ✅ Universal Fine-tuning + Evaluation for any Hugging Face instruct/causal LM
 # (Streaming, LoRA, Fast Evaluation, Metrics, Top-10 Preview)
@@ -147,12 +146,12 @@ def train_model(max_samples=None):
     return model, tok, trainer
 
 # ------------------------------ EVALUATION (Fast + Top-10 Preview)
-def evaluate_model(model, tok, max_new_tokens=256, max_samples_per_split=None, batch_size=EVAL_BATCH_SIZE):  
+def evaluate_model(model, tok, max_new_tokens=256, max_samples_per_split=None, batch_size=EVAL_BATCH_SIZE):
     warnings.filterwarnings("ignore", message="Setting `pad_token_id` to `eos_token_id`")
     device = "cuda" if torch.cuda.is_available() else "cpu"
     model.to(device).eval()
 
-    comet = evaluate.load("comet")  
+    #comet = evaluate.load("comet")
 
     preds, refs = {}, {}
     for lang in INDIAN_LANGS:
@@ -215,9 +214,8 @@ def evaluate_model(model, tok, max_new_tokens=256, max_samples_per_split=None, b
     for d in preds:
         if not preds[d]: continue
         bleu_scores[d] = sacrebleu.corpus_bleu(preds[d],[refs[d]]).score
-        chrf_scores[d] = sacrebleu.corpus_chrf(preds[d], [[r] for r in refs[d]]).score 
-        comet_scores[d] = comet.compute(predictions=preds[d], references=refs[d], sources=[""]*len(refs[d]))["mean_score"]
-
+        chrf_scores[d] = sacrebleu.corpus_chrf(preds[d], [[r] for r in refs[d]]).score
+        #comet_scores[d] = comet.compute(predictions=preds[d], references=refs[d], sources=[""]*len(refs[d]))["mean_score"]
 
     # ---------------- PLOTS
     for metric, scores in [("BLEU",bleu_scores),("chrF",chrf_scores),("COMET",comet_scores)]:
@@ -262,9 +260,9 @@ if __name__ == "__main__":
     # 2️⃣ Evaluate
     bleu, chrf, comet = evaluate_model(
         model, tok,
-        max_samples_per_split=None if FULL_DATASET else 200,  
+        max_samples_per_split=None if FULL_DATASET else 200,
         batch_size=EVAL_BATCH_SIZE
-    ) #set 200 to 1k
+    )
 
     # 3️⃣ Plot training curve
     plot_training(trainer)
@@ -296,6 +294,7 @@ print("\n🧮 Averages Across All Directions:")
 print(f"  ➤ Mean BLEU  : {avg_bleu:.2f}")
 print(f"  ➤ Mean chrF  : {avg_chrf:.2f}")
 print(f"  ➤ Mean COMET : {avg_comet:.4f}")
+
 # ======================================================
 # 📉 Enhanced Training & Learning Metrics Visualization (Smoothed + Detailed)
 # ======================================================
@@ -383,6 +382,7 @@ if len(df) > 5:
     display(Image(filename=der_path))
 
 print("\n✅ All enhanced training metric plots saved to:", OUTPUT_DIR)
+
 # ======================================================
 # 📊 Metrics Summary + Separate Plots for BLEU, chrF, COMET (Safe Version)
 # ======================================================
@@ -455,8 +455,9 @@ def plot_metric(metric_name, scores_dict):
 plot_metric("BLEU", bleu)
 plot_metric("chrF", chrf)
 plot_metric("COMET", comet_scores)
+
 # ======================================================
-# 📈 Separate Plots for BLEU, chrF, COMET (Optional)
+# 📈 Separate Plots for BLEU, chrF, COMET (Colab-friendly)
 # ======================================================
 plot_dir = OUTPUT_DIR / "metric_plots"
 plot_dir.mkdir(exist_ok=True, parents=True)
@@ -465,9 +466,9 @@ def plot_metric(metric_name, scores_dict):
     if not scores_dict:
         print(f"⚠️ No {metric_name} scores available.")
         return
-    
+
     langs, vals = list(scores_dict.keys()), [scores_dict[k] for k in scores_dict]
-    
+
     plt.figure(figsize=(12,6))
     plt.bar(langs, vals, color='skyblue')
     plt.title(f"{metric_name} Scores per Direction", fontsize=16)
@@ -476,10 +477,10 @@ def plot_metric(metric_name, scores_dict):
     plt.xticks(rotation=45, ha="right")
     plt.grid(axis='y', linestyle='--', alpha=0.7)
     plt.tight_layout()
-    
+
     # Show plot inline in Colab
     plt.show()
-    
+
     # Save plot
     path = plot_dir / f"{metric_name.lower()}_per_direction.png"
     plt.savefig(path)
@@ -490,5 +491,3 @@ def plot_metric(metric_name, scores_dict):
 plot_metric("BLEU", bleu)
 plot_metric("chrF", chrf)
 plot_metric("COMET", comet_scores)
-
-
