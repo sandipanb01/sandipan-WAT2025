@@ -262,7 +262,7 @@ if __name__ == "__main__":
         model, tok,
         max_samples_per_split=None if FULL_DATASET else 200,
         batch_size=EVAL_BATCH_SIZE
-    )
+    )#set 200 to 1k 
 
     # 3️⃣ Plot training curve
     plot_training(trainer)
