@@ -105,7 +105,7 @@ def detect_lora_modules(model):
     modules = []
     for n,m in model.named_modules():
         n_lower = n.lower()
-        if any(x in n_lower for x in ["q_proj","k_proj","v_proj","o_proj","attn.wq","attn.wk","attn.wv","attn.wo"]):
+        if any(x in n_lower for x in ["q_proj","k_proj","v_proj","o_proj", "up_proj","down_proj","attn.wq","attn.wk","attn.wv","attn.wo"]):
             modules.append(n.split(".")[-1])
     return list(set(modules))
 
@@ -132,12 +132,14 @@ def train_model(max_samples=None):
         output_dir=str(OUTPUT_DIR),
         per_device_train_batch_size=BATCH_SIZE,
         gradient_accumulation_steps=GRAD_ACCUM,
-        learning_rate=1.5e-4,
+        learning_rate=1.5e-4, #use 1.5e-4
+        lr_scheduler_type="cosine",  #use cosine LR scheduler if u have good GPU
         num_train_epochs=1,
         max_steps=MAX_TRAIN_STEPS,
         logging_steps=10,
         save_strategy="no",
-        report_to="none"
+        report_to="none",
+        warmup_ratio=0.03  #MODIFIED: warmup ratio
     )
     trainer = SFTTrainer(model=model, args=cfg, train_dataset=ds, tokenizer=tok)
     trainer.train()
