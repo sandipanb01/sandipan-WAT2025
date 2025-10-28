@@ -35,14 +35,12 @@ PER_DEVICE_BATCH = 1         # effective per-device micro-batch
 GRAD_ACCUM = 4
 MAX_TRAIN_STEPS = 2000       # optimize accordingly
 EVAL_BATCH_SIZE = 8
-FULL_DATASET = True          # toggle full dataset or capped samples on small GPUs
-MAX_SAMPLES = None           # if None, script may auto-cap on small GPUs
+FULL_DATASET = True          # toggle full dataset or cap samples on small GPUs
+MAX_SAMPLES = None           # fix according to your GPU 
 NUM_WORKERS = 3
 # For T4: recommend FP16; on A100/H100 prefer BF16. Use these to override auto-detection:
 FORCE_FP16 = True
 FORCE_BF16 = False
-
-HF_AUTH_TOKEN_ENV = "USE YOUR OWN HF TOKEN"
 
 INDIAN_LANGS = ["hin","ben","tam","tel","mal","kan","mar","guj","urd","pan","ori"]
 LANG_MAP = {
