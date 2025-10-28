@@ -33,7 +33,7 @@ OUTPUT_DIR.mkdir(exist_ok=True, parents=True)
 MAX_SEQ_LEN = 1024
 PER_DEVICE_BATCH = 1         # effective per-device micro-batch
 GRAD_ACCUM = 4
-MAX_TRAIN_STEPS = 50       # will be reduced automatically on small GPUs for safety
+MAX_TRAIN_STEPS = 2000       # optimize accordingly
 EVAL_BATCH_SIZE = 8
 FULL_DATASET = True          # toggle full dataset or capped samples on small GPUs
 MAX_SAMPLES = None           # if None, script may auto-cap on small GPUs
