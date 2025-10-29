@@ -27,7 +27,7 @@ from IPython.display import display, Markdown
 
 # ------------------------------ CONFIG (tweak if you want)
 MODEL_NAME = "google/gemma-3-270m-it"
-OUTPUT_DIR = Path("/kaggle/working/universal_output")
+OUTPUT_DIR = Path("/content/universal_output") #Path("/kaggle/working/universal_output")
 OUTPUT_DIR.mkdir(exist_ok=True, parents=True)
 
 MAX_SEQ_LEN = 1024
