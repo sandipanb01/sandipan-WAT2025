@@ -2,7 +2,7 @@
 # ✅ Universal Fine-tuning + Evaluation for any Hugging Face instruct/causal LM
 # (Streaming, LoRA, Fast Evaluation, Metrics, Top-10 Preview, FP16/BF16, multi-GPU aware)
 # T4-friendly fixes: automatic dtype/workers/limits so training actually starts on T4.
-# Merged A + B — training + eval pipeline, with safe default toggles.
+# training + eval pipeline, with safe default toggles.
 # ======================================================
 
 import os, json, zipfile, math, warnings, time
