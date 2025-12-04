@@ -83,6 +83,22 @@ LANG_MAP = {
 }
 
 # -------------------------
+# Competition-ready flags (minimal, required fixes)
+# -------------------------
+# LIGHT_MODE: reduces steps/samples to be T4/Colab friendly (winning submission)
+LIGHT_MODE = True
+
+if LIGHT_MODE:
+    # Conservative settings that still produce good quality but run on T4 in time
+    MAX_TRAIN_STEPS = 500
+    HYBRID_STEPS = 200
+    # Cap streaming samples used during training in LIGHT_MODE unless user overrides
+    if MAX_SAMPLES is None:
+        MAX_SAMPLES = 15000
+    # Keep batch/accum the same to preserve deterministic behaviour
+    # EVAL uses smaller batches by default; leave EVAL_BATCH_SIZE as-is
+
+# -------------------------
 # Research-mode flags (safe defaults)
 # -------------------------
 # Which PEFTs to try
@@ -97,7 +113,7 @@ LORA_DROPOUT = 0.05
 # Hybrid selective FT
 ENABLE_HYBRID_FT = False
 HYBRID_UNFREEZE_TOPK = 2   # top-k decoder layers to unfreeze in hybrid stage
-HYBRID_STEPS = 500
+HYBRID_STEPS = HYBRID_STEPS
 HYBRID_LR = 5e-6
 
 # Backtranslation (on/off)
@@ -114,20 +130,16 @@ SWEEP_HYBRID = [False, True]
 EXPERIMENT_LOG = OUTPUT_DIR/"experiments.jsonl"
 
 # -------------------------
-# Prompt builder
+# Prompt builder (SIMPLIFIED for competition)
+# - Short, deterministic, low-token prompts improve speed and stability.
 # -------------------------
 def build_prompt(src, src_lang, tgt_lang, example, tokenizer):
-    ex_src, ex_tgt = example
-    if tokenizer and hasattr(tokenizer, "apply_chat_template"):
-        msgs = [
-            {"role":"user","content": f"Translate this {LANG_MAP[src_lang]} text to {LANG_MAP[tgt_lang]}:\n{ex_src}"},
-            {"role":"assistant","content": ex_tgt},
-            {"role":"user","content": f"Now translate this {LANG_MAP[src_lang]} text to {LANG_MAP[tgt_lang]}:\n{src}"},
-            {"role":"assistant","content": ""}
-        ]
-        return tokenizer.apply_chat_template(msgs, add_generation_prompt=True, tokenize=False)
-    return (f"{LANG_MAP[src_lang]} → {LANG_MAP[tgt_lang]} translation example:\n"
-            f"{ex_src} → {ex_tgt}\n\nTranslate:\n{src}\n")
+    """
+    Competition-friendly prompt: very short explicit instruction.
+    Keeps function signature same as original.
+    """
+    # Avoid heavy "chat" templates — one-line instruction + sentence
+    return f"Translate the following {LANG_MAP[src_lang]} sentence into {LANG_MAP[tgt_lang]}:\n{src}\n"
 
 # -------------------------
 # DATA streaming + optional BT injection
@@ -147,6 +159,7 @@ def stream_examples(tokenizer, max_samples=None, bt_files=None):
 
         ds_temp = load_dataset(dataset_name, split=split, streaming=True, name=cfg)
         one_shot = ("","")
+        # keep the small one-shot selection but we won't use it in prompt now
         for row in islice(ds_temp, 50):
             s, t = row.get("src_txt",""), row.get("tgt_txt","")
             if s and t and len(s.split())>5 and len(t.split())>5:
@@ -176,6 +189,7 @@ def stream_examples(tokenizer, max_samples=None, bt_files=None):
                         # expected {"src": synthetic_src, "tgt": original_tgt, "lang": "hin"}
                         lang = obj.get("lang")
                         if not lang: continue
+                        # use the simplified prompt (src is synthetic source)
                         yield {"input_text": build_prompt(obj["src"], "eng", lang, ("Example","Example"), tokenizer),
                                "target_text": obj["tgt"], "direction": f"eng_{lang}"}
             except Exception as e:
@@ -192,8 +206,8 @@ class PralekhaDataset(IterableDataset):
 
     def __iter__(self):
         for ex in stream_examples(self.tok, self.max_samples, self.bt_files):
-            src_enc = self.tok(ex["input_text"], truncation=True, max_length=MAX_SEQ_LEN)
-            tgt_enc = self.tok(ex["target_text"], truncation=True, max_length=MAX_SEQ_LEN)
+            src_enc = self.tok(ex["input_text"], truncation=True, max_length=MAX_SEQ_LEN, add_special_tokens=False)
+            tgt_enc = self.tok(ex["target_text"], truncation=True, max_length=MAX_SEQ_LEN, add_special_tokens=True)
 
             inp = src_enc["input_ids"] + tgt_enc["input_ids"]
             inp = inp[:MAX_SEQ_LEN]
@@ -476,19 +490,23 @@ def evaluate_model(model, tok, max_samples_per_split=None, max_new_tokens=256):
             for d,p,r in zip(directions, decs, references):
                 preds[d].append(p.strip()); refs[d].append(r.strip())
 
-    # create submission.zip
+    # create LoResMT-compliant submission files (ONE file per direction, hyphen-separated names)
+    for d in preds:
+        arr = preds[d]
+        # skip if empty (still create empty file)
+        fname = OUTPUT_DIR / f"{d.replace('_','-')}.jsonl"
+        with open(fname, "w", encoding="utf-8") as f:
+            for p in arr:
+                # each line is a JSON list with single string as required
+                f.write(json.dumps([p], ensure_ascii=False) + "\n")
+    # zip them (optional, but keep for compatibility)
     sub_zip = OUTPUT_DIR/"submission.zip"
     with zipfile.ZipFile(sub_zip, "w") as zf:
         for d in preds:
-            arr = preds[d]
-            for i in range(0, len(arr), 1000):
-                chunk = arr[i:i+1000]
-                jfile = OUTPUT_DIR/f"{d.replace('_','_2_')}_{(i//1000)+1}.jsonl"
-                with open(jfile, "w", encoding="utf-8") as f:
-                    for p in chunk:
-                        f.write(json.dumps([p], ensure_ascii=False) + "\n")
-                zf.write(jfile, jfile.name)
-    print("Saved submission.zip ->", sub_zip)
+            fname = OUTPUT_DIR / f"{d.replace('_','-')}.jsonl"
+            if fname.exists():
+                zf.write(fname, fname.name)
+    print("Saved submission files and ZIP ->", OUTPUT_DIR)
 
     # compute metrics
     bleu = {}; chrf = {}
@@ -551,7 +569,7 @@ def backtranslate(model, tokenizer, input_sentences, src_lang, tgt_lang,
     torch.manual_seed(SEED)
     for i in tqdm(range(0, len(input_sentences), batch_size), desc="BT"):
         batch = input_sentences[i:i+batch_size]
-        prompts = [f"Translate this {LANG_MAP[src_lang]} text to {LANG_MAP[tgt_lang]}:\n{s}" for s in batch]
+        prompts = [f"Translate the following {LANG_MAP[src_lang]} sentence into {LANG_MAP[tgt_lang]}:\n{s}\n" for s in batch]
         enc = tokenizer(prompts, return_tensors="pt", padding=True, truncation=True, max_length=MAX_SEQ_LEN).to(device)
         with torch.no_grad():
             outs = model.generate(**enc, max_new_tokens=max_new_tokens, do_sample=False, pad_token_id=tokenizer.pad_token_id)
@@ -583,7 +601,7 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     # safety: small test mode if nothing passed
-    safe_max = args.max_samples or (2000 if not FULL_DATASET else None)
+    safe_max = args.max_samples or (MAX_SAMPLES if MAX_SAMPLES is not None else (2000 if not FULL_DATASET else None))
 
     if args.run_mode == "single":
         print("Running single experiment...")
