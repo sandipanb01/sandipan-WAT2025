@@ -105,14 +105,14 @@ def detect_lora_modules(model):
     modules = []
     for n,m in model.named_modules():
         n_lower = n.lower()
-        if any(x in n_lower for x in ["q_proj","k_proj","v_proj","o_proj", "up_proj","down_proj","attn.wq","attn.wk","attn.wv","attn.wo"]):
+        if any(x in n_lower for x in ["q_proj","k_proj","v_proj","o_proj", "up_proj","down_proj","gate_proj","attn.wq","attn.wk","attn.wv","attn.wo"]):
             modules.append(n.split(".")[-1])
     return list(set(modules))
 
 def prepare_model():
     tok = AutoTokenizer.from_pretrained(MODEL_NAME, trust_remote_code=True)
     if tok.pad_token is None: tok.pad_token = tok.eos_token
-    model = AutoModelForCausalLM.from_pretrained(MODEL_NAME, torch_dtype=torch.float32, device_map="auto")
+    model = AutoModelForCausalLM.from_pretrained(MODEL_NAME, torch_dtype=torch.float16, device_map="auto")
 
     target_modules = detect_lora_modules(model)
     print(f"⚡ LoRA target modules detected: {target_modules}")
