@@ -146,7 +146,7 @@ def detect_lora_modules(model):
     for n,m in model.named_modules():
         n_lower = n.lower()
         if any(x in n_lower for x in [
-            "q_proj","k_proj","v_proj","o_proj",
+            "q_proj","k_proj","v_proj","gate_proj","o_proj",
             "up_proj","down_proj","attn.wq","attn.wk","attn.wv","attn.wo"
         ]):
             modules.append(n.split(".")[-1])
