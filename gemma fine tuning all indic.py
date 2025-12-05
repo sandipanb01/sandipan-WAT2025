@@ -118,9 +118,9 @@ def prepare_model():
     print(f"⚡ LoRA target modules detected: {target_modules}")
 
     lora_cfg = LoraConfig(
-        r=16, lora_alpha=16,
+        r=8, lora_alpha=16,
         target_modules=target_modules,
-        lora_dropout=0.05, task_type="CAUSAL_LM"
+        lora_dropout=0.1, task_type="CAUSAL_LM"
     )
     return get_peft_model(model, lora_cfg), tok
 
@@ -132,14 +132,14 @@ def train_model(max_samples=None):
         output_dir=str(OUTPUT_DIR),
         per_device_train_batch_size=BATCH_SIZE,
         gradient_accumulation_steps=GRAD_ACCUM,
-        learning_rate=1.5e-4, #use 1.5e-4
+        learning_rate=3e-5, #use 1.5e-4
         lr_scheduler_type="cosine",  #use cosine LR scheduler if u have good GPU
         num_train_epochs=1,
         max_steps=MAX_TRAIN_STEPS,
         logging_steps=10,
         save_strategy="no",
         report_to="none",
-        warmup_ratio=0.03  #MODIFIED: warmup ratio
+        warmup_ratio=0.15  #MODIFIED: warmup ratio
     )
     trainer = SFTTrainer(model=model, args=cfg, train_dataset=ds, tokenizer=tok)
     trainer.train()
