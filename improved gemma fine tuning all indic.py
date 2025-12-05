@@ -1,7 +1,6 @@
 # ======================================================
 # ✅ Universal Fine-tuning + Evaluation for any Hugging Face instruct/causal LM
 # (Streaming, LoRA, Fast Evaluation, Metrics, Top-10 Preview)
-# Includes enhanced training visualizations (smoothed loss, derivative, LR trend)
 # ======================================================
 
 import os, json, zipfile, math, warnings
@@ -15,9 +14,10 @@ from peft import LoraConfig, get_peft_model
 from trl import SFTTrainer, SFTConfig
 import sacrebleu, evaluate
 import matplotlib.pyplot as plt
+from tqdm import tqdm
+from IPython.display import display, Markdown, Image
 import pandas as pd
 import numpy as np
-from IPython.display import display, Markdown, Image
 
 # ------------------------------ CONFIG
 MODEL_NAME = "google/gemma-3-270m-it"
@@ -97,24 +97,25 @@ class PralekhaDataset(IterableDataset):
         for ex in stream_examples(self.tok, self.max_samples):
             s_enc = self.tok(ex["input_text"], truncation=True, max_length=MAX_SEQ_LEN, add_special_tokens=False)
             t_enc = self.tok(ex["target_text"], truncation=True, max_length=MAX_SEQ_LEN, add_special_tokens=True)
-            inp_ids = s_enc["input_ids"] + t_enc["input_ids"]
-            lbl_ids = [-100]*len(s_enc["input_ids"]) + t_enc["input_ids"]
-            if len(inp_ids) > MAX_SEQ_LEN:
-                inp_ids = inp_ids[:MAX_SEQ_LEN]
-                lbl_ids = lbl_ids[:MAX_SEQ_LEN]
-            yield {"input_ids": inp_ids, "attention_mask":[1]*len(inp_ids), "labels": lbl_ids}
+            inp = (s_enc["input_ids"] + t_enc["input_ids"])[:MAX_SEQ_LEN]
+            lbl = ([-100]*len(s_enc["input_ids"]) +
+                   [min(i,self.tok.vocab_size-1) for i in t_enc["input_ids"]])[:MAX_SEQ_LEN]
+            if len(inp) < 10:  # filter too-short sequences
+                continue
+            yield {"input_ids": inp, "attention_mask":[1]*len(inp), "labels": lbl}
 
 # ------------------------------ MODEL PREP
 def detect_lora_modules(model):
-    target_keywords = ["q_proj","k_proj","v_proj","o_proj","up_proj","down_proj","gate_proj","proj","linear"]
     modules = []
-    for n, m in model.named_modules():
-        if isinstance(m, torch.nn.Linear):
-            n_lower = n.lower()
-            if any(k in n_lower for k in target_keywords):
-                modules.append(n)
+    for n,m in model.named_modules():
+        n_lower = n.lower()
+        if any(x in n_lower for x in ["q_proj","k_proj","v_proj","o_proj", "up_proj","down_proj","gate_proj","attn.wq","attn.wk","attn.wv","attn.wo"]):
+            modules.append(n.split(".")[-1])
     modules = list(set(modules))
-    print(f"⚡ LoRA target modules detected ({len(modules)}): {modules}")
+    if "gate_proj" not in modules:
+        print("⚠️ gate_proj not detected! Check model architecture.")
+    else:
+        print(f"⚡ LoRA target modules detected (including gate_proj): {modules}")
     return modules
 
 def prepare_model():
@@ -157,7 +158,6 @@ def evaluate_model(model, tok, max_new_tokens=256, max_samples_per_split=None, b
     warnings.filterwarnings("ignore", message="Setting `pad_token_id` to `eos_token_id`")
     device = "cuda" if torch.cuda.is_available() else "cpu"
     model.to(device).eval()
-
     preds, refs = {}, {}
     for lang in INDIAN_LANGS:
         for d in [f"eng_{lang}", f"{lang}_eng"]:
@@ -166,7 +166,7 @@ def evaluate_model(model, tok, max_new_tokens=256, max_samples_per_split=None, b
     splits = get_dataset_split_names("ai4bharat/Pralekha","dev")
     print("\n🔍 Starting batched evaluation...\n")
 
-    for split in splits:
+    for split in tqdm(splits, desc="Evaluating language pairs"):
         parts = split.split("_")
         if len(parts)!=2: continue
         sl, tl = parts
@@ -221,74 +221,35 @@ def evaluate_model(model, tok, max_new_tokens=256, max_samples_per_split=None, b
         bleu_scores[d] = sacrebleu.corpus_bleu(preds[d],[refs[d]]).score
         chrf_scores[d] = sacrebleu.corpus_chrf(preds[d], [[r] for r in refs[d]]).score
 
-    # Top-10 samples
+    # Top-10 preview
     print("\n🔠 Sample Translations (Top 10 per direction):\n")
     for d in preds.keys():
         display(Markdown(f"### {d.upper()}"))
         for i in range(min(10,len(preds[d]))):
             display(Markdown(f"**Ref:** {refs[d][i]}  \n**Pred:** {preds[d][i]}"))
 
-    return bleu_scores, chrf_scores, {}
+    return bleu_scores, chrf_scores
 
-# ------------------------------ ENHANCED TRAINING VISUALS
-def plot_training_enhanced(trainer):
+# ------------------------------ TRAINING PLOTS (Smoothed)
+def plot_training(trainer):
     logs = trainer.state.log_history
     df = pd.DataFrame(logs)
-    if df.empty: return
     df["loss_smooth"] = df["loss"].rolling(window=10, min_periods=1).mean()
-
-    # Raw + Smoothed Loss
     plt.figure(figsize=(8,4))
     plt.plot(df["step"], df["loss"], alpha=0.5, color="gray", label="Raw Loss")
     plt.plot(df["step"], df["loss_smooth"], color="blue", linewidth=2, label="Smoothed Loss")
-    plt.xlabel("Step"); plt.ylabel("Loss"); plt.title("Training Loss (Raw + Smoothed)"); plt.legend()
-    plt.tight_layout(); plt.savefig(OUTPUT_DIR / "training_loss_smooth.png"); plt.close()
-    display(Image(filename=OUTPUT_DIR / "training_loss_smooth.png"))
-
-    # Learning Rate
-    if "learning_rate" in df.columns:
-        plt.figure(figsize=(8,4))
-        plt.plot(df["step"], df["learning_rate"], color="orange", label="LR")
-        plt.xlabel("Step"); plt.ylabel("LR"); plt.title("Learning Rate Schedule"); plt.legend()
-        plt.tight_layout(); plt.savefig(OUTPUT_DIR / "learning_rate_trend.png"); plt.close()
-        display(Image(filename=OUTPUT_DIR / "learning_rate_trend.png"))
-
-    # Loss per epoch
-    if "epoch" in df.columns:
-        plt.figure(figsize=(8,4))
-        plt.scatter(df["epoch"], df["loss"], color="green", alpha=0.6, s=20, label="Raw Loss")
-        epoch_means = df.groupby("epoch")["loss"].mean()
-        plt.plot(epoch_means.index, epoch_means.values, color="red", linewidth=2, label="Mean Loss per Epoch")
-        plt.xlabel("Epoch"); plt.ylabel("Loss"); plt.title("Loss per Epoch"); plt.legend()
-        plt.tight_layout(); plt.savefig(OUTPUT_DIR / "epoch_loss_trend.png"); plt.close()
-        display(Image(filename=OUTPUT_DIR / "epoch_loss_trend.png"))
-
-    # Loss derivative
-    if len(df) > 5:
-        df["loss_derivative"] = np.gradient(df["loss_smooth"])
-        plt.figure(figsize=(8,4))
-        plt.plot(df["step"], df["loss_derivative"], color="purple", label="d(Loss)/d(Step)")
-        plt.axhline(0, color="black", linestyle="--", alpha=0.5)
-        plt.xlabel("Step"); plt.ylabel("Loss Change"); plt.title("Loss Change Rate"); plt.legend()
-        plt.tight_layout(); plt.savefig(OUTPUT_DIR / "loss_derivative_curve.png"); plt.close()
-        display(Image(filename=OUTPUT_DIR / "loss_derivative_curve.png"))
-
-    print("\n✅ Enhanced training plots saved to:", OUTPUT_DIR)
+    plt.xlabel("Step"); plt.ylabel("Loss"); plt.title("Training Loss (Raw + Smoothed)")
+    plt.legend(); plt.tight_layout()
+    path = OUTPUT_DIR / "training_loss_smooth.png"
+    plt.savefig(path); plt.close()
+    display(Image(filename=path))
+    print("✅ Training loss plotted and smoothed.")
 
 # ------------------------------ MAIN
 if __name__ == "__main__":
     os.environ["CUDA_LAUNCH_BLOCKING"]="1"
     max_samples = None if FULL_DATASET else MAX_COLAB_SAMPLES
 
-    # Train
     model, tok, trainer = train_model(max_samples=max_samples)
-
-    # Evaluate
-    bleu, chrf, comet = evaluate_model(
-        model, tok,
-        max_samples_per_split=None if FULL_DATASET else 200,
-        batch_size=EVAL_BATCH_SIZE
-    )
-
-    # Plot enhanced training visuals
-    plot_training_enhanced(trainer)
+    bleu, chrf = evaluate_model(model, tok, max_samples_per_split=None if FULL_DATASET else 200, batch_size=EVAL_BATCH_SIZE)
+    plot_training(trainer)
