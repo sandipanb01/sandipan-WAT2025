@@ -1,13 +1,14 @@
 # ======================================================
-# 🚀 UNIVERSAL VS CODE VERSION (LoRA + Streaming + SFTTrainer)
+# 🚀 UNIVERSAL VS CODE VERSION (LoRA + Streaming + SFTTrainer) - FINAL
 # ======================================================
 
-import os, json, zipfile, warnings, gc
+import os, json, zipfile, warnings, gc, math
 from pathlib import Path
 import torch
 from datasets import load_dataset, get_dataset_split_names
-from transformers import AutoTokenizer, AutoModelForCausalLM, Trainer, TrainingArguments
+from transformers import AutoTokenizer, AutoModelForCausalLM
 from peft import LoraConfig, get_peft_model
+from trl import SFTTrainer, SFTConfig
 import sacrebleu
 import matplotlib.pyplot as plt
 from tqdm import tqdm
@@ -81,7 +82,7 @@ def load_translation_data(tokenizer, max_samples=None):
         for row in ds:
             if max_samples and count >= max_samples: break
             s, t = row.get("src_txt",""), row.get("tgt_txt","")
-            if not s or not t or len(s.split()) < 5 or len(t.split()) < 5: 
+            if not s or not t or len(s.split()) < 5 or len(t.split()) < 5:
                 skipped += 1
                 continue
             if s[:100] == t[:100]:
@@ -116,31 +117,32 @@ def load_translation_data(tokenizer, max_samples=None):
     print(f"✅ Loaded {len(data['dev'])} eval examples")
     return data
 
-# ------------------------------ MODEL PREP
+# ------------------------------ MODEL PREP (safe fp16)
 def prepare_model():
     warnings.filterwarnings("ignore", message=".*label_names.*")
     print("\n🔧 Loading model...")
     tok = AutoTokenizer.from_pretrained(MODEL_NAME, trust_remote_code=True)
     if tok.pad_token is None: tok.pad_token = tok.eos_token
     tok.padding_side = 'right'
-    
+
+    # T4-safe dtype: float16
     model = AutoModelForCausalLM.from_pretrained(
-        MODEL_NAME, 
-        torch_dtype=torch.bfloat16,
+        MODEL_NAME,
+        torch_dtype=torch.float16,
         device_map="auto",
         trust_remote_code=True,
         low_cpu_mem_usage=True
     )
-    
-    target_modules = list({n.split(".")[-1] for n, m in model.named_modules() if any(x in n.lower() for x in ["q_proj","k_proj","gate_proj","v_proj","o_proj","up_proj","down_proj","attn.wq","attn.wk","attn.wv","attn.wo"])})
-    print(f"⚡ LoRA targets: {target_modules}")
 
+    target_modules = list({n.split(".")[-1] for n, m in model.named_modules() if any(x in n.lower() for x in ["q_proj","k_proj","gate_proj","v_proj","o_proj","up_proj","down_proj","attn.wq","attn.wk","attn.wv","attn.wo"])})
+
+    print(f"⚡ LoRA targets: {target_modules}")
     lora_cfg = LoraConfig(
         r=2,
-        lora_alpha=4, 
+        lora_alpha=4,
         target_modules=target_modules,
         lora_dropout=0.1,
-        task_type="CAUSAL_LM", 
+        task_type="CAUSAL_LM",
         bias="none"
     )
     model = get_peft_model(model, lora_cfg)
@@ -162,38 +164,40 @@ def collate_fn(batch):
             "attention_mask": torch.tensor(attention_mask),
             "labels": torch.tensor(labels)}
 
-# ------------------------------ TRAINING (SFTTrainer compatible)
-def train_model(data, tokenizer):
-    model, tok = prepare_model()
-    train_dataset = list(data["train"])  # streaming-friendly for SFTTrainer
-    args = TrainingArguments(
-        output_dir=str(OUTPUT_DIR),
+# ------------------------------ SFT TRAINER
+def train_model(model, tok, dataset, output_dir=str(OUTPUT_DIR), max_steps=100):
+    sft_config = SFTConfig(
+        output_dir=output_dir,
+        overwrite_output_dir=True,
+        num_train_epochs=1,
+        max_steps=max_steps,
         per_device_train_batch_size=BATCH_SIZE,
+        per_device_eval_batch_size=1,
         gradient_accumulation_steps=GRAD_ACCUM,
-        learning_rate=2e-4,
-        lr_scheduler_type="cosine",
-        num_train_epochs=5 if QUICK_TEST else 3,
         logging_steps=10,
-        save_strategy="epoch",
-        save_total_limit=1,
+        save_steps=25,
+        save_total_limit=2,
+        learning_rate=2e-4,
+        warmup_ratio=0.03,
+        lr_scheduler_type="cosine",
+        bf16=False,
+        fp16=True,
         report_to="none",
-        warmup_ratio=0.1,
-        remove_unused_columns=False,
-        label_names=["labels"],
-        max_grad_norm=1.0
     )
 
-    trainer = Trainer(
+    trainer = SFTTrainer(
         model=model,
-        args=args,
-        train_dataset=train_dataset,
-        data_collator=collate_fn
+        tokenizer=tok,
+        args=sft_config,
+        train_dataset=dataset,
+        formatting_func=None,
+        dataset_text_field=None,
+        max_seq_length=MAX_SEQ_LEN,
     )
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
+
     trainer.train()
-    model.save_pretrained(OUTPUT_DIR)
-    tok.save_pretrained(OUTPUT_DIR)
+    trainer.save_model(output_dir)
+    tok.save_pretrained(output_dir)
     return model, tok, trainer
 
 # ------------------------------ EVALUATION
@@ -202,6 +206,7 @@ def evaluate_model(model, tok, eval_data):
     device = "cuda" if torch.cuda.is_available() else "cpu"
     model.to(device).eval()
     preds, refs, inputs = {"eng_hin": [], "hin_eng": []}, {"eng_hin": [], "hin_eng": []}, {"eng_hin": [], "hin_eng": []}
+
     for ex in tqdm(eval_data, desc="Evaluating"):
         src, tgt, dirn = ex["src"], ex["tgt"], ex["dirn"]
         prompt = f"""Task: Translate English to Hindi.\nIMPORTANT: Output ONLY Hindi translation.\n\nEnglish text:\n{src}\n\nHindi translation:""" if dirn=="eng_hin" else f"""Task: Translate Hindi to English.\nIMPORTANT: Output ONLY English translation.\n\nHindi text:\n{src}\n\nEnglish translation:"""
@@ -215,6 +220,7 @@ def evaluate_model(model, tok, eval_data):
         preds[dirn].append(pred_text)
         refs[dirn].append(tgt.strip())
         inputs[dirn].append(src.strip())
+
     save_results(preds, refs, inputs)
     return calculate_metrics(preds, refs)
 
@@ -261,14 +267,22 @@ if __name__ == "__main__":
     os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
     os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
     if torch.cuda.is_available(): torch.cuda.empty_cache(); gc.collect()
+
+    # Prepare tokenizer & data
     tok = AutoTokenizer.from_pretrained(MODEL_NAME, trust_remote_code=True)
     if tok.pad_token is None: tok.pad_token = tok.eos_token
     data = load_translation_data(tok, max_samples=TRAIN_SAMPLES)
-    model, tok, trainer = train_model(data, tok)
+
+    # Prepare model (PEFT/LoRA) and train using SFTTrainer
+    model, tok = prepare_model()
+    train_dataset = list(data["train"])  # SFTTrainer accepts list-like tokenized samples
+    model, tok, trainer = train_model(model, tok, train_dataset, output_dir=str(OUTPUT_DIR), max_steps=50 if QUICK_TEST else 1000)
+
+    # Evaluate and plot
     bleu, chrf = evaluate_model(model, tok, data["dev"])
     plot_training(trainer)
 
-    # Final results print
+    # Final results
     print("\n📊 FINAL RESULTS")
     for dirn in ["eng_hin","hin_eng"]:
         if dirn in bleu:
