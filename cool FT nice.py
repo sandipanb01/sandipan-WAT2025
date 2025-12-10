@@ -18,9 +18,9 @@ MODEL_NAME = "google/gemma-3-4b-it"
 OUTPUT_DIR = Path("./universal_output_sft")
 OUTPUT_DIR.mkdir(exist_ok=True, parents=True)
 
-MAX_SEQ_LEN = 384
+MAX_SEQ_LEN = 256
 BATCH_SIZE = 1
-GRAD_ACCUM = 4
+GRAD_ACCUM = 8
 QUICK_TEST = True
 
 if QUICK_TEST:
@@ -117,7 +117,7 @@ def load_translation_data(tokenizer, max_samples=None):
     print(f"✅ Loaded {len(data['dev'])} eval examples")
     return data
 
-# ------------------------------ MODEL PREP (safe fp16)
+# ------------------------------ MODEL PREP (safe bf16)
 def prepare_model():
     warnings.filterwarnings("ignore", message=".*label_names.*")
     print("\n🔧 Loading model...")
@@ -128,7 +128,7 @@ def prepare_model():
     # T4-safe dtype: float16
     model = AutoModelForCausalLM.from_pretrained(
         MODEL_NAME,
-        torch_dtype=torch.float16,
+        torch_dtype=torch.bfloat16,
         device_map="auto",
         trust_remote_code=True,
         low_cpu_mem_usage=True
@@ -180,8 +180,8 @@ def train_model(model, tok, dataset, output_dir=str(OUTPUT_DIR), max_steps=100):
         learning_rate=2e-4,
         warmup_ratio=0.03,
         lr_scheduler_type="cosine",
-        bf16=False,
-        fp16=True,
+        bf16=True,
+        fp16=False,
         report_to="none",
     )
 
