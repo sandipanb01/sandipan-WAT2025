@@ -20,24 +20,24 @@ import pandas as pd
 import numpy as np
 
 # ------------------------------ CONFIG
-MODEL_NAME = "google/gemma-3-270m-it"
+MODEL_NAME = "google/gemma-3-4b-it"
 OUTPUT_DIR = Path("./universal_output_best")
 OUTPUT_DIR.mkdir(exist_ok=True, parents=True)
 
-MAX_SEQ_LEN = 1024
+MAX_SEQ_LEN = 382
 BATCH_SIZE = 1
 GRAD_ACCUM = 4
-MAX_TRAIN_STEPS = 100
+MAX_TRAIN_STEPS = 50
 EVAL_BATCH_SIZE = 8
 FULL_DATASET = False
-MAX_COLAB_SAMPLES = 500
+MAX_COLAB_SAMPLES = 50
 
 # ------------------------------ BEAM SWITCH
 BEAM_MODE = "A"  # "A" or "B"
 if BEAM_MODE == "A":
-    BEAM_KWARGS = dict(num_beams=5, early_stopping=True)
+    BEAM_KWARGS = dict(num_beams=3, early_stopping=True)
 else:
-    BEAM_KWARGS = dict(num_beams=8, length_penalty=1.0)
+    BEAM_KWARGS = dict(num_beams=3, length_penalty=1.0)
 
 INDIAN_LANGS = ["hin","ben","tam","tel","mal","kan","mar","guj","urd","pan","ori"]
 LANG_MAP = {
@@ -145,12 +145,12 @@ def detect_lora_modules(model):
 def prepare_model():
     tok = AutoTokenizer.from_pretrained(MODEL_NAME, trust_remote_code=True)
     if tok.pad_token is None: tok.pad_token = tok.eos_token
-    model = AutoModelForCausalLM.from_pretrained(MODEL_NAME, torch_dtype=torch.float32, device_map="auto")
+    model = AutoModelForCausalLM.from_pretrained(MODEL_NAME, torch_dtype=torch.bfloat16, device_map="auto")
     target_modules = detect_lora_modules(model)
     if not target_modules:
         target_modules = ["q_proj","k_proj","gate_proj","v_proj","o_proj","up_proj","down_proj","attn.wq","attn.wk","attn.wv","attn.wo"]
     print(f"⚡ LoRA target modules: {target_modules}")
-    lora_cfg = LoraConfig(r=8, lora_alpha=16, target_modules=target_modules, lora_dropout=0.1, task_type="CAUSAL_LM")
+    lora_cfg = LoraConfig(r=2, lora_alpha=4, target_modules=target_modules, lora_dropout=0.1, task_type="CAUSAL_LM")
     return get_peft_model(model, lora_cfg), tok
 
 # ------------------------------ TRAINING
@@ -161,7 +161,7 @@ def train_model(max_samples=None):
         output_dir=str(OUTPUT_DIR),
         per_device_train_batch_size=BATCH_SIZE,
         gradient_accumulation_steps=GRAD_ACCUM,
-        learning_rate=3e-5,
+        learning_rate=2e-4,
         lr_scheduler_type="cosine",
         num_train_epochs=1,
         max_steps=MAX_TRAIN_STEPS,
@@ -337,7 +337,7 @@ if __name__ == "__main__":
     model, tok, trainer = train_model(max_samples=max_samples)
 
     # 2️⃣ Evaluate
-    bleu, chrf, comet = evaluate_model(model, tok, max_samples_per_split=None if FULL_DATASET else 200, batch_size=EVAL_BATCH_SIZE)
+    bleu, chrf, comet = evaluate_model(model, tok, max_samples_per_split=None if FULL_DATASET else 50, batch_size=EVAL_BATCH_SIZE)
 
     # 3️⃣ Plot training curves
     plot_training(trainer)
