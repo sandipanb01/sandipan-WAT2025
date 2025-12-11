@@ -13,6 +13,8 @@ import torch
 from datasets import load_dataset, get_dataset_split_names
 from torch.utils.data import IterableDataset
 from transformers import AutoTokenizer, AutoModelForCausalLM
+from datasets import Dataset
+from transformers import DataCollatorForSeq2Seq
 from peft import LoraConfig, get_peft_model
 from trl import SFTTrainer, SFTConfig
 import sacrebleu
@@ -184,8 +186,8 @@ def tokenize_and_mask(batch, tokenizer):
     }
 
 # ------------------------------ TRAINING
-def train_model_with_lora(max_samples=None):
-    model, tok = prepare_model_with_lora()
+def train_model(max_samples=None):
+    model, tok = prepare_model()
     examples = stream_examples_list(max_samples=max_samples)
     raw_ds = Dataset.from_list(examples)
     tokenized_ds = raw_ds.map(lambda x: tokenize_and_mask(x, tok), remove_columns=["input_text","target_text","direction"])
