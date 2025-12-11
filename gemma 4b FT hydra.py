@@ -1,10 +1,9 @@
 # ======================================================
-# ✅ Universal Fine-tuning + Evaluation (Hydra-ready)
-# Single-script with full outputs (JSONL, ZIP, metrics, plots, Top-10 preview)
-# Industry-benchmark enhancements: metrics, reproducibility, mixed precision
+# ✅ Universal Fine-tuning + Evaluation (Streaming / Low-Mem / Multi-GPU)
+# Hydra-ready | LoRA | Benchmark Metrics | JSONL + ZIP
 # ======================================================
 
-import os, json, zipfile, math, warnings, gc, random
+import os, json, zipfile, warnings, gc
 from pathlib import Path
 from itertools import islice
 import torch
@@ -13,20 +12,19 @@ from torch.utils.data import IterableDataset
 from transformers import AutoTokenizer, AutoModelForCausalLM
 from peft import LoraConfig, get_peft_model
 from trl import SFTTrainer, SFTConfig
-import sacrebleu
-from rouge_score import rouge_scorer
+import sacrebleu, evaluate
 import matplotlib.pyplot as plt
 import pandas as pd
-import numpy as np
-from tabulate import tabulate
+from tqdm import tqdm
 import hydra
 from omegaconf import DictConfig, OmegaConf
+import torch.distributed as dist
+import wandb
 
 # ======================================================
 # -------------------- CONFIG -------------------------
 # ------------------------------------------------------
 DEFAULT_CONFIG = dict(
-    seed=42,
     model_name="google/gemma-3-4b-it",
     max_seq_len=382,
     max_new_tokens=256,
@@ -38,8 +36,8 @@ DEFAULT_CONFIG = dict(
     max_colab_samples=50,
     beam_mode="A",  # A or B
     target_lang="hin",
-    metrics=["bleu","rouge"],
-    top_k_preview=10
+    use_wandb=False,
+    project_name="translation_benchmark"
 )
 
 # ======================================================
@@ -75,17 +73,17 @@ def extract_answer(full_output, prompt):
     try:
         if prompt in full_output: return full_output.split(prompt, 1)[1].strip()
     except: pass
-    for m in ["Translation:", "Output:", "Answer:", "Translation -", "Translation —"]:
-        if m in full_output: return full_output.split(m,1)[1].strip()
+    markers = ["Translation:", "Output:", "Answer:", "Translation -", "Translation —"]
+    for m in markers:
+        if m in full_output: return full_output.split(m, 1)[1].strip()
     return full_output.strip()
 
 # ======================================================
-# ------------------ DATASET --------------------------
+# ------------------ DATASET (Streaming) --------------
 # ------------------------------------------------------
-def stream_examples(tokenizer=None, max_samples=None):
+def stream_examples(tokenizer=None, max_samples=None, split_type="dev"):
     dataset_name = "ai4bharat/Pralekha"
-    config_name = "train"
-    splits = get_dataset_split_names(dataset_name, config_name)
+    splits = get_dataset_split_names(dataset_name, split_type)
     for split in splits:
         parts = split.split("_")
         if len(parts)!=2: continue
@@ -94,35 +92,25 @@ def stream_examples(tokenizer=None, max_samples=None):
         lang = tl if sl=="eng" else sl
         if lang not in INDIAN_LANGS: continue
 
-        ds = load_dataset(dataset_name, split=split, streaming=True, name=config_name)
+        ds = load_dataset(dataset_name, split=split, streaming=True, name=split_type)
         one_shot = ("","")
         for row in islice(ds,50):
-            s,t = row.get("src_txt",""), row.get("tgt_txt","")
+            s=row.get("src_txt",""); t=row.get("tgt_txt","")
             if len(s.split())>5 and len(t.split())>5: one_shot=(s,t); break
 
-        ds = load_dataset(dataset_name, split=split, streaming=True, name=config_name)
+        ds = load_dataset(dataset_name, split=split, streaming=True, name=split_type)
         count=0
         for row in ds:
             if max_samples and count>=max_samples: break
-            s,t = row.get("src_txt",""), row.get("tgt_txt","")
+            s=row.get("src_txt",""); t=row.get("tgt_txt","")
             if not s or not t: continue
             eng, indic = (s,t) if sl=="eng" else (t,s)
             use_example = one_shot if (one_shot[0] and one_shot[1] and "dev" not in split) else None
             for s_txt, t_txt, dirn in [(eng,indic,f"eng_{lang}"),(indic,eng,f"{lang}_eng")]:
                 prompt = build_prompt(s_txt, dirn.split("_")[0], dirn.split("_")[1], use_example, tokenizer)
-                if not prompt or not prompt.strip(): continue
+                if not prompt.strip(): continue
                 yield {"input_text": prompt, "target_text": t_txt, "direction": dirn}
             count+=1
-
-class PralekhaDataset(IterableDataset):
-    def __init__(self, tokenizer, max_samples=None, max_seq_len=382):
-        self.max_samples=max_samples; self.tok=tokenizer; self.max_seq_len=max_seq_len
-    def __iter__(self):
-        for ex in stream_examples(self.tok, self.max_samples):
-            enc=self.tok(ex["input_text"], truncation=True, max_length=self.max_seq_len)
-            if not enc.get("input_ids"): continue
-            enc["labels"]=self.tok(ex["target_text"], truncation=True, max_length=self.max_seq_len)["input_ids"]
-            yield enc
 
 # ======================================================
 # ------------------ MODEL PREP -----------------------
@@ -137,7 +125,7 @@ def detect_lora_modules(model):
 
 def prepare_model(cfg):
     tok = AutoTokenizer.from_pretrained(cfg.model_name, trust_remote_code=True)
-    if tok.pad_token is None: tok.pad_token=tok.eos_token
+    if tok.pad_token is None: tok.pad_token = tok.eos_token
     model = AutoModelForCausalLM.from_pretrained(cfg.model_name, torch_dtype=torch.bfloat16, device_map="auto")
     try: model.gradient_checkpointing_enable()
     except: pass
@@ -152,8 +140,8 @@ def prepare_model(cfg):
 # ------------------ TRAINING -------------------------
 # ------------------------------------------------------
 def train_model(cfg):
-    model,tok = prepare_model(cfg)
-    ds = PralekhaDataset(tok, max_samples=cfg.max_colab_samples if not cfg.full_dataset else None, max_seq_len=cfg.max_seq_len)
+    model, tok = prepare_model(cfg)
+    ds = IterableDataset.from_iterable(stream_examples(tok, max_samples=cfg.max_colab_samples, split_type="train"))
     sft_cfg = SFTConfig(
         output_dir=".",
         per_device_train_batch_size=cfg.batch_size,
@@ -164,137 +152,83 @@ def train_model(cfg):
         max_steps=cfg.max_train_steps,
         logging_steps=10,
         save_strategy="no",
-        report_to="none",
+        report_to="wandb" if cfg.use_wandb else "none",
         warmup_ratio=0.1,
         gradient_checkpointing=True
     )
-    trainer=SFTTrainer(model=model,args=sft_cfg,train_dataset=ds,tokenizer=tok)
+    trainer = SFTTrainer(model=model, args=sft_cfg, train_dataset=ds, tokenizer=tok)
     trainer.train()
-    return model,tok,trainer
+    return model, tok, trainer
 
 # ======================================================
-# ------------------ BATCH PROCESS --------------------
+# ------------------ LOW-MEM BATCH EVAL ----------------
 # ------------------------------------------------------
-def process_batch(model,tok,batch_prompts,batch_refs,batch_dirs,batch_inputs,batch_rawlens,preds,refs,inputs,device,max_new_tokens,beam_kwargs):
-    enc = tok(batch_prompts, return_tensors="pt", padding=True, truncation=True, max_length=max(batch_rawlens)+max_new_tokens)
-    if "input_ids" not in enc or enc["input_ids"].size(0)==0: return
-    for k in enc: enc[k]=enc[k].to(device)
-    with torch.no_grad():
-        out_ids = model.generate(**enc, max_new_tokens=max_new_tokens, pad_token_id=tok.pad_token_id, eos_token_id=tok.eos_token_id, **beam_kwargs)
-    out_ids = out_ids.cpu().tolist()
-    for i in range(len(batch_prompts)):
-        prompt_len=batch_rawlens[i]
-        gen = out_ids[i][prompt_len:] if len(out_ids[i])>prompt_len else []
-        decoded=tok.decode(gen, skip_special_tokens=True, clean_up_tokenization_spaces=True).strip()
-        dirn=batch_dirs[i]
-        preds[dirn].append(decoded)
-        refs[dirn].append(batch_refs[i])
-        inputs[dirn].append(batch_inputs[i])
-
-# ======================================================
-# ------------------ EVALUATION + ZIP -----------------
-# ------------------------------------------------------
-def evaluate_model(model,tok,cfg):
-    device="cuda" if torch.cuda.is_available() else "cpu"
+def lowmem_eval(model, tok, cfg):
+    device = "cuda" if torch.cuda.is_available() else "cpu"
     model.eval()
-    preds,refs,inputs={}, {}, {}
-    target_lang=cfg.target_lang
-    for d in [f"eng_{target_lang}", f"{target_lang}_eng"]: preds[d], refs[d], inputs[d]=[],[],[]
+    preds, refs, inputs = {}, {}, {}
+    target_lang = cfg.target_lang
+    for d in [f"eng_{target_lang}", f"{target_lang}_eng"]: preds[d], refs[d], inputs[d] = [], [], []
 
-    splits = get_dataset_split_names("ai4bharat/Pralekha","dev")
-    beam_kwargs = dict(num_beams=3, early_stopping=True) if cfg.beam_mode=="A" else dict(num_beams=3,length_penalty=1.0)
-    print("🔍 Starting evaluation (ENG<->INDIC)...")
+    # Streaming evaluation
+    beam_kwargs = dict(num_beams=3, early_stopping=True) if cfg.beam_mode=="A" else dict(num_beams=3, length_penalty=1.0)
+    rouge = evaluate.load("rouge")
+    chrf = evaluate.load("chrf")
+    bertscore = evaluate.load("bertscore")
 
-    for split in splits:
-        sl, tl = split.split("_")
-        if not ((sl=="eng" and tl==target_lang) or (sl==target_lang and tl=="eng")): continue
-        ds = load_dataset("ai4bharat/Pralekha", split=split, streaming=True, name="dev")
-        batch_prompts,batch_refs,batch_dirs,batch_inputs,batch_rawlens=[],[],[],[],[]
-        for row in ds:
-            if not row.get("src_txt") or not row.get("tgt_txt"): continue
-            eng, indic = (row["src_txt"],row["tgt_txt"]) if sl=="eng" else (row["tgt_txt"],row["src_txt"])
-            p1,p2 = eval_prompt(eng,"eng",target_lang), eval_prompt(indic,target_lang,"eng")
-            for prompt,ref,dirn,inp in [(p1,indic.strip(),f"eng_{target_lang}",eng.strip()),(p2,eng.strip(),f"{target_lang}_eng",indic.strip())]:
-                if not prompt.strip(): continue
-                batch_prompts.append(prompt); batch_refs.append(ref); batch_dirs.append(dirn)
-                batch_inputs.append(inp); batch_rawlens.append(len(tok(prompt, add_special_tokens=False)["input_ids"]))
-            if len(batch_prompts)>=cfg.eval_batch_size:
-                process_batch(model,tok,batch_prompts,batch_refs,batch_dirs,batch_inputs,batch_rawlens,preds,refs,inputs,device,cfg.max_new_tokens,beam_kwargs)
-                batch_prompts,batch_refs,batch_dirs,batch_inputs,batch_rawlens=[],[],[],[],[]
-        if batch_prompts:
-            process_batch(model,tok,batch_prompts,batch_refs,batch_dirs,batch_inputs,batch_rawlens,preds,refs,inputs,device,cfg.max_new_tokens,beam_kwargs)
+    batch_prompts, batch_refs, batch_dirs, batch_inputs, batch_rawlens = [], [], [], [], []
 
-    # --- Save JSON + Metrics
+    for ex in stream_examples(tok, max_samples=None, split_type="dev"):
+        batch_prompts.append(ex["input_text"])
+        batch_refs.append(ex["target_text"])
+        batch_dirs.append(ex["direction"])
+        batch_inputs.append(ex["input_text"])
+        batch_rawlens.append(len(tok(ex["input_text"], add_special_tokens=False)["input_ids"]))
+        if len(batch_prompts) >= cfg.eval_batch_size:
+            process_batch(model, tok, batch_prompts, batch_refs, batch_dirs, batch_inputs, batch_rawlens, preds, refs, inputs, device, cfg.max_new_tokens, beam_kwargs)
+            batch_prompts, batch_refs, batch_dirs, batch_inputs, batch_rawlens = [], [], [], [], []
+    if batch_prompts:
+        process_batch(model, tok, batch_prompts, batch_refs, batch_dirs, batch_inputs, batch_rawlens, preds, refs, inputs, device, cfg.max_new_tokens, beam_kwargs)
+
+    # Metrics
     out_dir = Path("outputs"); out_dir.mkdir(exist_ok=True, parents=True)
-    metrics={}
+    metrics = {}
     for d in preds:
         json_file = out_dir/f"{d}_pred_ref.jsonl"
         with open(json_file,"w",encoding="utf-8") as f:
             for inp,p,r in zip(inputs[d],preds[d],refs[d]):
                 f.write(json.dumps({"input_text":inp,"pred":p,"ref":r},ensure_ascii=False)+"\n")
-        if "bleu" in cfg.metrics:
-            try: metrics[f"{d}_bleu"]=sacrebleu.corpus_bleu(preds[d],[refs[d]]).score
-            except: metrics[f"{d}_bleu"]=0.0
-        if "rouge" in cfg.metrics:
-            scorer=rouge_scorer.RougeScorer(["rouge1","rouge2","rougeL"], use_stemmer=True)
-            scores=[scorer.score(r,p) for r,p in zip(refs[d],preds[d])]
-            metrics[f"{d}_rouge1"]=np.mean([s["rouge1"].fmeasure for s in scores])
-            metrics[f"{d}_rouge2"]=np.mean([s["rouge2"].fmeasure for s in scores])
-            metrics[f"{d}_rougeL"]=np.mean([s["rougeL"].fmeasure for s in scores])
-
-    # --- Top-K preview table
-    print("\n📌 Top-10 predictions preview per direction:")
-    for d in preds:
-        table=[]
-        k=min(cfg.top_k_preview,len(preds[d]))
-        for i in range(k):
-            table.append([inputs[d][i], preds[d][i], refs[d][i]])
-        print(f"\nDirection: {d}")
-        print(tabulate(table, headers=["Input","Prediction","Reference"], tablefmt="grid"))
-
-    # --- Save ZIP
-    zip_path = out_dir/"outputs.zip"
-    with zipfile.ZipFile(zip_path,"w",zipfile.ZIP_DEFLATED) as zipf:
-        for file in out_dir.glob("*"):
-            if file.is_file() and file.name!="outputs.zip":
-                zipf.write(file, file.name)
-    print(f"\n✅ Saved predictions, metrics, plots, and ZIP at {zip_path}")
+        try:
+            metrics[d] = {
+                "BLEU": sacrebleu.corpus_bleu(preds[d],[refs[d]]).score,
+                "ROUGE": rouge.compute(predictions=preds[d], references=refs[d])["rouge1"],
+                "chrF": chrf.compute(predictions=preds[d], references=refs[d])["score"],
+                "BERTScore": bertscore.compute(predictions=preds[d], references=refs[d], lang="en")["f1"]
+            }
+        except: metrics[d] = {"BLEU":0.0,"ROUGE":0.0,"chrF":0.0,"BERTScore":0.0}
 
     with open(out_dir/"metrics.json","w",encoding="utf-8") as f: json.dump(metrics,f,ensure_ascii=False,indent=2)
+
+    # ZIP
+    zip_path = out_dir/"benchmark_outputs.zip"
+    with zipfile.ZipFile(zip_path,"w") as zipf:
+        for f in out_dir.glob("*"):
+            zipf.write(f, arcname=f.name)
+    print(f"✅ Outputs and metrics saved in {zip_path}")
     return metrics
 
 # ======================================================
-# ------------------ TRAINING PLOTS -------------------
-# ------------------------------------------------------
-def plot_training(trainer,cfg):
-    logs=trainer.state.log_history
-    df=pd.DataFrame(logs)
-    out_dir=Path("outputs/plots"); out_dir.mkdir(parents=True,exist_ok=True)
-    if "loss" in df.columns:
-        df["loss_smooth"]=df["loss"].rolling(window=10,min_periods=1).mean()
-        plt.figure(figsize=(8,4))
-        plt.plot(df["step"],df["loss"],alpha=0.5,color="gray")
-        plt.plot(df["step"],df["loss_smooth"],color="blue",linewidth=2)
-        plt.xlabel("Step"); plt.ylabel("Loss"); plt.title("Loss over Steps")
-        plt.tight_layout(); plt.savefig(out_dir/"loss_smooth.png"); plt.close()
-
-# ======================================================
-# ------------------ MAIN (Hydra) --------------------
+# ------------------ MAIN -----------------------------
 # ------------------------------------------------------
 @hydra.main(config_path=None, config_name=None)
 def main(cfg: DictConfig):
     cfg = OmegaConf.merge(DEFAULT_CONFIG, cfg)
-    # --- Reproducibility
-    seed = cfg.get("seed",42)
-    random.seed(seed); np.random.seed(seed); torch.manual_seed(seed)
-    if torch.cuda.is_available(): torch.cuda.manual_seed_all(seed)
     print(OmegaConf.to_yaml(cfg))
-
-    model,tok,trainer=train_model(cfg)
-    metrics=evaluate_model(model,tok,cfg)
-    plot_training(trainer,cfg)
-    print("\n✅ Done. Outputs in ./outputs")
-    print(tabulate([[k,v] for k,v in metrics.items()], headers=["Metric","Score"]))
+    if cfg.use_wandb: wandb.init(project=cfg.project_name, config=cfg)
+    model, tok, trainer = train_model(cfg)
+    metrics = lowmem_eval(model, tok, cfg)
+    if cfg.use_wandb: wandb.log(metrics); wandb.finish()
+    print("\n✅ Done. Metrics:", metrics)
 
 if __name__=="__main__":
     main()
