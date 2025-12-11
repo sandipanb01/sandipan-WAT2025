@@ -153,10 +153,7 @@ def prepare_model():
         device_map="auto"
     )
 
-    # Explicitly move to CUDA after loading
-    model = model.to("cuda")
-    torch.cuda.empty_cache() # Clear any residual cache
-
+ 
     try: model.gradient_checkpointing_enable()
     except: pass
 
