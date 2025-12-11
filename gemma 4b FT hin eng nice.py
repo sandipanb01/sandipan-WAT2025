@@ -150,8 +150,7 @@ def prepare_model():
     model = AutoModelForCausalLM.from_pretrained(
         MODEL_NAME,
         torch_dtype=torch.bfloat16,  # Specify dtype here
-        low_cpu_mem_usage=True,
-        device_map=None
+        device_map="auto"
     )
 
     # Explicitly move to CUDA after loading
@@ -397,14 +396,14 @@ if __name__ == "__main__":
     plot_training(trainer)
 
     # 4️⃣ Final summary
-    print("\n✅ Training complete!") # Replaced logger.info
-    print(f"📁 All outputs saved to: {OUTPUT_DIR}") # Replaced logger.info
-    print(f"   - Model weights") # Replaced logger.info
-    print(f"   - eng_hin_pred_ref.jsonl") # Replaced logger.info
-    print(f"   - hin_eng_pred_ref.jsonl") # Replaced logger.info
-    print(f"   - submission.zip") # Replaced logger.info
-    print(f"   - training_loss_smooth.png") # Replaced logger.info
-    print(f"   - learning_rate_trend.png") # Replaced logger.info
-    print(f"   - epoch_loss_trend.png") # Replaced logger.info
-    print(f"   - loss_derivative_curve.png") # Replaced logger.info
-    print(f"   - metric_plots/ (BLEU, chrF, COMET)") # Replaced logger.info
+    print("\n✅ Training complete!") 
+    print(f"📁 All outputs saved to: {OUTPUT_DIR}") 
+    print(f"   - Model weights") 
+    print(f"   - eng_hin_pred_ref.jsonl") 
+    print(f"   - hin_eng_pred_ref.jsonl") 
+    print(f"   - submission.zip") 
+    print(f"   - training_loss_smooth.png") 
+    print(f"   - learning_rate_trend.png") 
+    print(f"   - epoch_loss_trend.png") 
+    print(f"   - loss_derivative_curve.png") 
+    print(f"   - metric_plots/ (BLEU, chrF, COMET)") 
