@@ -278,7 +278,7 @@ def evaluate_model(model, tok, max_new_tokens=MAX_NEW_TOKENS,
                     preds, refs, inputs, device
                 )
                 batch_prompts, batch_refs, batch_dirs = [], [], []
-                batch_inputs, batch_rawlens = [], [], []
+                batch_inputs, batch_rawlens = [], []
 
         # leftover
         if batch_prompts:
