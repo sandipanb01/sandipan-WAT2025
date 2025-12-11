@@ -97,7 +97,7 @@ def detect_lora_modules(model):
             modules.append(n.split(".")[-1])
     return list(set(modules))
 
-def prepare_model_with_lora():
+def prepare_model():
     tok = AutoTokenizer.from_pretrained(MODEL_NAME, trust_remote_code=True)
     if tok.pad_token is None:
         tok.pad_token = tok.eos_token
@@ -221,6 +221,7 @@ def train_model(max_samples=None):
     model.save_pretrained(OUTPUT_DIR)
     tok.save_pretrained(OUTPUT_DIR)
     return model, tok, trainer
+    
 # ------------------------------ EVALUATION (fully safe, with top-10 previews)
 def evaluate_model(model, tok, max_new_tokens=MAX_NEW_TOKENS,
                    max_samples_per_split=None, batch_size=EVAL_BATCH_SIZE):
@@ -397,7 +398,6 @@ def evaluate_model(model, tok, max_new_tokens=MAX_NEW_TOKENS,
     return bleu_scores, chrf_scores, comet_scores
 
 
-# --- helper to process a batch safely
 # --- helper to process a batch safely (robust replacement)
 def process_batch(model, tok, batch_prompts, batch_refs, batch_dirs, batch_inputs, batch_rawlens, preds, refs, inputs, device):
 
