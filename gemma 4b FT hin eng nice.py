@@ -60,7 +60,7 @@ def build_prompt(src, src_lang, tgt_lang, example=None, tokenizer=None):
             msgs.append({"role":"assistant","content":ex_tgt})
         msgs.append({"role":"user","content":f"Translate this {LANG_MAP[src_lang]} text to {LANG_MAP[tgt_lang]}:\n{src}"})
         return tokenizer.apply_chat_template(msgs, add_generation_prompt=True, tokenize=False)
-    
+
     if ex_src and ex_tgt:
         return f"Example translation ({LANG_MAP[src_lang]} → {LANG_MAP[tgt_lang]}):\n{ex_src} → {ex_tgt}\n\nTranslate this {LANG_MAP[src_lang]} text to {LANG_MAP[tgt_lang]}:\n{src}"
     else:
@@ -146,11 +146,17 @@ def prepare_model():
     if tok.pad_token is None:
         tok.pad_token = tok.eos_token
 
-    # ⚡ Safe loading 
-    with init_empty_weights():
-        model = AutoModelForCausalLM.from_pretrained(MODEL_NAME)
+    # ⚡ Load model with specified dtype and low_cpu_mem_usage
+    model = AutoModelForCausalLM.from_pretrained(
+        MODEL_NAME,
+        torch_dtype=torch.bfloat16,  # Specify dtype here
+        low_cpu_mem_usage=True,
+        device_map=None
+    )
 
-    model = model.to_empty(device='cuda', dtype=torch.bfloat16)
+    # Explicitly move to CUDA after loading
+    model = model.to("cuda")
+    torch.cuda.empty_cache() # Clear any residual cache
 
     try: model.gradient_checkpointing_enable()
     except: pass
@@ -167,7 +173,7 @@ def prepare_model():
         lora_dropout=0.1, task_type="CAUSAL_LM"
     )
 
-    model = get_peft_model(model, lora_cfg)  # ✅ LoRA safely wrapped on GPU
+    model = get_peft_model(model, lora_cfg)
     return model, tok
 
 # ------------------------------ TRAINING
@@ -206,7 +212,7 @@ def evaluate_model(model, tok, max_new_tokens=MAX_NEW_TOKENS, max_samples_per_sp
         preds[d], refs[d], inputs[d] = [], [], []
 
     splits = get_dataset_split_names("ai4bharat/Pralekha","dev")
-    logger.info("🔍 Starting batched evaluation (ENG<->HIN only)...")
+    print("🔍 Starting batched evaluation (ENG<->HIN only)...") # Replaced logger.info
 
     for split in tqdm(splits):
         parts = split.split("_")
@@ -249,7 +255,7 @@ def evaluate_model(model, tok, max_new_tokens=MAX_NEW_TOKENS, max_samples_per_sp
         with open(out_file,"w",encoding="utf-8") as f:
             for inp, p, r in zip(inputs[d], preds[d], refs[d]):
                 f.write(json.dumps({"input_text": inp, "pred": p, "ref": r}, ensure_ascii=False)+"\n")
-        logger.info(f"✅ JSONL saved: {out_file}")
+        print(f"✅ JSONL saved: {out_file}") # Replaced logger.info
 
     sub_zip = OUTPUT_DIR / "submission.zip"
     with zipfile.ZipFile(sub_zip,"w") as zf:
@@ -262,7 +268,7 @@ def evaluate_model(model, tok, max_new_tokens=MAX_NEW_TOKENS, max_samples_per_sp
                 with open(fp,"w",encoding="utf-8") as f:
                     for p in chunk: f.write(json.dumps([p],ensure_ascii=False)+"\n")
                 zf.write(fp, fp.name)
-    logger.info(f"✅ Submission ZIP saved: {sub_zip}")
+    print(f"✅ Submission ZIP saved: {sub_zip}") # Replaced logger.info
 
     # --- Top-10 preview tables
     for d in preds:
@@ -311,7 +317,7 @@ def evaluate_model(model, tok, max_new_tokens=MAX_NEW_TOKENS, max_samples_per_sp
     plot_metric("BLEU", bleu_scores)
     plot_metric("chrF", chrf_scores)
     plot_metric("COMET", comet_scores)
-    logger.info("📈 Metrics plots saved.")
+    print("📈 Metrics plots saved.") # Replaced logger.info
     return bleu_scores, chrf_scores, comet_scores
 
 
@@ -391,14 +397,14 @@ if __name__ == "__main__":
     plot_training(trainer)
 
     # 4️⃣ Final summary
-    logger.info("\n✅ Training complete!")
-    logger.info(f"📁 All outputs saved to: {OUTPUT_DIR}")
-    logger.info(f"   - Model weights")
-    logger.info(f"   - eng_hin_pred_ref.jsonl")
-    logger.info(f"   - hin_eng_pred_ref.jsonl")
-    logger.info(f"   - submission.zip")
-    logger.info(f"   - training_loss_smooth.png")
-    logger.info(f"   - learning_rate_trend.png")
-    logger.info(f"   - epoch_loss_trend.png")
-    logger.info(f"   - loss_derivative_curve.png")
-    logger.info(f"   - metric_plots/ (BLEU, chrF, COMET)")
+    print("\n✅ Training complete!") # Replaced logger.info
+    print(f"📁 All outputs saved to: {OUTPUT_DIR}") # Replaced logger.info
+    print(f"   - Model weights") # Replaced logger.info
+    print(f"   - eng_hin_pred_ref.jsonl") # Replaced logger.info
+    print(f"   - hin_eng_pred_ref.jsonl") # Replaced logger.info
+    print(f"   - submission.zip") # Replaced logger.info
+    print(f"   - training_loss_smooth.png") # Replaced logger.info
+    print(f"   - learning_rate_trend.png") # Replaced logger.info
+    print(f"   - epoch_loss_trend.png") # Replaced logger.info
+    print(f"   - loss_derivative_curve.png") # Replaced logger.info
+    print(f"   - metric_plots/ (BLEU, chrF, COMET)") # Replaced logger.info
