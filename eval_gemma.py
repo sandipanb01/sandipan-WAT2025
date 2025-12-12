@@ -1,42 +1,24 @@
 # ------------------------------ EVALUATION HELPERS
-def extract_langs_from_split(split):
-    parts = split.split("_")
-    return parts[0], parts[1]
+def build_eval_prompt_tokenized(example, tokenizer, src_lang, tgt_lang):
+    """Tokenized chat prompt exactly like training"""
+    user_prompt = f"Translate this {src_lang} text to {tgt_lang}:\n{example['src_txt']}"
+    messages = {"messages":[{"role":"user","content":user_prompt}]}
+    tokenized = apply_chat_template(messages, tokenizer=tokenizer, tokenize=True)
+    return tokenized["input_ids"]
 
-def build_eval_prompt(example, tokenizer):
-    prompt = (
-        f"Translate this {example['src_lang']} text to "
-        f"{example['tgt_lang']}:\n{example['src_txt']}"
-    )
-    messages = {"messages": [{"role": "user", "content": prompt}]}
-    return apply_chat_template(messages, tokenizer=tokenizer)
-
-def generate_batch(model, tok, prompts, batch_size):
-    enc = tok(
-        prompts,
-        return_tensors="pt",
-        padding=True,
-        truncation=True,
-        max_length=MAX_SEQ_LEN
-    ).to(model.device)
-
+def generate_batch(model, input_ids_list, tokenizer):
+    """Generate outputs handling variable-length prompts"""
+    enc = torch.nn.utils.rnn.pad_sequence(input_ids_list, batch_first=True, padding_value=tokenizer.pad_token_id).to(model.device)
     with torch.no_grad():
-        out = model.generate(
-            **enc,
-            max_new_tokens=MAX_NEW_TOKENS,
-            do_sample=False,   # greedy decode
-        )
+        out = model.generate(enc, max_new_tokens=MAX_NEW_TOKENS, do_sample=False)
 
     outputs = []
-    prompt_len = enc["input_ids"].shape[1]
-
-    for i in range(len(prompts)):
+    for i, ids in enumerate(input_ids_list):
+        prompt_len = ids.shape[0]
         gen_ids = out[i][prompt_len:]
-        text = tok.decode(gen_ids, skip_special_tokens=True).strip()
+        text = tokenizer.decode(gen_ids, skip_special_tokens=True).strip()
         outputs.append(text)
-
     return outputs
-
 # ------------------------------ EVALUATION
 def evaluate_model(
     model,
