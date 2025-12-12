@@ -1,136 +1,144 @@
-# ------------------------------ EVALUATION HELPERS
+# ---------------------------------------------------------
+# FIXED: Chat-style tokenized prompt for evaluation
+# ---------------------------------------------------------
 def build_eval_prompt_tokenized(example, tokenizer, src_lang, tgt_lang):
-    """Tokenized chat prompt exactly like training"""
+    """Create tokenized chat prompt exactly like training."""
     user_prompt = f"Translate this {src_lang} text to {tgt_lang}:\n{example['src_txt']}"
-    messages = {"messages":[{"role":"user","content":user_prompt}]}
-    tokenized = apply_chat_template(messages, tokenizer=tokenizer, tokenize=True)
-    return tokenized["input_ids"]
 
-def generate_batch(model, input_ids_list, tokenizer):
-    """Generate outputs handling variable-length prompts"""
-    enc = torch.nn.utils.rnn.pad_sequence(input_ids_list, batch_first=True, padding_value=tokenizer.pad_token_id).to(model.device)
+    messages = [
+        {"role": "user", "content": user_prompt}
+    ]
+
+    input_ids = tokenizer.apply_chat_template(
+        messages,
+        tokenize=True,
+        add_generation_prompt=True
+    )
+    return input_ids
+
+
+# ---------------------------------------------------------
+# FIXED: Generate with variable-length slicing
+# ---------------------------------------------------------
+def generate_batch(model, tokenizer, batch_input_ids, max_new_tokens=256):
+    enc = torch.nn.utils.rnn.pad_sequence(
+        [torch.tensor(x) for x in batch_input_ids],
+        batch_first=True,
+        padding_value=tokenizer.pad_token_id,
+    ).to(model.device)
+
     with torch.no_grad():
-        out = model.generate(enc, max_new_tokens=MAX_NEW_TOKENS, do_sample=False)
+        out = model.generate(
+            enc,
+            max_new_tokens=max_new_tokens,
+            do_sample=False
+        )
 
-    outputs = []
-    for i, ids in enumerate(input_ids_list):
-        prompt_len = ids.shape[0]
+    results = []
+    for i, ids in enumerate(batch_input_ids):
+        prompt_len = len(ids)
         gen_ids = out[i][prompt_len:]
         text = tokenizer.decode(gen_ids, skip_special_tokens=True).strip()
-        outputs.append(text)
-    return outputs
-# ------------------------------ EVALUATION
-def evaluate_model(
-    model,
-    tok,
-    max_samples=200,
-    batch_size=8,
-    save_json=True,
-    save_zip=True
-):
-    dataset_name = "ai4bharat/Pralekha"
-    config_name = "train"
+        results.append(text)
+    return results
 
-    splits = get_dataset_split_names(dataset_name, config_name)
-    split = splits[0]
-    src_lang, tgt_lang = extract_langs_from_split(split)
 
-    ds = load_dataset(dataset_name, split=split, streaming=True, name=config_name)
+# ---------------------------------------------------------
+# FIXED: Single-split loader (ALWAYS load eng_hin)
+# ---------------------------------------------------------
+def load_pralekha_split(lang1, lang2):
+    """
+    Pralekha ONLY has eng_XXX splits.
+    - eng→hin  -> load split="eng_hin"
+    - hin→eng  -> still load split="eng_hin" but reverse fields
+    """
+    # Always use eng_hin split for English-Hindi
+    split = "eng_hin"
+    print(f"Dataset load info: split='{split}'")
+    return load_dataset("ai4bharat/Pralekha", name="train", split=split, streaming=True)
+
+
+# ---------------------------------------------------------
+# FIXED: Correct evaluation for both eng→hin and hin→eng
+# ---------------------------------------------------------
+def evaluate_direction(model, tokenizer, src_lang, tgt_lang, max_samples=150, batch_size=8):
+    ds = load_pralekha_split(src_lang, tgt_lang)
+    ds_iter = iter(ds)
 
     preds, refs, srcs = [], [], []
-
-    print("\n==============================")
-    print(f"🔍 Evaluating: {src_lang} → {tgt_lang}")
-    print("==============================\n")
-
-    iterator = iter(ds)
     processed = 0
-    pbar = tqdm(total=max_samples, desc="Evaluating")
+
+    pbar = tqdm(total=max_samples, desc=f"Evaluating {src_lang}→{tgt_lang}")
 
     while processed < max_samples:
-        batch_examples = []
+        batch_src = []
+        batch_refs = []
+        batch_ids = []
 
         for _ in range(batch_size):
             try:
-                batch_examples.append(next(iterator))
+                ex = next(ds_iter)
             except StopIteration:
                 break
 
-        if not batch_examples:
+            # ---------------------------------------------------
+            # FIXED: reverse fields for hin→eng
+            # ---------------------------------------------------
+            if src_lang == "eng" and tgt_lang == "hin":
+                src_text = ex["src_txt"]
+                ref_text = ex["tgt_txt"]
+            else:
+                src_text = ex["tgt_txt"]
+                ref_text = ex["src_txt"]
+
+            fake_ex = {"src_txt": src_text}
+            ids = build_eval_prompt_tokenized(fake_ex, tokenizer, src_lang, tgt_lang)
+
+            batch_src.append(src_text)
+            batch_refs.append(ref_text)
+            batch_ids.append(ids)
+
+        if not batch_ids:
             break
 
-        processed += len(batch_examples)
-        pbar.update(len(batch_examples))
+        outs = generate_batch(model, tokenizer, batch_ids)
 
-        prompts = [build_eval_prompt(ex, tok) for ex in batch_examples]
-        outs = generate_batch(model, tok, prompts, batch_size)
+        preds.extend(outs)
+        refs.extend([r.strip() for r in batch_refs])
+        srcs.extend([s.strip() for s in batch_src])
 
-        for ex, pred in zip(batch_examples, outs):
-            preds.append(pred)
-            refs.append(ex["tgt_txt"].strip())
-            srcs.append(ex["src_txt"].strip())
+        processed += len(batch_ids)
+        pbar.update(len(batch_ids))
 
     pbar.close()
-    print(f"\nDone! Total evaluated = {len(preds)}")
+    print(f"Done: {processed} samples for {src_lang}→{tgt_lang}")
 
-    # ---------- BLEU & CHRF ----------
+    # Compute BLEU and chrF
     bleu = sacrebleu.corpus_bleu(preds, [refs]).score
-    chrf = sacrebleu.corpus_chrf(preds, [refs]).score
+    chrf_metric = sacrebleu.metrics.CHRF(word_order=0)
+    chrf = chrf_metric.corpus_score(preds, [refs]).score
 
-    print(f"\n🌟 BLEU:   {bleu:.2f}")
-    print(f"🌟 chrF++: {chrf:.3f}")
-
-    # ---------- JSONL ----------
-    jsonl_path = OUTPUT_DIR / "eval_predictions.jsonl"
-    if save_json:
-        with open(jsonl_path, "w", encoding="utf-8") as f:
-            for p, r, s in zip(preds, refs, srcs):
-                f.write(json.dumps(
-                    {"pred": p, "ref": r, "src": s},
-                    ensure_ascii=False
-                ) + "\n")
-        print(f"📄 Saved predictions → {jsonl_path}")
-
-    # ---------- TOP-10 TABLE ----------
-    scores = [
-        sacrebleu.sentence_chrf(p, [r]).score
-        for p, r in zip(preds, refs)
-    ]
-
-    rank = list(enumerate(scores))
-    rank.sort(key=lambda x: -x[1])
-    top10 = rank[:10]
-
-    print("\n================ TOP-10 (chrF) ================")
-    print(f"{'Rank':<6}{'Score':<8}{'Prediction'}")
-    print("-----------------------------------------------")
-
-    for i, (idx, sc) in enumerate(top10, 1):
-        preview = preds[idx][:120].replace("\n", " ")
-        print(f"{i:<6}{sc:<8.2f}{preview}")
-
-    # ---------- ZIP BUNDLE ----------
-    if save_zip:
-        zip_path = OUTPUT_DIR / "eval_bundle.zip"
-        with zipfile.ZipFile(zip_path, "w") as z:
-            if save_json:
-                z.write(jsonl_path, arcname="eval_predictions.jsonl")
-        print(f"\n📦 Saved ZIP bundle → {zip_path}")
-
+    print(f"BLEU = {bleu:.2f}   chrF = {chrf:.3f}\n")
     return bleu, chrf
 
-# ------------------------------ MAIN
+
+# ---------------------------------------------------------
+# MAIN LOOP FOR BOTH DIRECTIONS
+# ---------------------------------------------------------
 if __name__ == "__main__":
     os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
-    max_samples = None if FULL_DATASET else MAX_COLAB_SAMPLES
 
     # 1️⃣ Train
-    model, tok, trainer = train_model(max_samples=max_samples)
+    max_samples = None if FULL_DATASET else MAX_COLAB_SAMPLES
+    model, tokenizer, trainer = train_model(max_samples=max_samples)
 
-    # 2️⃣ Full Evaluation
-    bleu, chrf = evaluate_model(
-        model,
-        tok,
-        max_samples=150,
-        batch_size=EVAL_BATCH_SIZE,
-    )
+    # 2️⃣ Evaluate ENG↔HIN
+    results = {}
+    for split in DIRECTIONS:
+        src, tgt = split.split("_")
+        bleu, chrf = evaluate_direction(model, tokenizer, src, tgt)
+        results[split] = {"BLEU": bleu, "chrF": chrf}
+
+    print("\n✅ Final Results (ENG↔HIN):")
+    for split, scores in results.items():
+        print(f"{split}: BLEU={scores['BLEU']:.2f}, chrF={scores['chrF']:.3f}")
