@@ -6,12 +6,14 @@
 # Safe tokenization filters applied to avoid empty prompts
 # ======================================================
 
-import os
+import os, json, zipfile, torch, random
 from pathlib import Path
-import torch
 from datasets import load_dataset, get_dataset_split_names
 from transformers import AutoTokenizer, AutoModelForCausalLM
-from trl import SFTTrainer, SFTConfig
+from peft import LoraConfig
+from trl import SFTTrainer, SFTConfig, apply_chat_template
+from tqdm import tqdm
+import sacrebleu
 from trl import apply_chat_template
 
 
@@ -124,12 +126,4 @@ def train_model(max_samples=None):
     # tok.save_pretrained(OUTPUT_DIR)
     return model, tok, trainer
     
-# ------------------------------ MAIN
-if __name__ == "__main__":
-    os.environ["CUDA_LAUNCH_BLOCKING"]="1"
-    max_samples = None if FULL_DATASET else MAX_COLAB_SAMPLES
 
-    # 1️⃣ Train
-    model, tok, trainer = train_model(max_samples=max_samples)
-
-    
