@@ -42,7 +42,9 @@ LANG_MAP = {
     "guj":"Gujarati","urd":"Urdu","pan":"Punjabi","ori":"Odia"
 }
 
+DIRECTIONS = ["eng_hin", "hin_eng"]  # dual-direction evaluation
 
+# ------------------------------ MODEL PREP
 def prepare_model():
     tok = AutoTokenizer.from_pretrained(MODEL_NAME, trust_remote_code=True)
     if tok.pad_token is None:
