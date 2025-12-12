@@ -116,7 +116,6 @@ def train_model(max_samples=None):
         model=model,
         args=cfg,
         train_dataset=dataset,
-        tokenizer=tok, #Remove this and training works
         peft_config=peft_config,
     )
 
