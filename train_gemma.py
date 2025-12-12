@@ -123,7 +123,7 @@ def train_model(max_samples=None):
     trainer.train()
     # model.save_pretrained(OUTPUT_DIR)
     # tok.save_pretrained(OUTPUT_DIR)
-    # return model, tok, trainer
+    return model, tok, trainer
     
 # ------------------------------ MAIN
 if __name__ == "__main__":
