@@ -24,7 +24,7 @@ def generate_batch(model, tok, prompts, batch_size):
         out = model.generate(
             **enc,
             max_new_tokens=MAX_NEW_TOKENS,
-            **BEAM_KWARGS
+            do_sample=False,   # greedy decode
         )
 
     outputs = []
