@@ -30,8 +30,8 @@ FULL_DATASET = False
 MAX_COLAB_SAMPLES = 300
 
 # ------------------------------ BEAM SWITCH
-BEAM_MODE = "A"  # "A" or "B"
-BEAM_KWARGS = dict(num_beams=5, num_return_sequences=1, early_stopping=True) if BEAM_MODE=="A" else dict(num_beams=5, length_penalty=1.0)
+#BEAM_MODE = "A"  # "A" or "B"
+#BEAM_KWARGS = dict(num_beams=5, num_return_sequences=1, early_stopping=True) if BEAM_MODE=="A" else dict(num_beams=5, length_penalty=1.0)
 
 INDIAN_LANGS = ["hin","ben","tam","tel","mal","kan","mar","guj","urd","pan","ori"]
 LANG_MAP = {
