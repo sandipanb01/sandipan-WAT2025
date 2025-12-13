@@ -1,18 +1,19 @@
 # ---------------------------------------------------------
 # FIXED: Chat-style tokenized prompt for evaluation
+# STRICTLY identical to training prompt
 # ---------------------------------------------------------
 def build_eval_prompt_tokenized(example, tokenizer, src_lang, tgt_lang):
-    """Create tokenized chat prompt exactly like training."""
     user_prompt = f"Translate this {src_lang} text to {tgt_lang}:\n{example['src_txt']}"
 
     messages = [
-        {"role": "user", "content": user_prompt}
+        {"role": "user", "content": user_prompt},
+        {"role": "assistant", "content": ""}
     ]
 
     input_ids = tokenizer.apply_chat_template(
         messages,
         tokenize=True,
-        add_generation_prompt=True
+        add_generation_prompt=False
     )
     return input_ids
 
@@ -20,7 +21,7 @@ def build_eval_prompt_tokenized(example, tokenizer, src_lang, tgt_lang):
 # ---------------------------------------------------------
 # FIXED: Generate with variable-length slicing
 # ---------------------------------------------------------
-def generate_batch(model, tokenizer, batch_input_ids, max_new_tokens=256):
+def generate_batch(model, tokenizer, batch_input_ids):
     enc = torch.nn.utils.rnn.pad_sequence(
         [torch.tensor(x) for x in batch_input_ids],
         batch_first=True,
@@ -30,7 +31,7 @@ def generate_batch(model, tokenizer, batch_input_ids, max_new_tokens=256):
     with torch.no_grad():
         out = model.generate(
             enc,
-            max_new_tokens=max_new_tokens,
+            max_new_tokens=MAX_NEW_TOKENS,
             do_sample=False
         )
 
@@ -47,21 +48,20 @@ def generate_batch(model, tokenizer, batch_input_ids, max_new_tokens=256):
 # FIXED: Single-split loader (ALWAYS load eng_hin)
 # ---------------------------------------------------------
 def load_pralekha_split(lang1, lang2):
-    """
-    Pralekha ONLY has eng_XXX splits.
-    - eng→hin  -> load split="eng_hin"
-    - hin→eng  -> still load split="eng_hin" but reverse fields
-    """
-    # Always use eng_hin split for English-Hindi
     split = "eng_hin"
     print(f"Dataset load info: split='{split}'")
-    return load_dataset("ai4bharat/Pralekha", name="train", split=split, streaming=True)
+    return load_dataset(
+        "ai4bharat/Pralekha",
+        name="train",
+        split=split,
+        streaming=True
+    )
 
 
 # ---------------------------------------------------------
 # FIXED: Correct evaluation for both eng→hin and hin→eng
 # ---------------------------------------------------------
-def evaluate_direction(model, tokenizer, src_lang, tgt_lang, max_samples=150, batch_size=8):
+def evaluate_direction(model, tokenizer, src_lang, tgt_lang, max_samples=200, batch_size=8):
     ds = load_pralekha_split(src_lang, tgt_lang)
     ds_iter = iter(ds)
 
@@ -81,9 +81,6 @@ def evaluate_direction(model, tokenizer, src_lang, tgt_lang, max_samples=150, ba
             except StopIteration:
                 break
 
-            # ---------------------------------------------------
-            # FIXED: reverse fields for hin→eng
-            # ---------------------------------------------------
             if src_lang == "eng" and tgt_lang == "hin":
                 src_text = ex["src_txt"]
                 ref_text = ex["tgt_txt"]
@@ -113,7 +110,6 @@ def evaluate_direction(model, tokenizer, src_lang, tgt_lang, max_samples=150, ba
     pbar.close()
     print(f"Done: {processed} samples for {src_lang}→{tgt_lang}")
 
-    # Compute BLEU and chrF
     bleu = sacrebleu.corpus_bleu(preds, [refs]).score
     chrf_metric = sacrebleu.metrics.CHRF(word_order=0)
     chrf = chrf_metric.corpus_score(preds, [refs]).score
@@ -128,18 +124,18 @@ def evaluate_direction(model, tokenizer, src_lang, tgt_lang, max_samples=150, ba
 if __name__ == "__main__":
     os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
 
-    # 1️⃣ Train
     max_samples = None if FULL_DATASET else MAX_COLAB_SAMPLES
     model, tokenizer, trainer = train_model(max_samples=max_samples)
 
-    # 2️⃣ Evaluate ENG↔HIN
     results = {}
     for split in DIRECTIONS:
         src, tgt = split.split("_")
-        bleu, chrf = evaluate_direction(model, tokenizer, src, tgt)
+        bleu, chrf = evaluate_direction(
+            model, tokenizer, src, tgt,
+            batch_size=EVAL_BATCH_SIZE
+        )
         results[split] = {"BLEU": bleu, "chrF": chrf}
 
     print("\n✅ Final Results (ENG↔HIN):")
     for split, scores in results.items():
         print(f"{split}: BLEU={scores['BLEU']:.2f}, chrF={scores['chrF']:.3f}")
-        
