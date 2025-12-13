@@ -67,25 +67,27 @@ def stream_examples_list(max_samples=None, tokenizer=None):
     config_name = "train"
     splits = get_dataset_split_names(dataset_name, config_name)
     split = splits[0]
-    
 
     def build_prompt(example):
-        """Constructs a prompt with up to 5 retrieved passages."""
         prompt = f"Translate this {example['src_lang']} text to {example['tgt_lang']}:\n{example['src_txt']}"
-        
         messages = {
-            "messages": [{"role": "user", "content": prompt}, {"role": "assistant", "content": example["tgt_txt"]}],
-            }
-        
+            "messages": [
+                {"role": "user", "content": prompt},
+                {"role": "assistant", "content": example["tgt_txt"]}
+            ],
+        }
         return messages
 
     parts = split.split("_")
     sl, tl = parts
-    
     lang = tl if sl=="eng" else sl
-    
+
     dataset = load_dataset(dataset_name, split=split, streaming=True, name=config_name)
     print(dataset)
+
+    if not FULL_DATASET and max_samples is not None:
+        dataset = dataset.take(max_samples)
+
     dataset = dataset.map(build_prompt)
     dataset = dataset.map(apply_chat_template, fn_kwargs={"tokenizer": tokenizer})
 
@@ -96,9 +98,9 @@ def stream_examples_list(max_samples=None, tokenizer=None):
 def train_model(max_samples=None):
     model, tok = prepare_model()
     dataset = stream_examples_list(max_samples=max_samples, tokenizer=tok)
-    
+
     peft_config = LoraConfig(r=256, lora_alpha=16, target_modules="all-linear")
-    
+
     cfg = SFTConfig(
         output_dir=str(OUTPUT_DIR),
         per_device_train_batch_size=BATCH_SIZE,
@@ -113,8 +115,10 @@ def train_model(max_samples=None):
         warmup_ratio=0.1,
         gradient_checkpointing=True,
         completion_only_loss=True,
-        packing=False,
+        packing=False
     )
+
+    assert cfg.max_steps is not None and cfg.max_steps > 0
 
     trainer = SFTTrainer(
         model=model,
@@ -124,8 +128,4 @@ def train_model(max_samples=None):
     )
 
     trainer.train()
-    # model.save_pretrained(OUTPUT_DIR)
-    # tok.save_pretrained(OUTPUT_DIR)
     return model, tok, trainer
-    
-
