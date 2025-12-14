@@ -74,7 +74,7 @@ def stream_examples_list(max_samples=None, tokenizer=None):
             "messages": [
                 {"role": "user", "content": prompt},
                 {"role": "assistant", "content": example["tgt_txt"]}
-            ],
+            ]
         }
         return messages
 
