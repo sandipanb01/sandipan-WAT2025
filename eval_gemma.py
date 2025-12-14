@@ -1,3 +1,7 @@
+# ---------------------------------------------------------
+# FIXED: Chat-style tokenized prompt for evaluation
+# STRICTLY identical to training prompt
+# ---------------------------------------------------------
 def build_eval_prompt_tokenized(example, tokenizer, src_lang, tgt_lang):
     user_prompt = f"Translate this {src_lang} text to {tgt_lang}:\n{example['src_txt']}"
 
