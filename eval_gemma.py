@@ -13,7 +13,7 @@ def build_eval_prompt_tokenized(example, tokenizer, src_lang, tgt_lang):
     input_ids = tokenizer.apply_chat_template(
         messages,
         tokenize=True,
-        add_generation_prompt=False
+        add_generation_prompt=True
     )
     return input_ids
 
@@ -32,7 +32,9 @@ def generate_batch(model, tokenizer, batch_input_ids):
         out = model.generate(
             enc,
             max_new_tokens=MAX_NEW_TOKENS,
-            do_sample=False
+            do_sample=False,
+            eos_token_id=tokenizer.eos_token_id, 
+            pad_token_id=tokenizer.pad_token_id
         )
 
     results = []
