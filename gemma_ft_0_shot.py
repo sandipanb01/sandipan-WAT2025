@@ -31,7 +31,7 @@ from huggingface_hub import login
 
 # Replace the token below with your actual HF access token
 # (Get it from https://huggingface.co/settings/tokens)
-login(token="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")
+login(token="USE_UR_HF_TOKEN")
 
 # ======================================================
 # ✅ Universal Fine-tuning + Evaluation for Hugging Face instruct/causal LM
