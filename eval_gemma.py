@@ -1,22 +1,21 @@
 # ---------------------------------------------------------
 # FIXED: Chat-style tokenized prompt for evaluation
-# ---------------------------------------------------------
+
 def build_eval_prompt_tokenized(example, tokenizer, src_lang, tgt_lang):
-    # MUST MATCH TRAINING PROMPT 
-    prompt = f"Translate this {example['src_lang']} text to {example['tgt_lang']}:\n{example['src_txt']}"
-    messages = {
-        "messages": [
-            {"role": "user", "content": prompt},
-            {"role": "assistant", "content": ""}
-        ]
-    }
+    """Create tokenized chat prompt exactly like training."""
+    user_prompt = f"Translate this {src_lang} text to {tgt_lang}:\n{example['src_txt']}"
+
+    messages = [
+        {"role": "user", "content": user_prompt},
+        {"role": "assistant", "content": ""}
+    ]
+
     input_ids = tokenizer.apply_chat_template(
         messages,
         tokenize=True,
-        add_generation_prompt=True  # critical for generation
+        add_generation_prompt=True
     )
     return input_ids
-
 
 # ---------------------------------------------------------
 # FIXED: Generate with EOS-aware stopping + safe slicing
@@ -145,4 +144,4 @@ if __name__ == "__main__":
     print("\n✅ Final Results (ENG↔HIN):")
     for split, scores in results.items():
         print(f"{split}: BLEU={scores['BLEU']:.2f}, chrF={scores['chrF']:.3f}")
-   
+
