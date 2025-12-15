@@ -51,7 +51,7 @@ GRAD_ACCUM = 8
 EVAL_BATCH_SIZE = 8
 
 FULL_DATASET = True
-MAX_COLAB_SAMPLES = False
+MAX_COLAB_SAMPLES = None
 
 DIRECTIONS = ["eng_hin", "hin_eng"]
 
