@@ -1,0 +1,199 @@
+#----------------------------------------------------------------EVALUATION--------------------------------------
+import os
+import torch
+from torch.utils.data import DataLoader, IterableDataset
+from functools import partial
+from datasets import load_dataset
+from tqdm import tqdm
+import sacrebleu
+import json
+import zipfile
+from pathlib import Path
+#-------------------------EVAL PROMPT--------------------------------
+def build_eval_prompt_messages(example, src_lang, tgt_lang):
+    user_prompt = f"Translate this {src_lang} text to {tgt_lang}:\n{example['src_txt']}"
+    return [
+        {"role": "user", "content": user_prompt},
+        {"role": "assistant", "content": ""}
+    ]
+#--------------------Streaming dataset wrapper-------------------
+class EvalDataset(IterableDataset):
+    def __init__(self, dataset, tokenizer, src_lang, tgt_lang):
+        self.dataset = dataset
+        self.tokenizer = tokenizer
+        self.src_lang = src_lang
+        self.tgt_lang = tgt_lang
+
+    def __iter__(self):
+        for ex in self.dataset:
+            if self.src_lang == "eng" and self.tgt_lang == "hin":
+                src_text = ex["src_txt"]
+                ref_text = ex["tgt_txt"]
+            else:
+                src_text = ex["tgt_txt"]
+                ref_text = ex["src_txt"]
+
+            messages = build_eval_prompt_messages(
+                {"src_txt": src_text}, self.src_lang, self.tgt_lang
+            )
+
+            input_ids = self.tokenizer.apply_chat_template(
+                messages,
+                tokenize=True,
+                add_generation_prompt=True,
+                return_tensors=None
+            )
+
+            yield {
+                "input_ids": torch.tensor(input_ids),
+                "reference": ref_text.strip()
+            }
+#----------------------Collate function-------------------------
+def eval_collate_fn(batch, tokenizer):
+    input_ids = [x["input_ids"] for x in batch]
+    refs = [x["reference"] for x in batch]
+
+    enc = tokenizer.pad(
+        {"input_ids": input_ids},
+        padding=True,
+        return_tensors="pt"
+    )
+
+    return enc["input_ids"], enc["attention_mask"], refs
+#-------------------------Generation (attention-mask-safe slicing)------------------
+def generate_batch(model, tokenizer, input_ids, attention_mask):
+    with torch.no_grad():
+        outputs = model.generate(
+            input_ids=input_ids.to(model.device),
+            attention_mask=attention_mask.to(model.device),
+            max_new_tokens=MAX_NEW_TOKENS,
+            do_sample=False,
+            eos_token_id=tokenizer.eos_token_id,
+            pad_token_id=tokenizer.pad_token_id
+        )
+
+    preds = []
+    for i in range(len(outputs)):
+        prompt_len = attention_mask[i].sum().item()
+        gen_ids = outputs[i][prompt_len:]
+        preds.append(tokenizer.decode(gen_ids, skip_special_tokens=True).strip())
+
+    return preds
+#------------------Datsset Loader----------------------------
+def load_pralekha_split(lang1, lang2):
+    split = "eng_hin"
+    print(f"Dataset load info: split='{split}'")
+    return load_dataset(
+        "ai4bharat/Pralekha",
+        name="train",
+        split=split,
+        streaming=True
+    )
+#-----------------Evaluation Function---------------------------
+def evaluate_direction(model, tokenizer, src_lang, tgt_lang, max_samples=None, batch_size=8):
+    raw_ds = load_pralekha_split(src_lang, tgt_lang)
+    eval_ds = EvalDataset(raw_ds, tokenizer, src_lang, tgt_lang)
+
+    collate = partial(eval_collate_fn, tokenizer=tokenizer)
+
+    loader = DataLoader(
+        eval_ds,
+        batch_size=batch_size,
+        collate_fn=collate
+    )
+
+    preds, refs = [], []
+    processed = 0
+
+    if max_samples is None:
+        max_samples = float("inf")
+
+    pbar = tqdm(desc=f"Evaluating {src_lang}→{tgt_lang}")
+
+    for input_ids, attention_mask, batch_refs in loader:
+        batch_preds = generate_batch(
+            model, tokenizer, input_ids, attention_mask
+        )
+
+        preds.extend(batch_preds)
+        refs.extend(batch_refs)
+
+        processed += len(batch_refs)
+        pbar.update(len(batch_refs))
+
+        if processed >= max_samples:
+            break
+
+    pbar.close()
+
+    bleu = sacrebleu.corpus_bleu(preds, [refs]).score
+    chrf = sacrebleu.metrics.CHRF(word_order=0).corpus_score(preds, [refs]).score
+
+    print(f"{src_lang}→{tgt_lang} | BLEU={bleu:.2f} | chrF={chrf:.3f}\n")
+    return bleu, chrf
+#-------------------------Main Loop--------------------------
+if __name__ == "__main__":
+    os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
+
+    max_samples = None if FULL_DATASET else MAX_COLAB_SAMPLES
+    model, tokenizer, trainer = train_model(max_samples=max_samples)
+
+    results = {}
+    for split in DIRECTIONS:
+        src, tgt = split.split("_")
+        bleu, chrf = evaluate_direction(
+            model, tokenizer, src, tgt,
+            batch_size=EVAL_BATCH_SIZE,
+            max_samples=max_samples
+        )
+        results[split] = {"BLEU": bleu, "chrF": chrf}
+
+    print("\n✅ Final Results (ENG↔HIN):")
+    for split, scores in results.items():
+        print(f"{split}: BLEU={scores['BLEU']:.2f}, chrF={scores['chrF']:.3f}")
+ #------------------JSONL-------------------------------------------
+OUTPUT_DIR = Path("./universal_output_best")
+OUTPUT_DIR.mkdir(exist_ok=True, parents=True)
+
+directions = ["eng_hin", "hin_eng"]
+max_samples_export = 100
+batch_size = 8
+
+jsonl_files = []
+
+for split in directions:
+    src, tgt = split.split("_")
+
+    raw_ds = load_pralekha_split(src, tgt)
+    eval_ds = EvalDataset(raw_ds, tokenizer, src, tgt)
+
+    collate = partial(eval_collate_fn, tokenizer=tokenizer)
+    loader = DataLoader(eval_ds, batch_size=batch_size, collate_fn=collate)
+
+    save_path = OUTPUT_DIR / f"{split}_pred_refs.jsonl"
+    processed = 0
+
+    with open(save_path, "w", encoding="utf-8") as f:
+        for input_ids, attention_mask, refs in loader:
+            preds = generate_batch(model, tokenizer, input_ids, attention_mask)
+
+            for p, r in zip(preds, refs):
+                f.write(json.dumps(
+                    {"prediction": p, "reference": r},
+                    ensure_ascii=False
+                ) + "\n")
+
+            processed += len(refs)
+            if processed >= max_samples_export:
+                break
+
+    jsonl_files.append(save_path)
+    print(f"Saved {processed} examples to {save_path}")
+
+zip_path = OUTPUT_DIR / "pred_refs_eng_hin.zip"
+with zipfile.ZipFile(zip_path, "w") as zipf:
+    for f in jsonl_files:
+        zipf.write(f, arcname=f.name)
+
+files.download(str(zip_path))
+
