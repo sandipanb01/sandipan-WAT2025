@@ -117,7 +117,7 @@ def load_pralekha_split(lang1, lang2):
 
 # ----------------- Evaluation Function --------------------------
 def evaluate_direction(model, tokenizer, src_lang, tgt_lang,
-                       max_samples=None, batch_size=8):
+                       max_samples=200, batch_size=8):
 
     raw_ds = load_pralekha_split(src_lang, tgt_lang)
     eval_ds = EvalDataset(raw_ds, tokenizer, src_lang, tgt_lang)
