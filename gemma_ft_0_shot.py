@@ -400,14 +400,3 @@ print(f"ZIP saved at: {zip_path}")
 # Optional (Colab only)
 # from google.colab import files
 # files.download(str(zip_path))
-# ------------------ ZIP DOWNLOAD CELL -------------------------
-from pathlib import Path
-
-# Path to the ZIP created in your previous cell
-zip_path = Path("./universal_output_best/pred_refs_eng_hin.zip")
-
-if zip_path.exists():
-    files.download(str(zip_path))
-    print(f"Downloading ZIP: {zip_path}")
-else:
-    print(f"ZIP file not found at {zip_path}, please check previous export step.")
