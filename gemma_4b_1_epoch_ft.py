@@ -12,6 +12,7 @@
     bitsandbytes \
     accelerate
 !pip install trl==0.25.0
+#!pip install git+https://github.com/Unbabel/COMET.git
 !pip install evaluate
 
 # Hugging Face login
