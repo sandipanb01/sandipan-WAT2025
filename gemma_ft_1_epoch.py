@@ -27,16 +27,25 @@ login(token="USE_UR_HF_TOKEN")
 # ======================================================
 # Imports
 # ======================================================
-import os, json, zipfile, torch
+import os, json, zipfile, torch, random
 from pathlib import Path
 from datasets import load_dataset, get_dataset_split_names
 from transformers import AutoTokenizer, AutoModelForCausalLM
 from peft import LoraConfig
 from trl import SFTTrainer, SFTConfig, apply_chat_template
-from torch.utils.data import DataLoader, IterableDataset
-from functools import partial
 from tqdm import tqdm
 import sacrebleu
+from trl import apply_chat_template
+import os
+import torch
+from torch.utils.data import DataLoader, IterableDataset
+from functools import partial
+from datasets import load_dataset
+from tqdm import tqdm
+import sacrebleu
+import json
+import zipfile
+from pathlib import Path
 
 # ======================================================
 # CONFIG
@@ -45,11 +54,11 @@ MODEL_NAME = "google/gemma-3-4b-it"
 OUTPUT_DIR = Path("./universal_output_best")
 OUTPUT_DIR.mkdir(exist_ok=True, parents=True)
 
-MAX_SEQ_LEN = 1024
 MAX_NEW_TOKENS = 256
 BATCH_SIZE = 2
 GRAD_ACCUM = 8
-EVAL_BATCH_SIZE = 2
+EVAL_BATCH_SIZE = 1
+MAX_TRAIN_STEPS = None
 FULL_DATASET = True
 MAX_COLAB_SAMPLES = None
 
@@ -129,6 +138,7 @@ def train_model(max_samples=None):
         output_dir=str(OUTPUT_DIR),
         per_device_train_batch_size=BATCH_SIZE,
         gradient_accumulation_steps=GRAD_ACCUM,
+        max_steps=MAX_TRAIN_STEPS,
         learning_rate=2e-5,
         lr_scheduler_type="cosine",
         num_train_epochs=1,          # TRUE FULL EPOCH
@@ -149,17 +159,22 @@ def train_model(max_samples=None):
     )
 
     trainer.train()
-    return model, tok
+    return model, tok, trainer
 
-# ======================================================
-# EVALUATION
-# ======================================================
+# ================================================================
+# EVALUATION (Bidirectional ENG↔HIN from eng_hin split)
+# ================================================================
+
+# ------------------------- EVAL PROMPT --------------------------
 def build_eval_prompt_messages(example, src_lang, tgt_lang):
+    user_prompt = f"Translate this {src_lang} text to {tgt_lang}:\n{example['src_txt']}"
     return [
-        {"role": "user", "content": f"Translate this {src_lang} text to {tgt_lang}:\n{example['src_txt']}"},
+        {"role": "user", "content": user_prompt},
         {"role": "assistant", "content": ""}
     ]
 
+
+# -------------------- Streaming Dataset Wrapper -----------------
 class EvalDataset(IterableDataset):
     def __init__(self, dataset, tokenizer, src_lang, tgt_lang):
         self.dataset = dataset
@@ -169,12 +184,17 @@ class EvalDataset(IterableDataset):
 
     def __iter__(self):
         for ex in self.dataset:
-            if self.src_lang == "eng":
-                src, ref = ex["src_txt"], ex["tgt_txt"]
+            if self.src_lang == "eng" and self.tgt_lang == "hin":
+                src_text = ex["src_txt"]
+                ref_text = ex["tgt_txt"]
             else:
-                src, ref = ex["tgt_txt"], ex["src_txt"]
+                src_text = ex["tgt_txt"]
+                ref_text = ex["src_txt"]
 
-            messages = build_eval_prompt_messages({"src_txt": src}, self.src_lang, self.tgt_lang)
+            messages = build_eval_prompt_messages(
+                {"src_txt": src_text}, self.src_lang, self.tgt_lang
+            )
+
             input_ids = self.tokenizer.apply_chat_template(
                 messages,
                 tokenize=True,
@@ -182,23 +202,31 @@ class EvalDataset(IterableDataset):
             )
 
             yield {
-                "input_ids": torch.tensor(input_ids),
-                "reference": ref.strip()
+                "input_ids": torch.tensor(input_ids, dtype=torch.long),
+                "reference": ref_text.strip()
             }
 
+
+# ---------------------- Collate Function ------------------------
 def eval_collate_fn(batch, tokenizer):
+    input_ids = [x["input_ids"] for x in batch]
+    refs = [x["reference"] for x in batch]
+
     enc = tokenizer.pad(
-        {"input_ids": [b["input_ids"] for b in batch]},
+        {"input_ids": input_ids},
+        padding=True,
         return_tensors="pt"
     )
-    refs = [b["reference"] for b in batch]
+
     return enc["input_ids"], enc["attention_mask"], refs
 
+
+# -------------------- Generation (SAFE slicing) -----------------
 def generate_batch(model, tokenizer, input_ids, attention_mask):
     with torch.no_grad():
         outputs = model.generate(
-            input_ids.to(model.device),
-            attention_mask.to(model.device),
+            input_ids=input_ids.to(model.device),
+            attention_mask=attention_mask.to(model.device),
             max_new_tokens=MAX_NEW_TOKENS,
             do_sample=False,
             use_cache=False,
@@ -208,13 +236,18 @@ def generate_batch(model, tokenizer, input_ids, attention_mask):
 
     preds = []
     for i in range(len(outputs)):
-        gen = outputs[i][attention_mask[i].sum():]
-        preds.append(tokenizer.decode(gen, skip_special_tokens=True).strip())
-        
+        prompt_len = attention_mask[i].sum().item()
+        gen_ids = outputs[i][prompt_len:]
+        preds.append(
+            tokenizer.decode(gen_ids, skip_special_tokens=True).strip()
+        )
+
     del outputs
     torch.cuda.empty_cache()
     return preds
 
+
+# ------------------ Dataset Loader ----------------------
 def load_pralekha_split():
     return load_dataset(
         "ai4bharat/Pralekha",
@@ -223,42 +256,59 @@ def load_pralekha_split():
         streaming=True
     )
 
-def evaluate_direction(model, tokenizer, src, tgt, max_samples=None):
-    model.eval()                
-    torch.cuda.empty_cache()    
-    raw_ds = load_pralekha_split()
-    eval_ds = EvalDataset(raw_ds, tokenizer, src, tgt)
 
-    collate = partial(eval_collate_fn, tokenizer=tokenizer)
+# ----------------- Evaluation Function --------------------------
+def evaluate_direction(model, tokenizer, src_lang, tgt_lang,
+                       max_samples=None, batch_size=1):
+
+    model.eval()
+    torch.cuda.empty_cache()
+
+    raw_ds = load_pralekha_split()
+    eval_ds = EvalDataset(raw_ds, tokenizer, src_lang, tgt_lang)
 
     loader = DataLoader(
         eval_ds,
-        batch_size=EVAL_BATCH_SIZE,
+        batch_size=batch_size,
         collate_fn=partial(eval_collate_fn, tokenizer=tokenizer),
         num_workers=0
     )
 
-    preds, refs, seen = [], [], 0
-    for input_ids, attn, batch_refs in tqdm(loader, desc=f"{src}->{tgt}"):
-        p = generate_batch(model, tokenizer, input_ids, attn)
-        preds.extend(p)
+    preds, refs = [], []
+    processed = 0
+
+    if max_samples is None:
+        max_samples = float("inf")
+
+    pbar = tqdm(desc=f"Evaluating {src_lang}→{tgt_lang}")
+
+    for input_ids, attention_mask, batch_refs in loader:
+        batch_preds = generate_batch(
+            model, tokenizer, input_ids, attention_mask
+        )
+
+        preds.extend(batch_preds)
         refs.extend(batch_refs)
-        seen += len(batch_refs)
-        if max_samples and seen >= max_samples:
+
+        processed += len(batch_refs)
+        pbar.update(len(batch_refs))
+
+        if processed >= max_samples:
             break
+
+    pbar.close()
 
     bleu = sacrebleu.corpus_bleu(preds, [refs]).score
     chrf = sacrebleu.metrics.CHRF(word_order=0).corpus_score(preds, [refs]).score
-    print(f"{src}->{tgt} | BLEU={bleu:.2f} | chrF={chrf:.3f}")
+
+    print(f"{src_lang}→{tgt_lang} | BLEU={bleu:.2f} | chrF={chrf:.3f}\n")
     return bleu, chrf
 
-# ------------------------- Main Loop ----------------------------
+
+# ------------------------- MAIN (EVAL ONLY) ----------------------------
 if __name__ == "__main__":
     os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
-
-    max_samples = None if FULL_DATASET else MAX_COLAB_SAMPLES
-    model, tokenizer, trainer = train_model(max_samples=max_samples)
-    model.eval()
+    model, tokenizer, trainer = train_model(max_samples=None)
 
     results = {}
     for split in DIRECTIONS:
@@ -270,15 +320,14 @@ if __name__ == "__main__":
             src,
             tgt,
             batch_size=EVAL_BATCH_SIZE,
-            max_samples=max_samples
+            max_samples=None
         )
         results[split] = {"BLEU": bleu, "chrF": chrf}
 
     print("\n✅ Final Results (ENG↔HIN):")
     for split, scores in results.items():
         print(f"{split}: BLEU={scores['BLEU']:.2f}, chrF={scores['chrF']:.3f}")
-    
-    torch.cuda.empty_cache()
+
 
 # ------------------ JSONL EXPORT --------------------------------
 OUTPUT_DIR = Path("./universal_output_best")
@@ -286,21 +335,19 @@ OUTPUT_DIR.mkdir(exist_ok=True, parents=True)
 
 directions = ["eng_hin", "hin_eng"]
 max_samples_export = 100
-batch_size = 1
 
 jsonl_files = []
 
 for split in directions:
     src, tgt = split.split("_")
 
-    raw_ds = load_pralekha_split(src, tgt)
+    raw_ds = load_pralekha_split()
     eval_ds = EvalDataset(raw_ds, tokenizer, src, tgt)
 
-    collate = partial(eval_collate_fn, tokenizer=tokenizer)
     loader = DataLoader(
         eval_ds,
-        batch_size=batch_size,
-        collate_fn=collate,
+        batch_size=1,
+        collate_fn=partial(eval_collate_fn, tokenizer=tokenizer),
         num_workers=0
     )
 
@@ -332,7 +379,3 @@ with zipfile.ZipFile(zip_path, "w") as zipf:
         zipf.write(f, arcname=f.name)
 
 print(f"ZIP saved at: {zip_path}")
-
-# Optional (Colab only)
-# from google.colab import files
-# files.download(str(zip_path))
