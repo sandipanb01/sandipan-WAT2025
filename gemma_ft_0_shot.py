@@ -65,7 +65,7 @@ GRAD_ACCUM = 8
 MAX_TRAIN_STEPS = 6000
 EVAL_BATCH_SIZE = 8
 FULL_DATASET = True
-MAX_COLAB_SAMPLES = False
+MAX_COLAB_SAMPLES = None
 
 # ------------------------------ BEAM SWITCH
 #BEAM_MODE = "A"  # "A" or "B"
