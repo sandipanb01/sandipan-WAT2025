@@ -280,6 +280,7 @@ def evaluate_direction(model, tokenizer, src_lang, tgt_lang,
                        max_samples=None, batch_size=8):
 
     model.eval()
+    torch.cuda.empty_cache()                       
     raw_ds = load_pralekha_split(src_lang, tgt_lang)
     eval_ds = EvalDataset(raw_ds, tokenizer, src_lang, tgt_lang)
 
