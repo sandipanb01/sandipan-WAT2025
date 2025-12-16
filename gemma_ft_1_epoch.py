@@ -45,11 +45,11 @@ MODEL_NAME = "google/gemma-3-4b-it"
 OUTPUT_DIR = Path("./universal_output_best")
 OUTPUT_DIR.mkdir(exist_ok=True, parents=True)
 
+MAX_SEQ_LEN = 1024
 MAX_NEW_TOKENS = 256
 BATCH_SIZE = 2
 GRAD_ACCUM = 8
 EVAL_BATCH_SIZE = 2
-
 FULL_DATASET = True
 MAX_COLAB_SAMPLES = None
 
