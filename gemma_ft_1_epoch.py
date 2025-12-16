@@ -48,7 +48,7 @@ OUTPUT_DIR.mkdir(exist_ok=True, parents=True)
 MAX_NEW_TOKENS = 256
 BATCH_SIZE = 2
 GRAD_ACCUM = 8
-EVAL_BATCH_SIZE = 8
+EVAL_BATCH_SIZE = 2
 
 FULL_DATASET = True
 MAX_COLAB_SAMPLES = None
@@ -201,6 +201,7 @@ def generate_batch(model, tokenizer, input_ids, attention_mask):
             attention_mask.to(model.device),
             max_new_tokens=MAX_NEW_TOKENS,
             do_sample=False,
+            use_cache=False,
             eos_token_id=tokenizer.eos_token_id,
             pad_token_id=tokenizer.pad_token_id
         )
@@ -209,6 +210,9 @@ def generate_batch(model, tokenizer, input_ids, attention_mask):
     for i in range(len(outputs)):
         gen = outputs[i][attention_mask[i].sum():]
         preds.append(tokenizer.decode(gen, skip_special_tokens=True).strip())
+        
+    del outputs
+    torch.cuda.empty_cache()
     return preds
 
 def load_pralekha_split():
@@ -220,8 +224,12 @@ def load_pralekha_split():
     )
 
 def evaluate_direction(model, tokenizer, src, tgt, max_samples=None):
+    model.eval()                
+    torch.cuda.empty_cache()    
     raw_ds = load_pralekha_split()
     eval_ds = EvalDataset(raw_ds, tokenizer, src, tgt)
+
+    collate = partial(eval_collate_fn, tokenizer=tokenizer)
 
     loader = DataLoader(
         eval_ds,
@@ -244,30 +252,41 @@ def evaluate_direction(model, tokenizer, src, tgt, max_samples=None):
     print(f"{src}->{tgt} | BLEU={bleu:.2f} | chrF={chrf:.3f}")
     return bleu, chrf
 
-# ======================================================
-# MAIN
-# ======================================================
+# ------------------------- Main Loop ----------------------------
 if __name__ == "__main__":
     os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
 
     max_samples = None if FULL_DATASET else MAX_COLAB_SAMPLES
-    model, tokenizer = train_model(max_samples)
+    model, tokenizer, trainer = train_model(max_samples=max_samples)
+    model.eval()
 
     results = {}
-    for d in DIRECTIONS:
-        s, t = d.split("_")
-        results[d] = evaluate_direction(model, tokenizer, s, t)
+    for split in DIRECTIONS:
+        torch.cuda.empty_cache()
+        src, tgt = split.split("_")
+        bleu, chrf = evaluate_direction(
+            model,
+            tokenizer,
+            src,
+            tgt,
+            batch_size=EVAL_BATCH_SIZE,
+            max_samples=max_samples
+        )
+        results[split] = {"BLEU": bleu, "chrF": chrf}
 
-    print("\n✅ FINAL RESULTS")
-    for k, v in results.items():
-        print(k, v)
+    print("\n✅ Final Results (ENG↔HIN):")
+    for split, scores in results.items():
+        print(f"{split}: BLEU={scores['BLEU']:.2f}, chrF={scores['chrF']:.3f}")
+    
+    torch.cuda.empty_cache()
+
 # ------------------ JSONL EXPORT --------------------------------
 OUTPUT_DIR = Path("./universal_output_best")
 OUTPUT_DIR.mkdir(exist_ok=True, parents=True)
 
 directions = ["eng_hin", "hin_eng"]
 max_samples_export = 100
-batch_size = 8
+batch_size = 1
 
 jsonl_files = []
 
