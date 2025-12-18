@@ -6,6 +6,8 @@
 # Style: Matches your working parallel data code exactly
 # ======================================================
 
+!pip install IndicTransToolkit
+
 import os, random, torch, warnings, gc, json, zipfile
 from pathlib import Path
 from itertools import islice
@@ -38,7 +40,7 @@ N_MONO = 6        # VERY SMALL ON PURPOSE
 N_TEST = 10
 MAX_SEQ_LEN = 1024
 MAX_NEW_TOKENS = 64
-MAX_STEPS = 10
+MAX_STEPS = 50
 BATCH_SIZE = 1
 GRAD_ACCUM = 2
 INDIC_BATCH_SIZE = 2
@@ -57,18 +59,18 @@ print("[LOAD] IITB-IndicMonoDoc")
 try:
     print("  Attempting: Loading full dataset and filtering by language...")
     mono = load_dataset("cfilt/IITB-IndicMonoDoc", split="train", trust_remote_code=True)
-    
+
     hi_docs = [x["text"] for x in mono if x["lang"] == "hi"][:N_MONO]
     en_docs = [x["text"] for x in mono if x["lang"] == "en"][:N_MONO]
-    
+
     assert len(hi_docs) == len(en_docs), f"Mismatch: {len(hi_docs)} Hindi vs {len(en_docs)} English"
     print(f"  ✓ Loaded {len(hi_docs)} Hindi + {len(en_docs)} English docs for TRAINING")
-    
+
 except Exception as e:
     print(f"  ✗ Failed: {e}")
     print("  Fallback: Using parallel corpus as monolingual...")
     parallel = load_dataset("cfilt/iitb-english-hindi", split="train", streaming=True)
-    
+
     parallel_samples = list(islice(parallel, N_MONO))
     hi_docs = [x["translation"]["hi"] for x in parallel_samples]
     en_docs = [x["translation"]["en"] for x in parallel_samples]
@@ -96,7 +98,7 @@ def initialize_indic_model(ckpt_dir):
         trust_remote_code=True,
         low_cpu_mem_usage=True,
     )
-    
+
     device = "cuda" if torch.cuda.is_available() else "cpu"
     model = model.to(device)
     if device == "cuda":
@@ -107,26 +109,26 @@ def initialize_indic_model(ckpt_dir):
 def batch_translate_no_cache(texts, src_lang, tgt_lang, model, tokenizer, ip, batch_size=2):
     """Translate texts in batches"""
     all_outputs = []
-    
+
     for i in range(0, len(texts), batch_size):
         batch = texts[i:i+batch_size]
-        
+
         inputs = ip.preprocess_batch(batch, src_lang=src_lang, tgt_lang=tgt_lang)
-        
+
         model_inputs = tokenizer(
             inputs, return_tensors="pt", padding=True, truncation=True, max_length=256
         ).to(model.device)
-        
+
         translated_tokens = model.generate(**model_inputs, use_cache=False, max_length=256)
-        
+
         outputs = tokenizer.batch_decode(translated_tokens, skip_special_tokens=True)
-        
+
         batch_outputs = ip.postprocess_batch(outputs, lang=tgt_lang)
         all_outputs.extend(batch_outputs)
-        
+
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
-    
+
     return all_outputs
 
 # Initialize processor once
@@ -138,8 +140,8 @@ print("  [1/2] Loading Indic→English model and translating...")
 tokenizer_ie, model_ie = initialize_indic_model(INDIC_TO_EN_CKPT)
 
 bt_en_r0 = batch_translate_no_cache(
-    hi_docs, 
-    src_lang="hin_Deva", 
+    hi_docs,
+    src_lang="hin_Deva",
     tgt_lang="eng_Latn",
     model=model_ie,
     tokenizer=tokenizer_ie,
@@ -184,13 +186,13 @@ def prepare_model():
 
     model = AutoModelForCausalLM.from_pretrained(
         MODEL_NAME,
-        torch_dtype=torch.bfloat16,
+        torch_dtype=torch.float32,
         device_map="auto"
     )
 
-    try: 
+    try:
         model.gradient_checkpointing_enable()
-    except: 
+    except:
         pass
 
     return model, tok
@@ -302,12 +304,12 @@ def generate_batch(model, tokenizer, input_ids, attention_mask):
 
     return preds
 
-def evaluate_direction(model, tokenizer, src_texts, ref_texts, src_lang, tgt_lang, 
+def evaluate_direction(model, tokenizer, src_texts, ref_texts, src_lang, tgt_lang,
                        round_name, batch_size=8):
     """Evaluation Function - Saves input/pred/ref JSONL"""
-    
+
     print(f"\n[EVAL {round_name}] {src_lang}→{tgt_lang}")
-    
+
     eval_ds = EvalDataset(src_texts, ref_texts, tokenizer, src_lang, tgt_lang)
     collate = partial(eval_collate_fn, tokenizer=tokenizer)
 
@@ -350,26 +352,26 @@ def evaluate_direction(model, tokenizer, src_texts, ref_texts, src_lang, tgt_lan
             }, ensure_ascii=False) + "\n")
 
     print(f"  Saved: {jsonl_path}")
-    
+
     return bleu, chrf
 
 def gemma_translate(model, tokenizer, texts, src_lang, tgt_lang, batch_size=2):
     """Generate translations using current Gemma model"""
     eval_ds = EvalDataset(texts, [""] * len(texts), tokenizer, src_lang, tgt_lang)
     collate = partial(eval_collate_fn, tokenizer=tokenizer)
-    
+
     loader = DataLoader(
         eval_ds,
         batch_size=batch_size,
         collate_fn=collate,
         num_workers=0
     )
-    
+
     preds = []
     for input_ids, attention_mask, _, _ in tqdm(loader, desc=f"Translating {src_lang}→{tgt_lang}"):
         batch_preds = generate_batch(model, tokenizer, input_ids, attention_mask)
         preds.extend(batch_preds)
-    
+
     return preds
 
 # ---------------- LOAD GEMMA + LORA (MATCHING REFERENCE CODE)
@@ -380,7 +382,7 @@ peft_config = LoraConfig(
     r=32,
     lora_alpha=64,
     target_modules="all-linear",
-    lora_dropout=0.05,
+
 )
 
 model = get_peft_model(model, peft_config)
@@ -396,14 +398,14 @@ cfg = SFTConfig(
     lr_scheduler_type="cosine",
     num_train_epochs=1,
     max_steps=MAX_STEPS,
-    logging_steps=1,
-    save_strategy="steps",
     save_steps=MAX_STEPS,
+    logging_steps=10,
+    save_strategy="no",
     report_to="none",
     warmup_ratio=0.05,
     gradient_checkpointing=True,
     completion_only_loss=True,
-    packing=False,
+    packing=False
 )
 
 trainer = SFTTrainer(
@@ -448,7 +450,7 @@ for r in [1, 2]:
     # Generate NEW synthetic translations using current Gemma
     print(f"  Step 1: Generating synthetic English from {len(hi_docs)} Hindi texts")
     gen_en = gemma_translate(model, tok, hi_docs, "Hindi", "English", batch_size=EVAL_BATCH_SIZE)
-    
+
     print(f"  Step 2: Generating synthetic Hindi from {len(en_docs)} English texts")
     gen_hi = gemma_translate(model, tok, en_docs, "English", "Hindi", batch_size=EVAL_BATCH_SIZE)
 
@@ -467,7 +469,7 @@ for r in [1, 2]:
     # Update config for this round
     cfg.output_dir = str(WORK_DIR / f"gemma_r{r}")
     cfg.save_steps = MAX_STEPS
-    
+
     # Train (model already has LoRA from R0)
     print(f"  Step 4: Training Gemma Round-{r}")
     trainer = SFTTrainer(
@@ -476,11 +478,11 @@ for r in [1, 2]:
         train_dataset=round_ds,
     )
     trainer.train()
-    
+
     # Save checkpoint
     model.save_pretrained(WORK_DIR / f"gemma_r{r}" / "final")
     tok.save_pretrained(WORK_DIR / f"gemma_r{r}" / "final")
-    
+
     # Evaluate this round
     print(f"\n  Step 5: Evaluating Round-{r}")
     bleu_en_hi, chrf_en_hi = evaluate_direction(
@@ -489,12 +491,12 @@ for r in [1, 2]:
     bleu_hi_en, chrf_hi_en = evaluate_direction(
         model, tok, test_hi, test_en, "Hindi", "English", f"r{r}", batch_size=EVAL_BATCH_SIZE
     )
-    
+
     metrics[f"round-{r}"] = {
         "eng_to_hin": {"bleu": bleu_en_hi, "chrf": chrf_en_hi},
         "hin_to_eng": {"bleu": bleu_hi_en, "chrf": chrf_hi_en}
     }
-    
+
     print(f"  ✓ Round {r} complete")
 
 print("\n" + "="*60)
