@@ -20,9 +20,16 @@ from transformers import (
     AutoModelForSeq2SeqLM,
 )
 from peft import LoraConfig, get_peft_model
-from trl import SFTTrainer, SFTConfig
 import sacrebleu
 from tqdm import tqdm
+from trl import SFTTrainer, SFTConfig, apply_chat_template
+from trl import apply_chat_template
+from torch.utils.data import DataLoader, IterableDataset
+from functools import partial
+import json
+import zipfile
+from pathlib import Path
+
 
 warnings.filterwarnings("ignore")
 
