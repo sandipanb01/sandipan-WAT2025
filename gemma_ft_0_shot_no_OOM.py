@@ -63,7 +63,7 @@ MAX_NEW_TOKENS = 256
 BATCH_SIZE = 2
 GRAD_ACCUM = 8
 MAX_TRAIN_STEPS = 6000
-EVAL_BATCH_SIZE = 1
+EVAL_BATCH_SIZE = 2
 FULL_DATASET = True
 MAX_COLAB_SAMPLES = None
 
@@ -277,7 +277,7 @@ def load_pralekha_split(lang1, lang2):
 
 # ----------------- Evaluation Function --------------------------
 def evaluate_direction(model, tokenizer, src_lang, tgt_lang,
-                       max_samples=None, batch_size=8):
+                       max_samples=None, batch_size=2):
 
     model.eval()
     torch.cuda.empty_cache()                       
@@ -358,7 +358,7 @@ OUTPUT_DIR.mkdir(exist_ok=True, parents=True)
 
 directions = ["eng_hin", "hin_eng"]
 max_samples_export = 100
-batch_size = 1
+batch_size = 2
 
 jsonl_files = []
 
