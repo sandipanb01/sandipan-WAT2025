@@ -259,7 +259,7 @@ def generate_batch(model, tokenizer, input_ids, attention_mask):
         )
 
     del outputs
-    torch.cuda.empty_cache()
+    #torch.cuda.empty_cache()
     return preds
 
 
@@ -280,7 +280,7 @@ def evaluate_direction(model, tokenizer, src_lang, tgt_lang,
                        max_samples=None, batch_size=2):
 
     model.eval()
-    torch.cuda.empty_cache()                       
+    #torch.cuda.empty_cache()                       
     raw_ds = load_pralekha_split(src_lang, tgt_lang)
     eval_ds = EvalDataset(raw_ds, tokenizer, src_lang, tgt_lang)
 
@@ -326,7 +326,10 @@ def evaluate_direction(model, tokenizer, src_lang, tgt_lang,
 
 # ------------------------- Main Loop ----------------------------
 if __name__ == "__main__":
-    os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
+    #os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
+
+    del trainer
+    torch.cuda.empty_cache()
 
     max_samples = None if FULL_DATASET else MAX_COLAB_SAMPLES
     model, tokenizer, trainer = train_model(max_samples=max_samples)
