@@ -326,7 +326,7 @@ def evaluate_direction(model, tokenizer, src_lang, tgt_lang,
 
 # ------------------------- Main Loop ----------------------------
 if __name__ == "__main__":
-    #os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
+    os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
 
     max_samples = None if FULL_DATASET else MAX_COLAB_SAMPLES
     model, tokenizer, trainer = train_model(max_samples=max_samples)
