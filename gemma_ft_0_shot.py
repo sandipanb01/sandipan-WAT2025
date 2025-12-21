@@ -63,7 +63,7 @@ MAX_NEW_TOKENS = 256
 BATCH_SIZE = 2
 GRAD_ACCUM = 8
 MAX_TRAIN_STEPS = 6000
-EVAL_BATCH_SIZE = 8
+EVAL_BATCH_SIZE = 2 #USE 8 IF NOT OOM
 FULL_DATASET = True
 MAX_COLAB_SAMPLES = None
 
@@ -272,9 +272,9 @@ def load_pralekha_split(lang1, lang2):
     )
 
 
-# ----------------- Evaluation Function --------------------------
+# ----------------- Evaluation Function (USE batch_size=8 if NOT OOM)--------------------------
 def evaluate_direction(model, tokenizer, src_lang, tgt_lang,
-                       max_samples=None, batch_size=8):
+                       max_samples=None, batch_size=2):
 
     raw_ds = load_pralekha_split(src_lang, tgt_lang)
     eval_ds = EvalDataset(raw_ds, tokenizer, src_lang, tgt_lang)
@@ -350,7 +350,7 @@ OUTPUT_DIR.mkdir(exist_ok=True, parents=True)
 
 directions = ["eng_hin", "hin_eng"]
 max_samples_export = 100
-batch_size = 8
+batch_size = 2 #USE BATCH SIZE 8
 
 jsonl_files = []
 
