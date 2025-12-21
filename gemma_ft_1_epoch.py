@@ -57,7 +57,7 @@ OUTPUT_DIR.mkdir(exist_ok=True, parents=True)
 MAX_NEW_TOKENS = 256
 BATCH_SIZE = 2
 GRAD_ACCUM = 8
-EVAL_BATCH_SIZE = 1
+EVAL_BATCH_SIZE = 2
 MAX_TRAIN_STEPS = None
 FULL_DATASET = True
 MAX_COLAB_SAMPLES = None
@@ -259,7 +259,7 @@ def load_pralekha_split():
 
 # ----------------- Evaluation Function --------------------------
 def evaluate_direction(model, tokenizer, src_lang, tgt_lang,
-                       max_samples=None, batch_size=1):
+                       max_samples=None, batch_size=2):
 
     model.eval()
     torch.cuda.empty_cache()
@@ -346,7 +346,7 @@ for split in directions:
 
     loader = DataLoader(
         eval_ds,
-        batch_size=1,
+        batch_size=2,
         collate_fn=partial(eval_collate_fn, tokenizer=tokenizer),
         num_workers=0
     )
