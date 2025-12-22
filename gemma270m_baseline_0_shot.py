@@ -3,6 +3,7 @@
 # Model: google/gemma-3-270m-it (or 4B if you change it)
 # Dataset: ai4bharat/Pralekha
 # Metrics: sacreBLEU + chrF
+# JSONL export + top 10 examples + ZIP
 # ======================================================
 
 import os, json, zipfile, torch
@@ -39,7 +40,6 @@ def load_model():
     model.eval()
     return model, tokenizer
 
-
 # ------------------------- EVAL PROMPT --------------------------
 def build_eval_prompt_messages(example, src_lang, tgt_lang):
     return [
@@ -49,7 +49,6 @@ def build_eval_prompt_messages(example, src_lang, tgt_lang):
         },
         {"role": "assistant", "content": ""}
     ]
-
 
 # -------------------- Streaming Dataset Wrapper -----------------
 class EvalDataset(IterableDataset):
@@ -80,14 +79,15 @@ class EvalDataset(IterableDataset):
 
             yield {
                 "input_ids": torch.tensor(input_ids, dtype=torch.long),
-                "reference": ref_text.strip()
+                "reference": ref_text.strip(),
+                "src_text": src_text.strip()
             }
-
 
 # ---------------------- Collate Function ------------------------
 def eval_collate_fn(batch, tokenizer):
     input_ids = [x["input_ids"] for x in batch]
     refs = [x["reference"] for x in batch]
+    src_texts = [x["src_text"] for x in batch]
 
     enc = tokenizer.pad(
         {"input_ids": input_ids},
@@ -95,8 +95,7 @@ def eval_collate_fn(batch, tokenizer):
         return_tensors="pt"
     )
 
-    return enc["input_ids"], enc["attention_mask"], refs
-
+    return enc["input_ids"], enc["attention_mask"], refs, src_texts
 
 # -------------------- Generation -----------------
 def generate_batch(model, tokenizer, input_ids, attention_mask):
@@ -118,7 +117,6 @@ def generate_batch(model, tokenizer, input_ids, attention_mask):
 
     return preds
 
-
 # ------------------ Dataset Loader ----------------------
 def load_pralekha():
     return load_dataset(
@@ -128,9 +126,8 @@ def load_pralekha():
         streaming=True
     )
 
-
 # ----------------- Evaluation Function --------------------------
-def evaluate_direction(model, tokenizer, src_lang, tgt_lang):
+def evaluate_direction(model, tokenizer, src_lang, tgt_lang, jsonl_files):
     raw_ds = load_pralekha()
     eval_ds = EvalDataset(raw_ds, tokenizer, src_lang, tgt_lang)
 
@@ -141,98 +138,62 @@ def evaluate_direction(model, tokenizer, src_lang, tgt_lang):
         num_workers=0
     )
 
-    preds, refs = [], []
+    preds, refs, src_texts = [], [], []
     processed = 0
+    jsonl_file = OUTPUT_DIR / f"{src_lang}_{tgt_lang}_pred_refs.jsonl"
 
-    pbar = tqdm(desc=f"Evaluating {src_lang}→{tgt_lang}")
+    with open(jsonl_file, "w", encoding="utf-8") as f:
+        pbar = tqdm(desc=f"Evaluating {src_lang}→{tgt_lang}")
+        for input_ids, attention_mask, batch_refs, batch_srcs in loader:
+            batch_preds = generate_batch(model, tokenizer, input_ids, attention_mask)
 
-    for input_ids, attention_mask, batch_refs in loader:
-        batch_preds = generate_batch(model, tokenizer, input_ids, attention_mask)
+            for p, r, s in zip(batch_preds, batch_refs, batch_srcs):
+                f.write(json.dumps({"src": s, "prediction": p, "reference": r}, ensure_ascii=False) + "\n")
 
-        preds.extend(batch_preds)
-        refs.extend(batch_refs)
+            preds.extend(batch_preds)
+            refs.extend(batch_refs)
+            src_texts.extend(batch_srcs)
+            processed += len(batch_refs)
+            pbar.update(len(batch_refs))
 
-        processed += len(batch_refs)
-        pbar.update(len(batch_refs))
+            if MAX_SAMPLES and processed >= MAX_SAMPLES:
+                break
+        pbar.close()
 
-        if MAX_SAMPLES and processed >= MAX_SAMPLES:
-            break
-
-    pbar.close()
+    jsonl_files.append(jsonl_file)
 
     bleu = sacrebleu.corpus_bleu(preds, [refs]).score
     chrf = sacrebleu.metrics.CHRF(word_order=0).corpus_score(preds, [refs]).score
 
     print(f"{src_lang}→{tgt_lang} | BLEU={bleu:.2f} | chrF={chrf:.3f}")
-    return bleu, chrf
 
+    # Show top 10 predictions + references
+    print("\nTop 10 examples:")
+    for i in range(min(10, len(preds))):
+        print(f"{i+1}. SRC: {src_texts[i]}")
+        print(f"   PRED: {preds[i]}")
+        print(f"   REF : {refs[i]}\n")
+
+    return bleu, chrf
 
 # ------------------------- MAIN ----------------------------
 if __name__ == "__main__":
     model, tokenizer = load_model()
 
     results = {}
+    jsonl_files = []
+
     for split in DIRECTIONS:
         src, tgt = split.split("_")
-        results[split] = evaluate_direction(model, tokenizer, src, tgt)
+        results[split] = evaluate_direction(model, tokenizer, src, tgt, jsonl_files)
 
     print("\n✅ BASELINE RESULTS")
     for k, (b, c) in results.items():
         print(f"{k}: BLEU={b:.2f}, chrF={c:.3f}")
-      
-# ------------------ JSONL EXPORT --------------------------------
-OUTPUT_DIR = Path("./baseline_eval_output")
-OUTPUT_DIR.mkdir(exist_ok=True, parents=True)
 
-directions = ["eng_hin", "hin_eng"]
-max_samples_export = 100
-batch_size = 8
-
-jsonl_files = []
-
-for split in directions:
-    src, tgt = split.split("_")
-
-    raw_ds = load_pralekha_split(src, tgt)
-    eval_ds = EvalDataset(raw_ds, tokenizer, src, tgt)
-
-    collate = partial(eval_collate_fn, tokenizer=tokenizer)
-    loader = DataLoader(
-        eval_ds,
-        batch_size=batch_size,
-        collate_fn=collate,
-        num_workers=0
-    )
-
-    save_path = OUTPUT_DIR / f"{split}_pred_refs.jsonl"
-    processed = 0
-
-    with open(save_path, "w", encoding="utf-8") as f:
-        for input_ids, attention_mask, refs in loader:
-            preds = generate_batch(model, tokenizer, input_ids, attention_mask)
-
-            for p, r in zip(preds, refs):
-                f.write(json.dumps(
-                    {"prediction": p, "reference": r},
-                    ensure_ascii=False
-                ) + "\n")
-
-            processed += len(refs)
-            if processed >= max_samples_export:
-                break
-
-    jsonl_files.append(save_path)
-    print(f"Saved {processed} examples to {save_path}")
-
-
-# ------------------ ZIP -----------------------------------------
-zip_path = OUTPUT_DIR / "pred_refs_eng_hin.zip"
-with zipfile.ZipFile(zip_path, "w") as zipf:
-    for f in jsonl_files:
-        zipf.write(f, arcname=f.name)
-
-print(f"ZIP saved at: {zip_path}")
-
-# Optional (Colab only)
-# from google.colab import files
-# files.download(str(zip_path))
+    # ------------------ ZIP EXPORT -------------------------
+    zip_path = OUTPUT_DIR / "pred_refs_baseline.zip"
+    with zipfile.ZipFile(zip_path, "w") as zipf:
+        for f in jsonl_files:
+            zipf.write(f, arcname=f.name)
+    print(f"\n📦 JSONL files zipped at: {zip_path}")
