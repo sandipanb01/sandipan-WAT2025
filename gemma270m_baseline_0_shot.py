@@ -1,32 +1,36 @@
-# ======================================================
-# ✅ BASELINE ZERO-SHOT EVALUATION (NO FINETUNING)
-# Model: google/gemma-3-270m-it (or 4B if you change it)
-# Dataset: ai4bharat/Pralekha
-# Metrics: sacreBLEU + chrF
-# JSONL export + top 10 examples + ZIP
-# ======================================================
+"""
+Zero-shot evaluation for Gemma-3-270M-it on Pralekha dataset.
+
+Features:
+- Streaming evaluation (avoid memory overload)
+- Automatic max tokens per target language (Hindi=3324, English=2912)
+- Chat-template applied (same as training code)
+- BLEU + chrF metrics
+- JSONL export + top-10 examples
+- ZIP output for convenience
+"""
 
 import os, json, zipfile, torch
 from pathlib import Path
+from functools import partial
+from torch.utils.data import DataLoader, IterableDataset
 from datasets import load_dataset
 from transformers import AutoTokenizer, AutoModelForCausalLM
-from torch.utils.data import DataLoader, IterableDataset
-from functools import partial
 from tqdm import tqdm
 import sacrebleu
+from trl import apply_chat_template
 
-# ------------------------------ CONFIG
+# ---------------------- CONFIG ----------------------
 MODEL_NAME = "google/gemma-3-270m-it"
-OUTPUT_DIR = Path("./baseline_eval_output")
+OUTPUT_DIR = Path("./zero_shot_eval_output")
 OUTPUT_DIR.mkdir(exist_ok=True, parents=True)
 
-MAX_NEW_TOKENS = 512
+MAX_TOKENS = {"eng": 2912, "hin": 3324}  # from tokenizer histogram
 EVAL_BATCH_SIZE = 8
-MAX_SAMPLES = 100   # set None for full streaming eval
-
+MAX_SAMPLES = 10  # None = full streaming eval
 DIRECTIONS = ["eng_hin", "hin_eng"]
 
-# ------------------------------ MODEL LOAD
+# ---------------------- MODEL LOAD ----------------------
 def load_model():
     tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, trust_remote_code=True)
     if tokenizer.pad_token is None:
@@ -40,17 +44,19 @@ def load_model():
     model.eval()
     return model, tokenizer
 
-# ------------------------- EVAL PROMPT --------------------------
-def build_eval_prompt_messages(example, src_lang, tgt_lang):
-    return [
-        {
-            "role": "user",
-            "content": f"Translate this {src_lang} text to {tgt_lang}:\n{example['src_txt']}"
-        },
+# ---------------------- PROMPT ----------------------
+def build_eval_prompt(src_text, src_lang, tgt_lang):
+    """
+    Zero-shot translation prompt.
+    """
+    prompt = f"Translate this {src_lang} text to {tgt_lang}:\n{src_text}"
+    messages = [
+        {"role": "user", "content": prompt},
         {"role": "assistant", "content": ""}
     ]
+    return messages
 
-# -------------------- Streaming Dataset Wrapper -----------------
+# ------------------ STREAMING DATASET ------------------
 class EvalDataset(IterableDataset):
     def __init__(self, dataset, tokenizer, src_lang, tgt_lang):
         self.dataset = dataset
@@ -60,22 +66,11 @@ class EvalDataset(IterableDataset):
 
     def __iter__(self):
         for ex in self.dataset:
-            if self.src_lang == "eng":
-                src_text = ex["src_txt"]
-                ref_text = ex["tgt_txt"]
-            else:
-                src_text = ex["tgt_txt"]
-                ref_text = ex["src_txt"]
+            src_text = ex["src_txt"] if self.src_lang == "eng" else ex["tgt_txt"]
+            ref_text = ex["tgt_txt"] if self.src_lang == "eng" else ex["src_txt"]
 
-            messages = build_eval_prompt_messages(
-                {"src_txt": src_text}, self.src_lang, self.tgt_lang
-            )
-
-            input_ids = self.tokenizer.apply_chat_template(
-                messages,
-                tokenize=True,
-                add_generation_prompt=True
-            )
+            messages = build_eval_prompt(src_text, self.src_lang, self.tgt_lang)
+            input_ids = self.tokenizer.apply_chat_template(messages, tokenize=True, add_generation_prompt=True)
 
             yield {
                 "input_ids": torch.tensor(input_ids, dtype=torch.long),
@@ -83,30 +78,26 @@ class EvalDataset(IterableDataset):
                 "src_text": src_text.strip()
             }
 
-# ---------------------- Collate Function ------------------------
+# ---------------------- COLLATE ----------------------
 def eval_collate_fn(batch, tokenizer):
     input_ids = [x["input_ids"] for x in batch]
     refs = [x["reference"] for x in batch]
     src_texts = [x["src_text"] for x in batch]
 
-    enc = tokenizer.pad(
-        {"input_ids": input_ids},
-        padding=True,
-        return_tensors="pt"
-    )
-
+    enc = tokenizer.pad({"input_ids": input_ids}, padding=True, return_tensors="pt")
     return enc["input_ids"], enc["attention_mask"], refs, src_texts
 
-# -------------------- Generation -----------------
-def generate_batch(model, tokenizer, input_ids, attention_mask):
+# ---------------------- GENERATE ----------------------
+def generate_batch(model, tokenizer, input_ids, attention_mask, tgt_lang):
+    max_new_tokens = MAX_TOKENS[tgt_lang]
     with torch.no_grad():
         outputs = model.generate(
             input_ids=input_ids.to(model.device),
             attention_mask=attention_mask.to(model.device),
-            max_new_tokens=MAX_NEW_TOKENS,
+            max_new_tokens=max_new_tokens,
             do_sample=False,
             eos_token_id=tokenizer.eos_token_id,
-            pad_token_id=tokenizer.pad_token_id,
+            pad_token_id=tokenizer.pad_token_id
         )
 
     preds = []
@@ -114,19 +105,18 @@ def generate_batch(model, tokenizer, input_ids, attention_mask):
         prompt_len = attention_mask[i].sum().item()
         gen_ids = outputs[i][prompt_len:]
         preds.append(tokenizer.decode(gen_ids, skip_special_tokens=True).strip())
-
     return preds
 
-# ------------------ Dataset Loader ----------------------
-def load_pralekha():
-    return load_dataset(
-        "ai4bharat/Pralekha",
-        name="train",
-        split="eng_hin",
-        streaming=True
-    )
+# ---------------------- LOAD DATA ----------------------
+def load_pralekha(split="train"):
+    dataset_name = "ai4bharat/Pralekha"
+    config_name = "train"
+    dataset = load_dataset(dataset_name, split=f"eng_hin", streaming=True, name=config_name)
+    if MAX_SAMPLES:
+        dataset = dataset.take(MAX_SAMPLES)
+    return dataset
 
-# ----------------- Evaluation Function --------------------------
+# ---------------------- EVALUATE ----------------------
 def evaluate_direction(model, tokenizer, src_lang, tgt_lang, jsonl_files):
     raw_ds = load_pralekha()
     eval_ds = EvalDataset(raw_ds, tokenizer, src_lang, tgt_lang)
@@ -145,7 +135,7 @@ def evaluate_direction(model, tokenizer, src_lang, tgt_lang, jsonl_files):
     with open(jsonl_file, "w", encoding="utf-8") as f:
         pbar = tqdm(desc=f"Evaluating {src_lang}→{tgt_lang}")
         for input_ids, attention_mask, batch_refs, batch_srcs in loader:
-            batch_preds = generate_batch(model, tokenizer, input_ids, attention_mask)
+            batch_preds = generate_batch(model, tokenizer, input_ids, attention_mask, tgt_lang)
 
             for p, r, s in zip(batch_preds, batch_refs, batch_srcs):
                 f.write(json.dumps({"src": s, "prediction": p, "reference": r}, ensure_ascii=False) + "\n")
@@ -167,7 +157,7 @@ def evaluate_direction(model, tokenizer, src_lang, tgt_lang, jsonl_files):
 
     print(f"{src_lang}→{tgt_lang} | BLEU={bleu:.2f} | chrF={chrf:.3f}")
 
-    # Show top 10 predictions + references
+    # Top-10 preview
     print("\nTop 10 examples:")
     for i in range(min(10, len(preds))):
         print(f"{i+1}. SRC: {src_texts[i]}")
@@ -176,10 +166,9 @@ def evaluate_direction(model, tokenizer, src_lang, tgt_lang, jsonl_files):
 
     return bleu, chrf
 
-# ------------------------- MAIN ----------------------------
+# ---------------------- MAIN ----------------------
 if __name__ == "__main__":
     model, tokenizer = load_model()
-
     results = {}
     jsonl_files = []
 
@@ -191,8 +180,8 @@ if __name__ == "__main__":
     for k, (b, c) in results.items():
         print(f"{k}: BLEU={b:.2f}, chrF={c:.3f}")
 
-    # ------------------ ZIP EXPORT -------------------------
-    zip_path = OUTPUT_DIR / "pred_refs_baseline.zip"
+    # ZIP all JSONL
+    zip_path = OUTPUT_DIR / "pred_refs_zero_shot.zip"
     with zipfile.ZipFile(zip_path, "w") as zipf:
         for f in jsonl_files:
             zipf.write(f, arcname=f.name)
