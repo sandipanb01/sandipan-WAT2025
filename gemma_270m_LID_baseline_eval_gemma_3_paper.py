@@ -238,3 +238,17 @@ for csv in csv_files:
 
 # Save the analysis
 pd.DataFrame(analysis_results).to_csv(results_dir / "copy_analysis.csv", index=False)
+
+#-------------YAPPING FAILURE (THE MODEL SHOWS A LANGUAGE COLLAPSE HERE)-----SO---A "SMOKING GUN TEST-------------------
+import pandas as pd
+from pathlib import Path
+
+# Load your results
+file_path = Path("./gemma3_strict_baseline/eng_hin_test.csv")
+if file_path.exists():
+    df = pd.read_csv(file_path)
+    print("--- FIRST 3 SAMPLES OF MODEL YAPPING ---")
+    for i, row in df.head(3).iterrows():
+        print(f"\nSource: {row['src']}")
+        print(f"Pred:   {row['pred']}")
+        print(f"Ref:    {row['ref']}")
