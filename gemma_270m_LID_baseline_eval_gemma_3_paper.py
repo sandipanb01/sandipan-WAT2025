@@ -200,3 +200,41 @@ def main():
 
 if __name__ == "__main__":
     main()
+#------------RUN IN A SEPARARTE CELL TO CHECK WRT YOUR CSV FILES IF THE MODEL IS CHEATING----------------    
+import pandas as pd
+from pathlib import Path
+from difflib import SequenceMatcher
+
+def similarity(a, b):
+    return SequenceMatcher(None, a.lower(), b.lower()).ratio()
+
+def analyze_copy_rate(csv_path):
+    df = pd.read_csv(csv_path)
+    
+    # 1. Exact Match: Pred is identical to Source
+    df['is_exact_copy'] = df.apply(lambda row: str(row['pred']).strip() == str(row['src']).strip(), axis=1)
+    
+    # 2. Fuzzy Copy: Pred is >80% similar to Source (catches minor punctuation changes)
+    df['is_fuzzy_copy'] = df.apply(lambda row: similarity(str(row['pred']), str(row['src'])) > 0.8, axis=1)
+    
+    exact_rate = df['is_exact_copy'].mean() * 100
+    fuzzy_rate = df['is_fuzzy_copy'].mean() * 100
+    
+    return exact_rate, fuzzy_rate
+
+# Path to your results directory
+results_dir = Path("./gemma3_strict_baseline")
+csv_files = list(results_dir.glob("*_test.csv"))
+
+print(f"{'Direction':<15} | {'Exact Copy %':<15} | {'Fuzzy Copy %':<15}")
+print("-" * 50)
+
+analysis_results = []
+for csv in csv_files:
+    exact, fuzzy = analyze_copy_rate(csv)
+    direction = csv.stem.replace("_test", "")
+    print(f"{direction:<15} | {exact:<15.2f} | {fuzzy:<15.2f}")
+    analysis_results.append({"direction": direction, "exact_copy_rate": exact, "fuzzy_copy_rate": fuzzy})
+
+# Save the analysis
+pd.DataFrame(analysis_results).to_csv(results_dir / "copy_analysis.csv", index=False)
