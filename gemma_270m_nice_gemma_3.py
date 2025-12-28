@@ -211,3 +211,97 @@ sample = df.iloc[0]
 print(f"\n[SAMPLE TEST - {sample['mode']}]")
 print(f"Source: {sample['source'][:70]}")
 print(f"Pred:   {sample['prediction'][:70]}")
+# ============================================================
+# 📊 POST-HOC STRICT EVAL CELL (SRC / PRED / REF)
+# BLEU + chrF + LID Sanity Check
+# ============================================================
+
+import json
+import sacrebleu
+import pandas as pd
+import numpy as np
+from langdetect import detect
+import unicodedata
+from collections import Counter
+
+# ---------------------------
+# Load saved evaluation JSON
+# ---------------------------
+EVAL_JSON = "final_eval_strict.json"
+
+with open(EVAL_JSON, "r", encoding="utf-8") as f:
+    data = json.load(f)
+
+df = pd.DataFrame(data)
+print(f"Loaded {len(df)} translation records")
+
+# ---------------------------
+# Helper: Script-based Hindi check
+# ---------------------------
+def is_hindi_script(text):
+    for char in text:
+        if 'DEVANAGARI' in unicodedata.name(char, ''):
+            return True
+    return False
+
+# ---------------------------
+# Split by direction
+# ---------------------------
+e2h = df[df["mode"] == "ENG_to_HIN"]
+h2e = df[df["mode"] == "HIN_to_ENG"]
+
+# ---------------------------
+# BLEU + chrF
+# ---------------------------
+def compute_metrics(sub_df):
+    preds = sub_df["prediction"].tolist()
+    refs  = sub_df["reference"].tolist()
+    bleu = sacrebleu.corpus_bleu(preds, [refs]).score
+    chrf = sacrebleu.corpus_chrf(preds, [refs]).score
+    return round(bleu, 2), round(chrf, 2)
+
+e2h_bleu, e2h_chrf = compute_metrics(e2h)
+h2e_bleu, h2e_chrf = compute_metrics(h2e)
+
+# ---------------------------
+# LID Accuracy
+# ---------------------------
+lid_results = []
+
+for _, row in df.iterrows():
+    try:
+        lid = detect(row["prediction"])
+    except:
+        lid = "unknown"
+
+    if row["mode"] == "ENG_to_HIN":
+        lid_results.append(is_hindi_script(row["prediction"]))
+    else:
+        lid_results.append(not is_hindi_script(row["prediction"]))
+
+lid_accuracy = np.mean(lid_results)
+
+# ---------------------------
+# REPORT
+# ---------------------------
+print("\n" + "="*60)
+print("📐 STRICT POST-HOC METRICS")
+print("="*60)
+print(f"ENG → HIN | BLEU: {e2h_bleu} | chrF: {e2h_chrf}")
+print(f"HIN → ENG | BLEU: {h2e_bleu} | chrF: {h2e_chrf}")
+print("-" * 60)
+print(f"LID Script Accuracy: {lid_accuracy:.2%}")
+print("="*60)
+
+# ---------------------------
+# Human Sanity Samples
+# ---------------------------
+print("\n🧪 QUALITATIVE SANITY CHECK (5 Samples)\n")
+
+for i in range(5):
+    row = df.iloc[i]
+    print(f"[{i+1}] MODE: {row['mode']}")
+    print("SRC :", row["source"][:120])
+    print("REF :", row["reference"][:120])
+    print("PRED:", row["prediction"][:120])
+    print("-"*60)
