@@ -305,3 +305,59 @@ for i in range(5):
     print("REF :", row["reference"][:120])
     print("PRED:", row["prediction"][:120])
     print("-"*60)
+# ============================================================
+# CREATE CLEAN JSONL FILES (SRC / REF / PRED ONLY)
+# ============================================================
+
+import json
+from pathlib import Path
+
+# Load your final evaluation JSON
+with open("final_eval_strict.json", "r", encoding="utf-8") as f:
+    records = json.load(f)
+
+out_dir = Path("exports_jsonl")
+out_dir.mkdir(exist_ok=True)
+
+eng_hin_path = out_dir / "eng_to_hin_src_ref_pred.jsonl"
+hin_eng_path = out_dir / "hin_to_eng_src_ref_pred.jsonl"
+
+eng_hin_count = 0
+hin_eng_count = 0
+
+with open(eng_hin_path, "w", encoding="utf-8") as f_eng, \
+     open(hin_eng_path, "w", encoding="utf-8") as f_hin:
+
+    for r in records:
+        line = {
+            "src": r["source"],
+            "ref": r["reference"],
+            "pred": r["prediction"]
+        }
+
+        if r["mode"] == "ENG_to_HIN":
+            f_eng.write(json.dumps(line, ensure_ascii=False) + "\n")
+            eng_hin_count += 1
+
+        elif r["mode"] == "HIN_to_ENG":
+            f_hin.write(json.dumps(line, ensure_ascii=False) + "\n")
+            hin_eng_count += 1
+
+print(f"✅ ENG→HIN JSONL records: {eng_hin_count}")
+print(f"✅ HIN→ENG JSONL records: {hin_eng_count}")
+print(f"📂 Files saved in: {out_dir.resolve()}")
+# ============================================================
+# ZIP & DOWNLOAD JSONL FILES (COLAB) #OPTIONAL, MIGHT NOT WORK WITH VS CODE
+# ============================================================
+
+import shutil
+from google.colab import files
+
+zip_name = "translation_jsonl_outputs"
+shutil.make_archive(
+    base_name=zip_name,
+    format="zip",
+    root_dir="exports_jsonl"
+)
+
+files.download(f"{zip_name}.zip")
