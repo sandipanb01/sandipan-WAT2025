@@ -268,6 +268,45 @@ print(f"✅ ENG→HIN JSONL records: {eng_hin_count}")
 print(f"✅ HIN→ENG JSONL records: {hin_eng_count}")
 print(f"📂 Saved in: {out_dir.resolve()}")
 # ============================================================
+# 📊 SAVE FINAL METRICS AS CSV + COLAB DOWNLOAD
+# ============================================================
+
+import pandas as pd
+from pathlib import Path
+
+scores_path = Path(f"{OUTPUT_DIR}/baseline_scores.csv")
+
+scores_df = pd.DataFrame([
+    {
+        "model": MODEL_ID,
+        "eval_samples": EVAL_SAMPLES,
+        "direction": "ENG_to_HIN",
+        "BLEU": e2h_bleu,
+        "chrF": e2h_chrf,
+        "LID_script_accuracy": lid_accuracy
+    },
+    {
+        "model": MODEL_ID,
+        "eval_samples": EVAL_SAMPLES,
+        "direction": "HIN_to_ENG",
+        "BLEU": h2e_bleu,
+        "chrF": h2e_chrf,
+        "LID_script_accuracy": lid_accuracy
+    }
+])
+
+scores_df.to_csv(scores_path, index=False)
+
+print(f"✅ Scores CSV saved at: {scores_path.resolve()}")
+
+# --- Colab download ---
+try:
+    from google.colab import files
+    files.download(str(scores_path))
+except ImportError:
+    print("⚠️ google.colab not available — CSV saved locally only.")
+
+# ============================================================
 # ZIP & DOWNLOAD JSONL FILES (OPTIONAL AND FOR COLAB ONLY)
 # ============================================================
 
