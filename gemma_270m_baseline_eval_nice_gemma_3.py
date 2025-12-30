@@ -267,3 +267,29 @@ with open(eng_hin_path, "w", encoding="utf-8") as f_eng, \
 print(f"✅ ENG→HIN JSONL records: {eng_hin_count}")
 print(f"✅ HIN→ENG JSONL records: {hin_eng_count}")
 print(f"📂 Saved in: {out_dir.resolve()}")
+# ============================================================
+# ZIP & DOWNLOAD JSONL FILES (OPTIONAL AND FOR COLAB ONLY)
+# ============================================================
+
+import shutil
+from pathlib import Path
+
+# Directory where JSONL files were saved
+jsonl_dir = Path(f"{OUTPUT_DIR}/jsonl_exports")
+zip_path = Path(f"{OUTPUT_DIR}/jsonl_exports.zip")
+
+# Create zip archive
+shutil.make_archive(
+    base_name=str(zip_path).replace(".zip", ""),
+    format="zip",
+    root_dir=jsonl_dir
+)
+
+print(f"📦 ZIP created at: {zip_path.resolve()}")
+
+# --- Colab download ---
+try:
+    from google.colab import files
+    files.download(str(zip_path))
+except ImportError:
+    print("⚠️ google.colab not available — ZIP saved locally only.")
