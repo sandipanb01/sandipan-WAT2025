@@ -260,6 +260,7 @@ for i in range(min(5, len(df_post))):
     row = df_post.iloc[i]
     print(f"[{i+1}] MODE: {row['mode']}")
     print("SRC :", row["source"][:100])
+    print("REF :", row["reference"][:100]) # STRICTLY ADDED: REF inclusion
     print("PRED:", row["prediction"][:100])
     print("-"*60)
 
