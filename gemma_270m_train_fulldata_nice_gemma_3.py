@@ -50,11 +50,18 @@ filtered_dataset = raw_dataset.filter(strict_filter)
 t_limit = MAX_TRAIN_SAMPLES if MAX_TRAIN_SAMPLES is not None else len(filtered_dataset)
 e_limit = EVAL_SAMPLES if EVAL_SAMPLES is not None else len(filtered_dataset)
 
-train_set = filtered_dataset.shuffle(seed=42).select(range(min(len(filtered_dataset), t_limit)))
+# --- NEW: Training/Validation Split (90/10) ---
+full_train_pool = filtered_dataset.shuffle(seed=42).select(range(min(len(filtered_dataset), t_limit)))
+split_data = full_train_pool.train_test_split(test_size=0.1, seed=42)
+train_set = split_data["train"]
+val_set = split_data["test"]
+
+# Test set for final evaluation
 test_set = filtered_dataset.shuffle(seed=99).select(range(min(len(filtered_dataset), e_limit)))
 
 print(f"📊 Training on: {len(train_set)} samples")
-print(f"📊 Evaluating on: {len(test_set)} samples")
+print(f"📊 Validation on: {len(val_set)} samples")
+print(f"📊 Final Eval on: {len(test_set)} samples")
 
 # ============================================================
 # 2. MODEL & LoRA CONFIG (Paper-Safe Standards)
@@ -97,13 +104,15 @@ def formatting_prompts_func(example):
     return {"text": texts}
 
 dataset = train_set.map(formatting_prompts_func, batched=True, remove_columns=train_set.column_names)
+val_dataset = val_set.map(formatting_prompts_func, batched=True, remove_columns=val_set.column_names)
 
 # ============================================================
-# 4. TRAINING EXECUTION
+# 4. TRAINING EXECUTION (Optimized for Full Dataset)
 # ============================================================
 trainer = SFTTrainer(
     model=model,
     train_dataset=dataset,
+    eval_dataset=val_dataset, # Model checks this during training
     peft_config=peft_config,
     args=SFTConfig(
         output_dir=OUTPUT_DIR,
@@ -113,13 +122,25 @@ trainer = SFTTrainer(
         learning_rate=2e-4, 
         num_train_epochs=2,
         logging_steps=10,
-        completion_only_loss=True, # Loss calculated only on model response
+        
+        # --- MODIFICATIONS: Scheduler & Validation ---
+        eval_strategy="steps",           # Evaluate every X steps
+        eval_steps=50,                  # Check val loss every 50 steps
+        lr_scheduler_type="cosine",      # Smoothly decays the learning rate
+        warmup_ratio=0.1,                # Spends first 10% of steps "warming up"
+        weight_decay=0.01,               # Prevents LoRA weights from exploding
+        # ------------------------------
+
+        completion_only_loss=True, 
         save_strategy="no",
         report_to="none"
     ),
 )
 
-print("🚀 Starting Strict Bidirectional Training...")
+print(f"🚀 Starting Training...")
+print(f"Effective Batch Size: {2 * 8}")
+print(f"Scheduler: Cosine with 10% Warmup")
+
 trainer.train()
 
 # MODIFICATION: Correctly access PEFT model and merge
