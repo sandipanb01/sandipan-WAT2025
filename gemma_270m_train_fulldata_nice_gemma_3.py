@@ -75,7 +75,7 @@ model = AutoModelForCausalLM.from_pretrained(
     torch_dtype=torch.float32, 
     device_map="auto"
 )
-
+# model.config.use_cache = False
 # High-rank LoRA for cross-script mapping (Devanagari vs Latin)
 peft_config = LoraConfig(
     r=64,
