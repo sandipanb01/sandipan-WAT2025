@@ -66,6 +66,7 @@ model = AutoModelForCausalLM.from_pretrained(
     device_map="auto",
     attn_implementation="flash_attention_2"
 )
+model.config.use_cache = False
 
 # High-rank LoRA for cross-script mapping (Devanagari vs Latin)
 peft_config = LoraConfig(
