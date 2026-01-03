@@ -63,8 +63,7 @@ tokenizer.padding_side = "right"
 model = AutoModelForCausalLM.from_pretrained(
     MODEL_ID,
     torch_dtype=torch.bfloat16, 
-    device_map="auto",
-    attn_implementation="flash_attention_2"
+    device_map="auto"
 )
 model.config.use_cache = False
 
