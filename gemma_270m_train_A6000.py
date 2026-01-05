@@ -22,7 +22,7 @@ def install_and_import(package):
 install_and_import("langdetect")
 from langdetect import detect, DetectorFactory
 DetectorFactory.seed = 42
-set_seed(42) # Yann LeCun Suggestion: Ensure strict reproducibility
+set_seed(42) 
 
 # ============================================================
 # 1. CONFIGURATION & STRICT FILTERING (Anti-Cheating)
@@ -33,7 +33,7 @@ OUTPUT_DIR = "./gemma3-strict-bidirectional"
 
 # MODIFICATION: Set to None for FULL DATASET
 MAX_TRAIN_SAMPLES = None 
-EVAL_SAMPLES = None
+EVAL_SAMPLES = 10000 
 
 def strict_filter(example):
     """
@@ -121,7 +121,7 @@ trainer = SFTTrainer(
     ),
 )
 
-print(f"🚀 Starting Full Dataset Training ({len(train_set)} samples)...")
+print(f"Starting Full Dataset Training ({len(train_set)} samples)...")
 trainer.train()
 
 # MODIFICATION: Correctly access PEFT model and merge
@@ -139,7 +139,7 @@ tokenizer.save_pretrained(f"{OUTPUT_DIR}/final_merged")
 results = []
 metrics = {"ENG_to_HIN": {"preds": [], "refs": []}, "HIN_to_ENG": {"preds": [], "refs": []}}
 
-print(f"📝 Evaluating {len(test_set)} samples...")
+print(f"Evaluating {len(test_set)} samples...")
 
 for sample in tqdm(test_set):
     pairs = [
@@ -224,7 +224,7 @@ print(f"\n[SAMPLE TEST - {sample['mode']}]")
 print(f"Source: {sample['source'][:70]}")
 print(f"Pred:   {sample['prediction'][:70]}")
 # ============================================================
-# 📊 POST-HOC STRICT EVAL CELL (SRC / PRED / REF)
+# POST-HOC STRICT EVAL CELL (SRC / PRED / REF)
 # BLEU + chrF + LID Sanity Check
 # ============================================================
 
@@ -297,7 +297,7 @@ lid_accuracy = np.mean(lid_results)
 # REPORT
 # ---------------------------
 print("\n" + "="*60)
-print("📐 STRICT POST-HOC METRICS")
+print("STRICT POST-HOC METRICS")
 print("="*60)
 print(f"ENG → HIN | BLEU: {e2h_bleu} | chrF: {e2h_chrf}")
 print(f"HIN → ENG | BLEU: {h2e_bleu} | chrF: {h2e_chrf}")
@@ -308,7 +308,7 @@ print("="*60)
 # ---------------------------
 # Human Sanity Samples
 # ---------------------------
-print("\n🧪 QUALITATIVE SANITY CHECK (5 Samples)\n")
+print("\n QUALITATIVE SANITY CHECK (5 Samples)\n")
 
 for i in range(5):
     row = df.iloc[i]
@@ -355,9 +355,9 @@ with open(eng_hin_path, "w", encoding="utf-8") as f_eng, \
             f_hin.write(json.dumps(line, ensure_ascii=False) + "\n")
             hin_eng_count += 1
 
-print(f"✅ ENG→HIN JSONL records: {eng_hin_count}")
-print(f"✅ HIN→ENG JSONL records: {hin_eng_count}")
-print(f"📂 Files saved in: {out_dir.resolve()}")
+print(f"ENG→HIN JSONL records: {eng_hin_count}")
+print(f"HIN→ENG JSONL records: {hin_eng_count}")
+print(f"Files saved in: {out_dir.resolve()}")
 # ============================================================
 # ZIP & DOWNLOAD JSONL FILES (COLAB) #OPTIONAL, MIGHT NOT WORK WITH VS CODE
 # ============================================================
