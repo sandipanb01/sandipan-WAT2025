@@ -32,8 +32,8 @@ DATASET_NAME = "ai4bharat/Pralekha"
 OUTPUT_DIR = "./gemma3-strict-bidirectional"
 
 # MODIFICATION: Set to None for FULL DATASET
-MAX_TRAIN_SAMPLES = None 
-EVAL_SAMPLES = None
+MAX_TRAIN_SAMPLES = 100  
+EVAL_SAMPLES = 50
 
 def strict_filter(example):
     """
@@ -110,8 +110,11 @@ trainer = SFTTrainer(
         learning_rate=2e-4, 
         num_train_epochs=10,
         logging_steps=10,
+        lr_scheduler_type="cosine",
+        warmup_ratio=0.1,
         completion_only_loss=True, # Loss calculated only on model response
         save_strategy="no",
+        gradient_checkpointing=True,
         report_to="none"
     ),
 )
