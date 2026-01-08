@@ -32,7 +32,7 @@ DATASET_NAME = "ai4bharat/Pralekha"
 OUTPUT_DIR = "./gemma3-strict-bidirectional"
 
 # MODIFICATION: Set to None for FULL DATASET
-MAX_TRAIN_SAMPLES = None 
+MAX_TRAIN_SAMPLES = None  
 EVAL_SAMPLES = 10000
 
 def strict_filter(example):
@@ -105,7 +105,7 @@ trainer = SFTTrainer(
     args=SFTConfig(
         output_dir=OUTPUT_DIR,
         dataset_text_field="text",
-        per_device_train_batch_size=4,
+        per_device_train_batch_size=2,
         gradient_accumulation_steps=8,
         learning_rate=2e-4, 
         num_train_epochs=10,
