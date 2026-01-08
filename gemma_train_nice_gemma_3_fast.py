@@ -31,8 +31,8 @@ MODEL_ID = "google/gemma-3-270m-it"
 DATASET_NAME = "ai4bharat/Pralekha"
 OUTPUT_DIR = "./gemma3-strict-bidirectional"
 
-MAX_TRAIN_SAMPLES = None 
-EVAL_SAMPLES = None
+MAX_TRAIN_SAMPLES = 100 
+EVAL_SAMPLES = 50
 
 def strict_filter(example):
     sim = SequenceMatcher(None, example["src_txt"].lower(), example["tgt_txt"].lower()).ratio()
@@ -48,12 +48,13 @@ train_set = filtered_dataset.shuffle(seed=42).select(range(t_limit))
 test_set = filtered_dataset.shuffle(seed=99).select(range(e_limit))
 
 # ============================================================
-# 2. MODEL & LoRA CONFIG (SDPA Optimized)
+# 2. MODEL & LoRA CONFIG
 # ============================================================
 tokenizer = AutoTokenizer.from_pretrained(MODEL_ID)
 tokenizer.pad_token = tokenizer.eos_token
-# Left padding is required for batched generation
-tokenizer.padding_side = "left" 
+
+# PRODUCTION MODE: Right padding for Training
+tokenizer.padding_side = "right" 
 
 model = AutoModelForCausalLM.from_pretrained(
     MODEL_ID,
@@ -65,7 +66,7 @@ model = AutoModelForCausalLM.from_pretrained(
 peft_config = LoraConfig(
     r=64,
     lora_alpha=128,
-    target_modules="all_linear",
+    target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
     task_type="CAUSAL_LM",
     bias="none"
 )
@@ -90,7 +91,7 @@ def formatting_prompts_func(example):
 dataset = train_set.map(formatting_prompts_func, batched=True, remove_columns=train_set.column_names)
 
 # ============================================================
-# 4. TRAINING EXECUTION
+# 4. TRAINING EXECUTION (Right Padding)
 # ============================================================
 trainer = SFTTrainer(
     model=model,
@@ -102,18 +103,21 @@ trainer = SFTTrainer(
         per_device_train_batch_size=2,
         gradient_accumulation_steps=8,
         learning_rate=2e-4, 
-        num_train_epochs=1,
+        num_train_epochs=10,
         logging_steps=10,
-        completion_loss=True,
+        lr_scheduler_type="cosine",
+        warmup_ratio=0.1,
+        completion_only_loss=True,
         save_strategy="no",
+        gradient_checkpointing=True,
         report_to="none"
     ),
 )
 
-print(f"Starting Full Dataset Training...")
+print(f"Starting Training with RIGHT PADDING...")
 trainer.train()
 
-print("Merging LoRA adapters into base weights...")
+print("Merging LoRA adapters...")
 model = trainer.model.merge_and_unload() 
 model.eval()
 
@@ -121,16 +125,18 @@ model.save_pretrained(f"{OUTPUT_DIR}/final_merged")
 tokenizer.save_pretrained(f"{OUTPUT_DIR}/final_merged")
 
 # ============================================================
-# 5. OPTIMIZED BATCHED EVALUATION
+# 5. OPTIMIZED BATCHED EVALUATION (Switch to Left Padding)
 # ============================================================
+# PRODUCTION MODE: Switch to Left padding for Generation
+tokenizer.padding_side = "left" 
+
 results = []
 metrics = {"ENG_to_HIN": {"preds": [], "refs": []}, "HIN_to_ENG": {"preds": [], "refs": []}}
 
-# Batch Size 
 BATCH_SIZE = 4 
 torch.cuda.empty_cache()
 
-print(f"Starting Fast Batch Evaluation on {len(test_set)} samples...")
+print(f"Starting Fast Batch Evaluation with LEFT PADDING on {len(test_set)} samples...")
 
 for i in tqdm(range(0, len(test_set), BATCH_SIZE)):
     batch = test_set.select(range(i, min(i + BATCH_SIZE, len(test_set))))
@@ -144,13 +150,15 @@ for i in tqdm(range(0, len(test_set), BATCH_SIZE)):
             srcs, refs = batch["tgt_txt"], batch["src_txt"]
 
         prompts = [f"<start_of_turn>user\n{ins}\n{s}<end_of_turn>\n<start_of_turn>model\n" for ins, s in zip(instrs, srcs)]
+        
+        # Tokenizer now uses left-padding set above
         inputs = tokenizer(prompts, return_tensors="pt", padding=True, truncation=True, max_length=512).to(model.device)
         
         with torch.no_grad():
             output_tokens = model.generate(
                 **inputs, 
                 max_new_tokens=512,
-                use_cache=True, # used for doc-level speed
+                use_cache=True, 
                 do_sample=False,
                 repetition_penalty=1.1,
                 pad_token_id=tokenizer.eos_token_id
@@ -188,34 +196,19 @@ script_accs = [(is_hindi_script(r['prediction']) if "ENG_to_HIN" in r['mode'] el
 true_lid_acc = np.mean(script_accs) if script_accs else 0
 
 df.to_csv("final_eval_strict.csv", index=False, encoding='utf-8-sig')
-with open("final_eval_strict.json", "w", encoding="utf-8") as f:
-    json.dump(results, f, ensure_ascii=False, indent=4)
 
 print("\n" + "="*50)
-print(f"STRICT METRICS (SDPA Optimized)")
+print(f"STRICT DUAL-PADDING METRICS")
 print(f"ENG -> HIN | BLEU: {e2h_bleu} | chrF: {e2h_chrf}")
 print(f"HIN -> ENG | BLEU: {h2e_bleu} | chrF: {h2e_chrf}")
 print(f"LID Script Accuracy: {true_lid_acc:.2%}")
 print("="*50)
 
 # ============================================================
-# 7. TERMINAL SAMPLE PRINTOUT (Top 10)
-# ============================================================
-print("\n QUALITATIVE SAMPLE CHECK (First 10)")
-print("-" * 80)
-for idx, item in enumerate(results[:10]):
-    print(f"SAMPLE #{idx + 1} | {item['mode']}")
-    print(f"SRC : {item['source'][:120]}...")
-    print(f"REF : {item['reference'][:120]}...")
-    print(f"PRED: {item['prediction'][:120]}...")
-    print("-" * 80)
-
-# ============================================================
-# CREATE CLEAN JSONL & ZIP (Colab)
+# CREATE CLEAN JSONL & ZIP
 # ============================================================
 out_dir = Path("exports_jsonl")
 out_dir.mkdir(exist_ok=True)
-
 with open(out_dir / "eng_to_hin.jsonl", "w") as f_e, open(out_dir / "hin_to_eng.jsonl", "w") as f_h:
     for r in results:
         line = json.dumps({"src": r["source"], "ref": r["reference"], "pred": r["prediction"]}, ensure_ascii=False) + "\n"
@@ -229,3 +222,30 @@ try:
     files.download("translation_results.zip")
 except:
     print(f"Results saved to {out_dir}")
+# ============================================================
+# NEW COLAB CELL: VISUAL QUALITATIVE CHECK
+# ============================================================
+from google.colab import data_table
+import pandas as pd
+
+# Enable interactive data tables 
+data_table.enable_dataframe_formatter()
+
+# Create a display-friendly version of the first 10 results
+# We select only the most important columns for a quick visual audit
+visual_df = df[['mode', 'source', 'reference', 'prediction']].head(10)
+
+# Rename columns for clarity in the UI
+visual_df.columns = ['Direction', 'Source Text', 'Ground Truth (Ref)', 'Model Prediction (Pred)']
+
+print("✨ TOP 10 TRANSLATION SAMPLES (Interactive View)")
+display(visual_df)
+
+# Optional: Print a colored summary if you want to see them in standard output too
+print("\n" + "—" * 50)
+for idx, row in visual_df.iterrows():
+    print(f"👉 SAMPLE #{idx+1} | {row['Direction']}")
+    print(f"   SRC: {row['Source Text'][:150]}...")
+    print(f"   REF: {row['Ground Truth (Ref)'][:150]}...")
+    print(f"   PRED: {row['Model Prediction (Pred)'][:150]}...")
+    print("—" * 50)    
