@@ -160,7 +160,7 @@ for i in tqdm(range(0, len(test_set), BATCH_SIZE)):
                 max_new_tokens=512,
                 use_cache=True, 
                 do_sample=False,
-                repetition_penalty=1.1,
+                repetition_penalty=0.1,
                 pad_token_id=tokenizer.eos_token_id
             )
         
