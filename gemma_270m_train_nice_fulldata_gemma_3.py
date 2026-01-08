@@ -368,3 +368,30 @@ shutil.make_archive(
 )
 
 files.download(f"{zip_name}.zip")
+# ============================================================
+# VISUAL QUALITATIVE CHECK (for COLAB)
+# ============================================================
+from google.colab import data_table
+import pandas as pd
+
+# Enable interactive data tables
+data_table.enable_dataframe_formatter()
+
+# Create a display-friendly version of the first 10 results
+# We select only the most important columns for a quick visual audit
+visual_df = df[['mode', 'source', 'reference', 'prediction']].head(10)
+
+# Rename columns for clarity in the UI
+visual_df.columns = ['Direction', 'Source Text', 'Ground Truth (Ref)', 'Model Prediction (Pred)']
+
+print("✨ TOP 10 TRANSLATION SAMPLES (Interactive View)")
+display(visual_df)
+
+# Optional: Print a colored summary if you want to see them in standard output too
+print("\n" + "—" * 50)
+for idx, row in visual_df.iterrows():
+    print(f"👉 SAMPLE #{idx+1} | {row['Direction']}")
+    print(f"   SRC: {row['Source Text'][:150]}...")
+    print(f"   REF: {row['Ground Truth (Ref)'][:150]}...")
+    print(f"   PRED: {row['Model Prediction (Pred)'][:150]}...")
+    print("—" * 50)
