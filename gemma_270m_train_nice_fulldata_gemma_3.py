@@ -369,29 +369,37 @@ shutil.make_archive(
 
 files.download(f"{zip_name}.zip")
 # ============================================================
-# VISUAL QUALITATIVE CHECK (for COLAB)
+# UNIVERSAL VISUAL CHECK (Works in Colab & VS Code)
 # ============================================================
-from google.colab import data_table
 import pandas as pd
+import sys
 
-# Enable interactive data tables
-data_table.enable_dataframe_formatter()
-
-# Create a display-friendly version of the first 10 results
-# We select only the most important columns for a quick visual audit
+# 1. Prepare the data
 visual_df = df[['mode', 'source', 'reference', 'prediction']].head(10)
-
-# Rename columns for clarity in the UI
 visual_df.columns = ['Direction', 'Source Text', 'Ground Truth (Ref)', 'Model Prediction (Pred)']
 
-print("✨ TOP 10 TRANSLATION SAMPLES (Interactive View)")
-display(visual_df)
+# 2. Environment-Specific Display
+is_colab = 'google.colab' in sys.modules
 
-# Optional: Print a colored summary if you want to see them in standard output too
-print("\n" + "—" * 50)
+if is_colab:
+    from google.colab import data_table
+    data_table.enable_dataframe_formatter()
+    print("✨ COLAB MODE: Interactive Table Enabled")
+    display(visual_df)
+else:
+    # VS Code / Terminal Mode
+    print("✨ VS CODE MODE: Printing Summary Table")
+    # We use to_string() to ensure the terminal doesn't cut off the middle columns
+    print(visual_df.to_string(index=False, max_colwidth=50))
+
+# 3. Universal Detailed Text View (Best for comparing scripts/characters)
+print("\n" + "═" * 80)
+print("📝 DETAILED SAMPLES (Top 10)")
+print("═" * 80)
+
 for idx, row in visual_df.iterrows():
-    print(f"👉 SAMPLE #{idx+1} | {row['Direction']}")
-    print(f"   SRC: {row['Source Text'][:150]}...")
-    print(f"   REF: {row['Ground Truth (Ref)'][:150]}...")
-    print(f"   PRED: {row['Model Prediction (Pred)'][:150]}...")
-    print("—" * 50)
+    print(f"📍 SAMPLE #{idx+1} | {row['Direction']}")
+    print(f"   [SRC]: {row['Source Text']}")
+    print(f"   [REF]: {row['Ground Truth (Ref)']}")
+    print(f"   [PRED]: {row['Model Prediction (Pred)']}")
+    print("-" * 80)
