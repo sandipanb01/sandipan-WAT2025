@@ -161,9 +161,6 @@ model.eval() # Ensure dropout/norm layers are in eval mode
 results = []
 metrics = {"ENG_to_HIN": {"preds": [], "refs": []}, "HIN_to_ENG": {"preds": [], "refs": []}}
 
-# Use the EOS token from the tokenizer to stop generation early
-stop_token_id = tokenizer.eos_token_id 
-
 for sample in tqdm(test_set):
     pairs = [
         ("ENG_to_HIN", "Translate to HINDI DEVANAGARI:", sample["src_txt"], sample["tgt_txt"]),
