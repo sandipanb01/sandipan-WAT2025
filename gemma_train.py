@@ -31,13 +31,21 @@ MODEL_ID = "google/gemma-3-270m-it"
 DATASET_NAME = "ai4bharat/Pralekha"
 OUTPUT_DIR = "./gemma3-strict-bidirectional"
 
-# TOGGLES (STRICT PRALAKHA)
-TRAIN_CONFIG = "train"    
-EVAL_CONFIG  = "test"      
+TRAIN_CONFIG = "train"
+EVAL_CONFIG  = "test"
 
-# Set to None for FULL run
 MAX_TRAIN_SAMPLES = 100
 EVAL_SAMPLES = 50
+
+MAX_SRC_LEN = 2400
+MAX_TGT_LEN = 2400
+
+# ----------------------------
+# Load tokenizer EARLY (needed for filtering)
+# ----------------------------
+tokenizer = AutoTokenizer.from_pretrained(MODEL_ID)
+tokenizer.pad_token = tokenizer.eos_token
+tokenizer.padding_side = "right"
 
 def strict_filter(example):
     sim = SequenceMatcher(
@@ -47,8 +55,17 @@ def strict_filter(example):
     ).ratio()
     return sim < 0.65
 
+def length_filter(example):
+    src_len = len(
+        tokenizer(example["src_txt"], add_special_tokens=True, truncation=False)["input_ids"]
+    )
+    tgt_len = len(
+        tokenizer(example["tgt_txt"], add_special_tokens=True, truncation=False)["input_ids"]
+    )
+    return (src_len <= MAX_SRC_LEN) and (tgt_len <= MAX_TGT_LEN)
+
 # ----------------------------
-# TRAIN DATA (STRICT)
+# TRAIN DATA (STRICT + LENGTH FILTER)
 # ----------------------------
 raw_dataset = load_dataset(
     DATASET_NAME,
@@ -57,12 +74,13 @@ raw_dataset = load_dataset(
 )
 
 filtered_dataset = raw_dataset.filter(strict_filter)
+filtered_dataset = filtered_dataset.filter(length_filter)
 
 t_limit = MAX_TRAIN_SAMPLES if MAX_TRAIN_SAMPLES is not None else len(filtered_dataset)
 train_set = filtered_dataset.shuffle(seed=42).select(range(t_limit))
 
 # ----------------------------
-# OFFICIAL TEST DATA (STRICT)
+# OFFICIAL TEST DATA (STRICT + LENGTH FILTER)
 # ----------------------------
 eval_dataset = load_dataset(
     DATASET_NAME,
@@ -70,16 +88,14 @@ eval_dataset = load_dataset(
     split="eng_hin"
 )
 
+eval_dataset = eval_dataset.filter(length_filter)
+
 e_limit = EVAL_SAMPLES if EVAL_SAMPLES is not None else len(eval_dataset)
 test_set = eval_dataset.shuffle(seed=99).select(range(e_limit))
 
 # ============================================================
 # 2. MODEL & LoRA CONFIG
 # ============================================================
-tokenizer = AutoTokenizer.from_pretrained(MODEL_ID)
-tokenizer.pad_token = tokenizer.eos_token
-tokenizer.padding_side = "right"
-
 model = AutoModelForCausalLM.from_pretrained(
     MODEL_ID,
     torch_dtype=torch.float32,
@@ -103,7 +119,6 @@ peft_config = LoraConfig(
 def formatting_prompts_func(example):
     texts = []
     for i in range(len(example["src_txt"])):
-        # Balanced Bidirectional Logic
         if i % 2 == 0:
             instr, src, tgt = "Translate to HINDI DEVANAGARI:", example["src_txt"][i], example["tgt_txt"][i]
         else:
@@ -115,7 +130,11 @@ def formatting_prompts_func(example):
         )
     return {"text": texts}
 
-dataset = train_set.map(formatting_prompts_func, batched=True, remove_columns=train_set.column_names)
+dataset = train_set.map(
+    formatting_prompts_func,
+    batched=True,
+    remove_columns=train_set.column_names
+)
 
 # ============================================================
 # 4. TRAINING
@@ -179,7 +198,7 @@ for sample in tqdm(test_set):
                 max_new_tokens=512,
                 temperature=0.1,
                 do_sample=False,
-                repetition_penalty=1.1 # Yann LeCun Recommendation: Prevent loops in small models
+                repetition_penalty=1.1
             )
 
         pred = tokenizer.decode(
@@ -211,37 +230,12 @@ def calc_metrics(preds, refs):
 e2h_bleu, e2h_chrf = calc_metrics(metrics["ENG_to_HIN"]["preds"], metrics["ENG_to_HIN"]["refs"])
 h2e_bleu, h2e_chrf = calc_metrics(metrics["HIN_to_ENG"]["preds"], metrics["HIN_to_ENG"]["refs"])
 
-# ============================================================
-# 6. SCRIPT-BASED LID
-# ============================================================
-import unicodedata
-
-def is_hindi_script(text):
-    for char in text:
-        if 'DEVANAGARI' in unicodedata.name(char, ''):
-            return True
-    return False
-
-df = pd.DataFrame(results)
-
-script_accs = []
-for _, row in df.iterrows():
-    has_hindi = is_hindi_script(row["prediction"])
-    script_accs.append(
-        has_hindi if row["mode"] == "ENG_to_HIN" else not has_hindi
-    )
-
-true_lid_acc = np.mean(script_accs)
-
-df.to_csv("final_eval_strict.csv", index=False, encoding="utf-8-sig")
-with open("final_eval_strict.json", "w", encoding="utf-8") as f:
-    json.dump(results, f, ensure_ascii=False, indent=4)
-
 print("\n" + "="*50)
 print("STRICT PAPER-STANDARD METRICS")
 print(f"ENG → HIN | BLEU: {e2h_bleu} | chrF: {e2h_chrf}")
 print(f"HIN → ENG | BLEU: {h2e_bleu} | chrF: {h2e_chrf}")
-print(f"Script Accuracy: {true_lid_acc:.2%}")
+print("="*50)
+print(f"Strict Script Accuracy: {true_lid_acc:.2%}")
 print("="*50)
 
 # Final Sanity Check Printout
