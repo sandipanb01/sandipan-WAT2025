@@ -34,8 +34,8 @@ OUTPUT_DIR = "./gemma3-strict-bidirectional"
 TRAIN_CONFIG = "train"
 EVAL_CONFIG  = "test"
 #Set to None for full data
-MAX_TRAIN_SAMPLES = None
-EVAL_SAMPLES = None
+MAX_TRAIN_SAMPLES = 100
+EVAL_SAMPLES = 50
 
 MAX_SRC_LEN = 2400
 MAX_TGT_LEN = 2400
@@ -84,7 +84,7 @@ test_set = eval_dataset.shuffle(seed=99).select(range(e_limit))
 # ============================================================
 model = AutoModelForCausalLM.from_pretrained(
     MODEL_ID,
-    torch_dtype=torch.bfloat16,
+    torch_dtype=torch.float32,
     device_map="auto"
 )
 
@@ -100,21 +100,21 @@ peft_config = LoraConfig(
 )
 
 # ============================================================
-# 3. BIDIRECTIONAL FORMATTING
+# 3. BIDIRECTIONAL FORMATTING (PROMPT/COMPLETION SPLIT)
 # ============================================================
 def formatting_prompts_func(example):
-    texts = []
+    prompts = []
+    completions = []
     for i in range(len(example["src_txt"])):
         if i % 2 == 0:
             instr, src, tgt = "Translate to HINDI DEVANAGARI:", example["src_txt"][i], example["tgt_txt"][i]
         else:
             instr, src, tgt = "Translate to ENGLISH:", example["tgt_txt"][i], example["src_txt"][i]
 
-        texts.append(
-            f"<start_of_turn>user\n{instr}\n{src}<end_of_turn>\n"
-            f"<start_of_turn>model\n{tgt}<end_of_turn>"
-        )
-    return {"text": texts}
+        prompts.append(f"<start_of_turn>user\n{instr}\n{src}<end_of_turn>\n<start_of_turn>model\n")
+        completions.append(f"{tgt}<end_of_turn>")
+        
+    return {"prompt": prompts, "completion": completions}
 
 dataset = train_set.map(
     formatting_prompts_func,
@@ -131,8 +131,7 @@ trainer = SFTTrainer(
     peft_config=peft_config,
     args=SFTConfig(
         output_dir=OUTPUT_DIR,
-        dataset_text_field="text",
-        per_device_train_batch_size=4,
+        per_device_train_batch_size=2,
         gradient_accumulation_steps=8,
         max_length=4800,
         learning_rate=2e-4,
@@ -156,10 +155,14 @@ model.save_pretrained(f"{OUTPUT_DIR}/final_merged")
 tokenizer.save_pretrained(f"{OUTPUT_DIR}/final_merged")
 
 # ============================================================
-# 5. STRICT EVALUATION
+# 5. STRICT EVALUATION (A6000 & GEMMA-3 OPTIMIZED)
 # ============================================================
+model.eval() # Ensure dropout/norm layers are in eval mode
 results = []
 metrics = {"ENG_to_HIN": {"preds": [], "refs": []}, "HIN_to_ENG": {"preds": [], "refs": []}}
+
+# Use the EOS token from the tokenizer to stop generation early
+stop_token_id = tokenizer.eos_token_id 
 
 for sample in tqdm(test_set):
     pairs = [
@@ -168,11 +171,10 @@ for sample in tqdm(test_set):
     ]
 
     for mode, instr, src, ref in pairs:
-        prompt = (
-            f"<start_of_turn>user\n{instr}\n{src}<end_of_turn>\n"
-            f"<start_of_turn>model\n"
-        )
+        # MATCH THE TRAINING PROMPT EXACTLY
+        prompt = f"<start_of_turn>user\n{instr}\n{src}<end_of_turn>\n<start_of_turn>model\n"
 
+        # Ensure inputs are moved to GPU in the correct BFLOAT16 format
         inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
 
         with torch.no_grad():
@@ -181,13 +183,14 @@ for sample in tqdm(test_set):
                 max_new_tokens=MAX_TGT_LEN,
                 temperature=0.1,
                 do_sample=False,
-                repetition_penalty=1.1
+                repetition_penalty=1.1,
+                eos_token_id=stop_token_id,   # CRITICAL: Stops model at <end_of_turn>
+                pad_token_id=tokenizer.pad_token_id
             )
 
-        pred = tokenizer.decode(
-            output[0][inputs.input_ids.shape[-1]:],
-            skip_special_tokens=True
-        ).strip()
+        # Extract only the newly generated tokens
+        pred_tokens = output[0][inputs.input_ids.shape[-1]:]
+        pred = tokenizer.decode(pred_tokens, skip_special_tokens=True).strip()
 
         results.append({
             "mode": mode,
@@ -198,7 +201,6 @@ for sample in tqdm(test_set):
 
         metrics[mode]["preds"].append(pred)
         metrics[mode]["refs"].append(ref)
-
 # ============================================================
 # >>> FIX START: LID + JSON
 # ============================================================
