@@ -183,10 +183,8 @@ for sample in tqdm(test_set):
                 max_new_tokens=MAX_TGT_LEN,
                 temperature=0.1,
                 do_sample=False,
-                repetition_penalty=1.1,
-                eos_token_id=stop_token_id,   # CRITICAL: Stops model at <end_of_turn>
-                pad_token_id=tokenizer.pad_token_id
-            )
+                repetition_penalty=1.1
+         )
 
         # Extract only the newly generated tokens
         pred_tokens = output[0][inputs.input_ids.shape[-1]:]
