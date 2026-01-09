@@ -98,35 +98,24 @@ peft_config = LoraConfig(
 )
 
 # ============================================================
-# 3. BIDIRECTIONAL FORMATTING
+# 3. BIDIRECTIONAL FORMATTING (Gemma-3 Technical Format)
 # ============================================================
 def formatting_prompts_func(example):
     texts = []
     for i in range(len(example["src_txt"])):
+        # Balanced Bidirectional Logic
         if i % 2 == 0:
-            instr, src, tgt = (
-                "Translate to HINDI DEVANAGARI:",
-                example["src_txt"][i],
-                example["tgt_txt"][i]
-            )
+            instr, src, tgt = "Translate to HINDI DEVANAGARI:", example["src_txt"][i], example["tgt_txt"][i]
         else:
-            instr, src, tgt = (
-                "Translate to ENGLISH:",
-                example["tgt_txt"][i],
-                example["src_txt"][i]
-            )
-
+            instr, src, tgt = "Translate to ENGLISH:", example["tgt_txt"][i], example["src_txt"][i]
+        
         texts.append(
             f"<start_of_turn>user\n{instr}\n{src}<end_of_turn>\n"
             f"<start_of_turn>model\n{tgt}<end_of_turn>"
         )
     return {"text": texts}
 
-dataset = train_set.map(
-    formatting_prompts_func,
-    batched=True,
-    remove_columns=train_set.column_names
-)
+dataset = train_set.map(formatting_prompts_func, batched=True, remove_columns=train_set.column_names)
 
 # ============================================================
 # 4. TRAINING
@@ -166,12 +155,9 @@ tokenizer.save_pretrained(f"{OUTPUT_DIR}/final_merged")
 # 5. STRICT EVALUATION
 # ============================================================
 results = []
-metrics = {
-    "ENG_to_HIN": {"preds": [], "refs": []},
-    "HIN_to_ENG": {"preds": [], "refs": []}
-}
+metrics = {"ENG_to_HIN": {"preds": [], "refs": []}, "HIN_to_ENG": {"preds": [], "refs": []}}
 
-print(f"📝 Evaluating {len(test_set)} official test samples...")
+print(f"📝 Evaluating {len(test_set)} samples...")
 
 for sample in tqdm(test_set):
     pairs = [
@@ -193,7 +179,7 @@ for sample in tqdm(test_set):
                 max_new_tokens=512,
                 temperature=0.1,
                 do_sample=False,
-                repetition_penalty=1.1
+                repetition_penalty=1.1 # Yann LeCun Recommendation: Prevent loops in small models
             )
 
         pred = tokenizer.decode(
