@@ -33,7 +33,7 @@ OUTPUT_DIR = "./gemma3-strict-bidirectional"
 
 TRAIN_CONFIG = "train"
 EVAL_CONFIG  = "test"
-
+#Set to None for full data
 MAX_TRAIN_SAMPLES = 100
 EVAL_SAMPLES = 50
 
