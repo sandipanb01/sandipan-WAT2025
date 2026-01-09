@@ -33,10 +33,12 @@ OUTPUT_DIR = "./gemma3-strict-bidirectional"
 
 TRAIN_CONFIG = "train"
 EVAL_CONFIG  = "test"
+
 #Set to None for full data
 MAX_TRAIN_SAMPLES = 100
 EVAL_SAMPLES = 50
 
+#From the tokenizer histogram
 MAX_SRC_LEN = 2400
 MAX_TGT_LEN = 2400
 
@@ -86,7 +88,7 @@ model = AutoModelForCausalLM.from_pretrained(
     MODEL_ID,
     torch_dtype=torch.float32,
     device_map="auto"
-)
+) #for Ampere GPUs, use bfloat16
 
 peft_config = LoraConfig(
     r=64,
@@ -137,14 +139,14 @@ trainer = SFTTrainer(
         learning_rate=2e-4,
         num_train_epochs=10,
         logging_steps=10,
-        lr_scheduler_type="cosine",
+        lr_scheduler_type="cosine", 
         warmup_ratio=0.1,
-        completion_only_loss=True,
+        completion_only_loss=True, #loss only on model output
         save_strategy="no",
         gradient_checkpointing=True,
         report_to="none"
     ),
-)
+)    #Also use max_length = MAX_SRC_LENGTH + MAX_TGT_LENGTH = 4800 in the sftconfig
 
 trainer.train()
 
@@ -177,7 +179,7 @@ for sample in tqdm(test_set):
         with torch.no_grad():
             output = model.generate(
                 **inputs,
-                max_new_tokens=512,
+                max_new_tokens=512, #set max_new_tokens = MAX_TGT_LENGTH
                 temperature=0.1,
                 do_sample=False,
                 repetition_penalty=1.1
