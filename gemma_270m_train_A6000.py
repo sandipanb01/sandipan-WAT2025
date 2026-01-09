@@ -134,7 +134,7 @@ trainer = SFTTrainer(
         dataset_text_field="text",
         per_device_train_batch_size=4,
         gradient_accumulation_steps=8,
-        max_length=5000,
+        max_length=4800,
         learning_rate=2e-4,
         num_train_epochs=2,
         logging_steps=10,
@@ -178,7 +178,7 @@ for sample in tqdm(test_set):
         with torch.no_grad():
             output = model.generate(
                 **inputs,
-                max_new_tokens=2500,
+                max_new_tokens=MAX_TGT_LEN,
                 temperature=0.1,
                 do_sample=False,
                 repetition_penalty=1.1
@@ -320,21 +320,7 @@ with open(eng_hin_path, "w", encoding="utf-8") as f_eng, \
 print(f"ENG→HIN JSONL records: {eng_hin_count}")
 print(f"HIN→ENG JSONL records: {hin_eng_count}")
 print(f"Files saved in: {out_dir.resolve()}")
-# ============================================================
-# ZIP & DOWNLOAD JSONL FILES (COLAB) #OPTIONAL, MIGHT NOT WORK WITH VS CODE
-# ============================================================
 
-import shutil
-from google.colab import files
-
-zip_name = "translation_jsonl_outputs"
-shutil.make_archive(
-    base_name=zip_name,
-    format="zip",
-    root_dir="exports_jsonl"
-)
-
-files.download(f"{zip_name}.zip")
 # ============================================================
 # UNIVERSAL VISUAL CHECK (Works in Colab & VS Code)
 # ============================================================
@@ -361,7 +347,7 @@ else:
 
 # 3. Universal Detailed Text View (Best for comparing scripts/characters)
 print("\n" + "═" * 80)
-print("📝 DETAILED SAMPLES (Top 10)")
+print("DETAILED SAMPLES (Top 10)")
 print("═" * 80)
 
 for idx, row in visual_df.iterrows():
