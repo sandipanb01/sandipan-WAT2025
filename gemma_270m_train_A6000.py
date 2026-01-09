@@ -245,7 +245,7 @@ print("="*50)
 # ============================================================
 # TOP-10 QUALITATIVE (SRC / REF / PRED)
 # ============================================================
-print("\n🧪 TOP-10 DETAILED SAMPLES\n")
+print("\n TOP-10 DETAILED SAMPLES\n")
 for i in range(min(10, len(df))):
     r = df.iloc[i]
     print(f"[{i+1}] {r['mode']}")
@@ -277,8 +277,8 @@ with open(eng_path, "w", encoding="utf-8") as fe, open(hin_path, "w", encoding="
 import shutil
 shutil.make_archive("translation_outputs", "zip", out_dir)
 
-print("\n✅ JSONL + ZIP CREATED")
-print("📦 translation_outputs.zip")
+print("\n JSONL + ZIP CREATED")
+print("translation_outputs.zip")
 # ============================================================
 # CREATE CLEAN JSONL FILES (SRC / REF / PRED ONLY)
 # ============================================================
@@ -317,9 +317,9 @@ with open(eng_hin_path, "w", encoding="utf-8") as f_eng, \
             f_hin.write(json.dumps(line, ensure_ascii=False) + "\n")
             hin_eng_count += 1
 
-print(f"✅ ENG→HIN JSONL records: {eng_hin_count}")
-print(f"✅ HIN→ENG JSONL records: {hin_eng_count}")
-print(f"📂 Files saved in: {out_dir.resolve()}")
+print(f"ENG→HIN JSONL records: {eng_hin_count}")
+print(f"HIN→ENG JSONL records: {hin_eng_count}")
+print(f"Files saved in: {out_dir.resolve()}")
 # ============================================================
 # ZIP & DOWNLOAD JSONL FILES (COLAB) #OPTIONAL, MIGHT NOT WORK WITH VS CODE
 # ============================================================
@@ -351,11 +351,11 @@ is_colab = 'google.colab' in sys.modules
 if is_colab:
     from google.colab import data_table
     data_table.enable_dataframe_formatter()
-    print("✨ COLAB MODE: Interactive Table Enabled")
+    print("COLAB MODE: Interactive Table Enabled")
     display(visual_df)
 else:
     # VS Code / Terminal Mode
-    print("✨ VS CODE MODE: Printing Summary Table")
+    print("VS CODE MODE: Printing Summary Table")
     # We use to_string() to ensure the terminal doesn't cut off the middle columns
     print(visual_df.to_string(index=False, max_colwidth=50))
 
@@ -365,7 +365,7 @@ print("📝 DETAILED SAMPLES (Top 10)")
 print("═" * 80)
 
 for idx, row in visual_df.iterrows():
-    print(f"📍 SAMPLE #{idx+1} | {row['Direction']}")
+    print(f"  SAMPLE #{idx+1} | {row['Direction']}")
     print(f"   [SRC]: {row['Source Text']}")
     print(f"   [REF]: {row['Ground Truth (Ref)']}")
     print(f"   [PRED]: {row['Model Prediction (Pred)']}")
