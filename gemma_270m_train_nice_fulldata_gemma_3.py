@@ -38,7 +38,6 @@ EVAL_CONFIG  = "test"
 MAX_TRAIN_SAMPLES = 100
 EVAL_SAMPLES = 50
 
-#From the tokenizer histogram
 MAX_SRC_LEN = 2400
 MAX_TGT_LEN = 2400
 
@@ -88,7 +87,7 @@ model = AutoModelForCausalLM.from_pretrained(
     MODEL_ID,
     torch_dtype=torch.float32,
     device_map="auto"
-) #for Ampere GPUs, use bfloat16
+)
 
 peft_config = LoraConfig(
     r=64,
@@ -102,21 +101,21 @@ peft_config = LoraConfig(
 )
 
 # ============================================================
-# 3. BIDIRECTIONAL FORMATTING
+# 3. BIDIRECTIONAL FORMATTING (PROMPT/COMPLETION SPLIT)
 # ============================================================
 def formatting_prompts_func(example):
-    texts = []
+    prompts = []
+    completions = []
     for i in range(len(example["src_txt"])):
         if i % 2 == 0:
             instr, src, tgt = "Translate to HINDI DEVANAGARI:", example["src_txt"][i], example["tgt_txt"][i]
         else:
             instr, src, tgt = "Translate to ENGLISH:", example["tgt_txt"][i], example["src_txt"][i]
 
-        texts.append(
-            f"<start_of_turn>user\n{instr}\n{src}<end_of_turn>\n"
-            f"<start_of_turn>model\n{tgt}<end_of_turn>"
-        )
-    return {"text": texts}
+        prompts.append(f"<start_of_turn>user\n{instr}\n{src}<end_of_turn>\n<start_of_turn>model\n")
+        completions.append(f"{tgt}<end_of_turn>")
+
+    return {"prompt": prompts, "completion": completions}
 
 dataset = train_set.map(
     formatting_prompts_func,
@@ -133,20 +132,20 @@ trainer = SFTTrainer(
     peft_config=peft_config,
     args=SFTConfig(
         output_dir=OUTPUT_DIR,
-        dataset_text_field="text",
         per_device_train_batch_size=2,
         gradient_accumulation_steps=8,
+        max_length=4800,
         learning_rate=2e-4,
         num_train_epochs=10,
         logging_steps=10,
-        lr_scheduler_type="cosine", 
+        lr_scheduler_type="cosine",
         warmup_ratio=0.1,
-        completion_only_loss=True, #loss only on model output
+        completion_only_loss=True,
         save_strategy="no",
         gradient_checkpointing=True,
         report_to="none"
     ),
-)    #Also use max_length = MAX_SRC_LENGTH + MAX_TGT_LENGTH = 4800 in the sftconfig
+) # max_length = MAX_SRC_LENGTH + MAX_TGT_LENGTH
 
 trainer.train()
 
@@ -169,26 +168,23 @@ for sample in tqdm(test_set):
     ]
 
     for mode, instr, src, ref in pairs:
-        prompt = (
-            f"<start_of_turn>user\n{instr}\n{src}<end_of_turn>\n"
-            f"<start_of_turn>model\n"
-        )
+        # MATCH THE TRAINING PROMPT EXACTLY
+        prompt = f"<start_of_turn>user\n{instr}\n{src}<end_of_turn>\n<start_of_turn>model\n"
 
         inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
 
         with torch.no_grad():
             output = model.generate(
                 **inputs,
-                max_new_tokens=512, #set max_new_tokens = MAX_TGT_LENGTH
+                max_new_tokens=MAX_TGT_LEN,
                 temperature=0.1,
                 do_sample=False,
                 repetition_penalty=1.1
-            )
+         ) #max_new_tokens=MAX_TGT_LEN
 
-        pred = tokenizer.decode(
-            output[0][inputs.input_ids.shape[-1]:],
-            skip_special_tokens=True
-        ).strip()
+        # Extract only the newly generated tokens
+        pred_tokens = output[0][inputs.input_ids.shape[-1]:]
+        pred = tokenizer.decode(pred_tokens, skip_special_tokens=True).strip()
 
         results.append({
             "mode": mode,
@@ -199,7 +195,6 @@ for sample in tqdm(test_set):
 
         metrics[mode]["preds"].append(pred)
         metrics[mode]["refs"].append(ref)
-
 # ============================================================
 # >>> FIX START: LID + JSON
 # ============================================================
@@ -371,7 +366,3 @@ for idx, row in visual_df.iterrows():
     print(f"   [REF]: {row['Ground Truth (Ref)']}")
     print(f"   [PRED]: {row['Model Prediction (Pred)']}")
     print("-" * 80)
-
-
-
-
