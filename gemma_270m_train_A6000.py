@@ -144,7 +144,7 @@ trainer = SFTTrainer(
         gradient_checkpointing=True,
         report_to="none"
     ),
-)
+) # max_length=MAX_SRC_LENGTH+MAX_TGT_LENGTH
 
 trainer.train()
 
@@ -155,9 +155,8 @@ model.save_pretrained(f"{OUTPUT_DIR}/final_merged")
 tokenizer.save_pretrained(f"{OUTPUT_DIR}/final_merged")
 
 # ============================================================
-# 5. STRICT EVALUATION (A6000 & GEMMA-3 OPTIMIZED)
+# 5. STRICT EVALUATION 
 # ============================================================
-model.eval() # Ensure dropout/norm layers are in eval mode
 results = []
 metrics = {"ENG_to_HIN": {"preds": [], "refs": []}, "HIN_to_ENG": {"preds": [], "refs": []}}
 
@@ -181,7 +180,7 @@ for sample in tqdm(test_set):
                 temperature=0.1,
                 do_sample=False,
                 repetition_penalty=1.1
-         )
+         ) # max_new_tokens=MAX_TGT_LEN
 
         # Extract only the newly generated tokens
         pred_tokens = output[0][inputs.input_ids.shape[-1]:]
