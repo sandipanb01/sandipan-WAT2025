@@ -34,8 +34,8 @@ OUTPUT_DIR = "./gemma3-strict-bidirectional"
 TRAIN_CONFIG = "train"
 EVAL_CONFIG  = "test"
 #Set to None for full data
-MAX_TRAIN_SAMPLES = 100
-EVAL_SAMPLES = 50
+MAX_TRAIN_SAMPLES = None
+EVAL_SAMPLES = None
 
 MAX_SRC_LEN = 2400
 MAX_TGT_LEN = 2400
@@ -84,7 +84,7 @@ test_set = eval_dataset.shuffle(seed=99).select(range(e_limit))
 # ============================================================
 model = AutoModelForCausalLM.from_pretrained(
     MODEL_ID,
-    torch_dtype=torch.float32,
+    torch_dtype=torch.bfloat16,
     device_map="auto"
 )
 
