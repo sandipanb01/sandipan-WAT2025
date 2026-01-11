@@ -202,3 +202,119 @@ for i in range(min(10, len(df))):
     print("REF :", r["reference"])
     print("PRED:", r["prediction"])
     print("-" * 80)
+# ADDED ON: # ============================================================
+# EXPORT JSONL + ZIP
+# ============================================================
+out_dir = Path("exports_jsonl")
+out_dir.mkdir(exist_ok=True)
+
+eng_path = out_dir / "eng_to_hin_src_ref_pred.jsonl"
+hin_path = out_dir / "hin_to_eng_src_ref_pred.jsonl"
+
+with open(eng_path, "w", encoding="utf-8") as fe, open(hin_path, "w", encoding="utf-8") as fh:
+    for r in results:
+        line = json.dumps(
+            {"src": r["source"], "ref": r["reference"], "pred": r["prediction"]},
+            ensure_ascii=False
+        )
+        if r["mode"] == "ENG_to_HIN":
+            fe.write(line + "\n")
+        else:
+            fh.write(line + "\n")
+
+import shutil
+shutil.make_archive("translation_outputs", "zip", out_dir)
+
+print("\n✅ JSONL + ZIP CREATED")
+print("📦 translation_outputs.zip")
+# ============================================================
+# CREATE CLEAN JSONL FILES (SRC / REF / PRED ONLY)
+# ============================================================
+
+import json
+from pathlib import Path
+
+# Load your final evaluation JSON
+with open("final_eval_strict.json", "r", encoding="utf-8") as f:
+    records = json.load(f)
+
+out_dir = Path("exports_jsonl")
+out_dir.mkdir(exist_ok=True)
+
+eng_hin_path = out_dir / "eng_to_hin_src_ref_pred.jsonl"
+hin_eng_path = out_dir / "hin_to_eng_src_ref_pred.jsonl"
+
+eng_hin_count = 0
+hin_eng_count = 0
+
+with open(eng_hin_path, "w", encoding="utf-8") as f_eng, \
+     open(hin_eng_path, "w", encoding="utf-8") as f_hin:
+
+    for r in records:
+        line = {
+            "src": r["source"],
+            "ref": r["reference"],
+            "pred": r["prediction"]
+        }
+
+        if r["mode"] == "ENG_to_HIN":
+            f_eng.write(json.dumps(line, ensure_ascii=False) + "\n")
+            eng_hin_count += 1
+
+        elif r["mode"] == "HIN_to_ENG":
+            f_hin.write(json.dumps(line, ensure_ascii=False) + "\n")
+            hin_eng_count += 1
+
+print(f"✅ ENG→HIN JSONL records: {eng_hin_count}")
+print(f"✅ HIN→ENG JSONL records: {hin_eng_count}")
+print(f"📂 Files saved in: {out_dir.resolve()}")
+# ============================================================
+# ZIP & DOWNLOAD JSONL FILES (COLAB) #OPTIONAL, MIGHT NOT WORK WITH VS CODE
+# ============================================================
+
+import shutil
+from google.colab import files
+
+zip_name = "translation_jsonl_outputs"
+shutil.make_archive(
+    base_name=zip_name,
+    format="zip",
+    root_dir="exports_jsonl"
+)
+
+files.download(f"{zip_name}.zip")
+# ============================================================
+# UNIVERSAL VISUAL CHECK (Works in Colab & VS Code)
+# ============================================================
+import pandas as pd
+import sys
+
+# 1. Prepare the data
+visual_df = df[['mode', 'source', 'reference', 'prediction']].head(10)
+visual_df.columns = ['Direction', 'Source Text', 'Ground Truth (Ref)', 'Model Prediction (Pred)']
+
+# 2. Environment-Specific Display
+is_colab = 'google.colab' in sys.modules
+
+if is_colab:
+    from google.colab import data_table
+    data_table.enable_dataframe_formatter()
+    print("✨ COLAB MODE: Interactive Table Enabled")
+    display(visual_df)
+else:
+    # VS Code / Terminal Mode
+    print("✨ VS CODE MODE: Printing Summary Table")
+    # We use to_string() to ensure the terminal doesn't cut off the middle columns
+    print(visual_df.to_string(index=False, max_colwidth=50))
+
+# 3. Universal Detailed Text View (Best for comparing scripts/characters)
+print("\n" + "═" * 80)
+print("📝 DETAILED SAMPLES (Top 10)")
+print("═" * 80)
+
+for idx, row in visual_df.iterrows():
+    print(f"📍 SAMPLE #{idx+1} | {row['Direction']}")
+    print(f"   [SRC]: {row['Source Text']}")
+    print(f"   [REF]: {row['Ground Truth (Ref)']}")
+    print(f"   [PRED]: {row['Model Prediction (Pred)']}")
+    print("-" * 80)
