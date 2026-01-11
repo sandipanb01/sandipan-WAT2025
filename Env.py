@@ -1,7 +1,7 @@
 !pip uninstall -y transformers tokenizers torchvision trl
 !pip install -U \
-    transformers==4.54.1 \
-    tokenizers==0.21.1 \
+    transformers==4.57.3 \
+    tokenizers==0.22.2 \
     datasets==3.5.0 \
     sacrebleu==2.5.1 \
     torch==2.6.0 \
