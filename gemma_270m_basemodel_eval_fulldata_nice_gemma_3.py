@@ -25,7 +25,7 @@ MODEL_ID = "google/gemma-3-270m-it"
 DATASET_NAME = "ai4bharat/Pralekha"
 EVAL_CONFIG = "test"
 
-EVAL_SAMPLES = None        # None = full official test set
+EVAL_SAMPLES = 100        # None = full official test set
 MAX_SRC_LEN = 2400
 MAX_TGT_LEN = 2400
 
@@ -72,7 +72,7 @@ print(f"✅ Evaluation samples: {len(eval_dataset)}")
 # ============================================================
 model = AutoModelForCausalLM.from_pretrained(
     MODEL_ID,
-    torch_dtype=torch.bfloat16,
+    torch_dtype=torch.float32,
     device_map="auto"
 )
 model.eval()
@@ -235,7 +235,7 @@ import json
 from pathlib import Path
 
 # Load your final evaluation JSON
-with open("final_eval_strict.json", "r", encoding="utf-8") as f:
+with open(f"{OUTPUT_DIR}/baseline_eval.json", "r", encoding="utf-8") as f:
     records = json.load(f)
 
 out_dir = Path("exports_jsonl")
