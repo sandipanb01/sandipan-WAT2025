@@ -268,21 +268,7 @@ with open(eng_hin_path, "w", encoding="utf-8") as f_eng, \
 print(f"✅ ENG→HIN JSONL records: {eng_hin_count}")
 print(f"✅ HIN→ENG JSONL records: {hin_eng_count}")
 print(f"📂 Files saved in: {out_dir.resolve()}")
-# ============================================================
-# ZIP & DOWNLOAD JSONL FILES (COLAB) #OPTIONAL, MIGHT NOT WORK WITH VS CODE
-# ============================================================
 
-import shutil
-from google.colab import files
-
-zip_name = "translation_jsonl_outputs"
-shutil.make_archive(
-    base_name=zip_name,
-    format="zip",
-    root_dir="exports_jsonl"
-)
-
-files.download(f"{zip_name}.zip")
 # ============================================================
 # UNIVERSAL VISUAL CHECK (Works in Colab & VS Code)
 # ============================================================
