@@ -304,3 +304,18 @@ for idx, row in visual_df.iterrows():
     print(f"   [REF]: {row['Ground Truth (Ref)']}")
     print(f"   [PRED]: {row['Model Prediction (Pred)']}")
     print("-" * 80)
+    
+# ZIP & DOWNLOAD JSONL FILES (COLAB) #OPTIONAL, MIGHT NOT WORK WITH VS CODE
+# ============================================================
+
+import shutil
+from google.colab import files
+
+zip_name = "translation_jsonl_outputs"
+shutil.make_archive(
+    base_name=zip_name,
+    format="zip",
+    root_dir="exports_jsonl"
+)
+
+files.download(f"{zip_name}.zip")
