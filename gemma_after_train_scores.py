@@ -2,15 +2,20 @@ import json
 import sacrebleu
 import numpy as np
 import unicodedata
+import pandas as pd  # Added for Excel export
 from pathlib import Path
 
 # --- Helper Functions ---
 
 def is_devanagari(text):
     """Checks if a string contains Devanagari characters."""
+    if not isinstance(text, str): return False
     for ch in text:
-        if "DEVANAGARI" in unicodedata.name(ch, ""):
-            return True
+        try:
+            if "DEVANAGARI" in unicodedata.name(ch, ""):
+                return True
+        except ValueError:
+            continue
     return False
 
 def load_jsonl(file_path):
@@ -24,7 +29,7 @@ def load_jsonl(file_path):
             try:
                 data.append(json.loads(line))
             except json.JSONDecodeError as e:
-                print(f"⚠️ Warning: Skipping malformed JSON line in {file_path}: {e} - Line: {line.strip()[:100]}...")
+                print(f"⚠️ Warning: Skipping malformed JSON line in {file_path}: {e}")
     return data
 
 def calculate_metrics(records, direction):
@@ -32,8 +37,11 @@ def calculate_metrics(records, direction):
     if not records:
         return None
 
-    preds = [r["pred"] for r in records]
-    refs = [r["ref"] for r in records]
+    preds = [r["pred"] for r in records if "pred" in r]
+    refs = [r["ref"] for r in records if "ref" in r]
+
+    if not preds or not refs:
+        return None
 
     # Calculate BLEU and chrF using sacrebleu
     bleu = sacrebleu.corpus_bleu(preds, [refs]).score
@@ -53,9 +61,11 @@ def calculate_metrics(records, direction):
     lid_acc = np.mean(lid_results) * 100 if lid_results else 0
 
     return {
+        "Direction": direction.replace("_", " "),
         "BLEU": round(bleu, 2),
         "chrF": round(chrf, 2),
-        "LID_Accuracy": round(lid_acc, 2)
+        "LID_Accuracy (%)": round(lid_acc, 2),
+        "Sample_Count": len(records)
     }
 
 # --- Main Execution ---
@@ -72,19 +82,31 @@ h2e_data = load_jsonl(h2e_file)
 e2h_metrics = calculate_metrics(e2h_data, "ENG_to_HIN")
 h2e_metrics = calculate_metrics(h2e_data, "HIN_to_ENG")
 
-# Display Results
-print("="*60)
-print(f"{'Direction':<15} | {'BLEU':<8} | {'chrF':<8} | {'LID Acc (%)':<12}")
-print("-"*60)
+# 1. Prepare data for Display and Excel
+all_results = []
+if e2h_metrics: all_results.append(e2h_metrics)
+if h2e_metrics: all_results.append(h2e_metrics)
 
-if e2h_metrics:
-    print(f"{'ENG → HIN':<15} | {e2h_metrics['BLEU']:<8} | {e2h_metrics['chrF']:<8} | {e2h_metrics['LID_Accuracy']:<12}")
+# 2. Display Results in Console
+print("="*75)
+print(f"{'Direction':<15} | {'BLEU':<8} | {'chrF':<8} | {'LID Acc (%)':<12} | {'Samples'}")
+print("-"*75)
+
+for res in all_results:
+    print(f"{res['Direction']:<15} | {res['BLEU']:<8} | {res['chrF']:<8} | {res['LID_Accuracy (%)']:<12} | {res['Sample_Count']}")
+
+print("="*75)
+
+# 3. SAVE TO EXCEL
+if all_results:
+    output_excel = "translation_metrics_summary.xlsx"
+    df = pd.DataFrame(all_results)
+    
+    # Optional: Reorder columns for a cleaner look
+    cols = ['Direction', 'BLEU', 'chrF', 'LID_Accuracy (%)', 'Sample_Count']
+    df = df[cols]
+    
+    df.to_excel(output_excel, index=False)
+    print(f"\n✅ Metrics successfully saved to: {output_excel}")
 else:
-    print(f"{'ENG → HIN':<15} | No data found.")
-
-if h2e_metrics:
-    print(f"{'HIN → ENG':<15} | {h2e_metrics['BLEU']:<8} | {h2e_metrics['chrF']:<8} | {h2e_metrics['LID_Accuracy']:<12}")
-else:
-    print(f"{'HIN → ENG':<15} | No data found.")
-
-print("="*60)
+    print("\n❌ No data found to save.")
