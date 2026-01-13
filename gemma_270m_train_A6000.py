@@ -133,7 +133,8 @@ trainer = SFTTrainer(
         output_dir=OUTPUT_DIR,
         per_device_train_batch_size=2,
         gradient_accumulation_steps=8,
-        max_length=4800,
+        #max_length=4800,
+        max_length=2048,
         learning_rate=2e-4,
         num_train_epochs=2,
         logging_steps=10,
@@ -176,7 +177,8 @@ for sample in tqdm(test_set):
         with torch.no_grad():
             output = model.generate(
                 **inputs,
-                max_new_tokens=MAX_TGT_LEN,
+                #max_new_tokens=MAX_TGT_LEN,
+                max_new_tokens=512,
                 temperature=0.1,
                 do_sample=False,
                 repetition_penalty=1.1
@@ -352,6 +354,83 @@ for idx, row in visual_df.iterrows():
     print(f"   [REF]: {row['Ground Truth (Ref)']}")
     print(f"   [PRED]: {row['Model Prediction (Pred)']}")
     print("-" * 80)
+    
+# ============================================================
+# SEPARATE CELL: FINAL METRICS EXPORT TO EXCEL
+# ============================================================
+import pandas as pd
+import sacrebleu
+import numpy as np
+import unicodedata
+import os
 
+def export_final_report(results_list, output_folder):
+    """
+    Calculates BLEU, chrF, and Script Accuracy for both directions 
+     and saves the summary to an Excel file.
+    """
+    # 1. Helper for script detection
+    def check_devanagari(text):
+        if not text: return False
+        for ch in text:
+            try:
+                if "DEVANAGARI" in unicodedata.name(ch, ""): return True
+            except ValueError: continue
+        return False
 
+    # 2. Process metrics for each direction
+    summary_stats = []
+    directions = ["ENG_to_HIN", "HIN_to_ENG"]
 
+    for mode in directions:
+        # Filter records for this direction
+        subset = [r for r in results_list if r["mode"] == mode]
+        if not subset:
+            continue
+            
+        preds = [r["prediction"] for r in subset]
+        refs = [r["reference"] for r in subset]
+        
+        # Calculate sacreBLEU metrics
+        bleu_score = sacrebleu.corpus_bleu(preds, [refs]).score
+        chrf_score = sacrebleu.corpus_chrf(preds, [refs]).score
+        
+        # Calculate Script (LID) Accuracy
+        lid_hits = []
+        for p in preds:
+            has_hin = check_devanagari(p)
+            # Match: English -> Hindi should have Devanagari; Hindi -> English should NOT
+            is_correct_script = has_hin if mode == "ENG_to_HIN" else not has_hin
+            lid_hits.append(is_correct_script)
+        
+        script_acc = np.mean(lid_hits) * 100 if lid_hits else 0
+        
+        summary_stats.append({
+            "Direction": mode.replace("_", " "),
+            "BLEU": round(bleu_score, 2),
+            "chrF": round(chrf_score, 2),
+            "Script Accuracy (%)": round(script_acc, 2),
+            "Total Samples": len(subset)
+        })
+
+    # 3. Create DataFrame and Save
+    report_df = pd.DataFrame(summary_stats)
+    
+    # Ensure the output directory exists
+    os.makedirs(output_folder, exist_ok=True)
+    
+    excel_path = os.path.join(output_folder, "final_translation_report.xlsx")
+    
+    # Save to Excel
+    report_df.to_excel(excel_path, index=False)
+    
+    # 4. Print Summary to Console
+    print("\n" + "═"*65)
+    print(f"📊 REPORT GENERATED: {excel_path}")
+    print("═"*65)
+    print(report_df.to_string(index=False))
+    print("═"*65 + "\n")
+
+# Execute the export
+# This uses 'results' and 'OUTPUT_DIR' from your previous code execution
+export_final_report(results, OUTPUT_DIR)
