@@ -131,7 +131,8 @@ train_set = train_set.map(
 # ============================================================
 model = AutoModelForCausalLM.from_pretrained(
     MODEL_ID,
-    torch_dtype=torch.bfloat16
+    torch_dtype=torch.bfloat16,
+    device_map="auto"
 )
 
 peft_config = LoraConfig(
