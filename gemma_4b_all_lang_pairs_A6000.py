@@ -217,9 +217,55 @@ for sample in tqdm(test_set):
         "reference": sample["tgt_txt"],
         "prediction": pred
     })
+# ============================================================
+# 10. EXPORT JSONL (ENG→INDIC / INDIC→ENG / ALL)
+# ============================================================
+
+export_dir = Path(OUTPUT_DIR) / "exports_jsonl"
+export_dir.mkdir(parents=True, exist_ok=True)
+
+eng_to_indic_path = export_dir / "eng_to_indic_src_ref_pred.jsonl"
+indic_to_eng_path = export_dir / "indic_to_eng_src_ref_pred.jsonl"
+all_pairs_path    = export_dir / "all_lang_pairs_src_ref_pred.jsonl"
+
+eng_to_indic_count = 0
+indic_to_eng_count = 0
+
+with open(eng_to_indic_path, "w", encoding="utf-8") as f_eng, \
+     open(indic_to_eng_path, "w", encoding="utf-8") as f_indic, \
+     open(all_pairs_path, "w", encoding="utf-8") as f_all:
+
+    for r in results:
+        src_lang, tgt_lang = r["lang_pair"].split("_")
+
+        record = {
+            "src": r["source"],
+            "ref": r["reference"],
+            "pred": r["prediction"],
+            "lang_pair": r["lang_pair"]
+        }
+
+        # Write ALL samples
+        f_all.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+        # Direction split
+        if src_lang == "eng":
+            f_eng.write(json.dumps(record, ensure_ascii=False) + "\n")
+            eng_to_indic_count += 1
+        else:
+            f_indic.write(json.dumps(record, ensure_ascii=False) + "\n")
+            indic_to_eng_count += 1
+
+print("\n" + "=" * 60)
+print("JSONL EXPORT SUMMARY")
+print(f"ENG → INDIC samples   : {eng_to_indic_count}")
+print(f"INDIC → ENG samples   : {indic_to_eng_count}")
+print(f"ALL samples exported  : {len(results)}")
+print(f"Saved to directory    : {export_dir.resolve()}")
+print("=" * 60)
 
 # ============================================================
-# 10. METRICS
+# 11. METRICS
 # ============================================================
 summary = []
 
@@ -243,7 +289,7 @@ df_metrics = pd.DataFrame(summary)
 df_metrics.to_excel(f"{OUTPUT_DIR}/final_metrics.xlsx", index=False)
 
 # ============================================================
-# 11. LOSS CURVE
+# 12. LOSS CURVE
 # ============================================================
 steps, losses = [], []
 
