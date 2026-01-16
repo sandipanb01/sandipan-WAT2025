@@ -30,74 +30,90 @@ MODEL_ID = "google/gemma-3-4b-it"
 DATASET_NAME = "ai4bharat/Pralekha"
 OUTPUT_DIR = "./gemma3-4b-strict-bidirectional"
 
+# ============================================================
+# TRAIN / EVAL SPLITS & MAX SAMPLES
+# ============================================================
+TRAIN_CONFIG = "train"
+EVAL_CONFIG  = "test"
+
+MAX_TRAIN_SAMPLES = 10  # None = use full data
+EVAL_SAMPLES      = 10
+
 MAX_SRC_LEN = 2400
 MAX_TGT_LEN = 2400
 
-# Dataset caps (Set to None for full data)
-MAX_TRAIN_SAMPLES = 10   # Set to None
-EVAL_SAMPLES = 10        # Set to None
-
-os.makedirs(OUTPUT_DIR, exist_ok=True)
-
-# ============================================================
-# TOKENIZER
-# ============================================================
+# ----------------------------
+# Load tokenizer early
+# ----------------------------
 tokenizer = AutoTokenizer.from_pretrained(MODEL_ID)
 tokenizer.pad_token = tokenizer.eos_token
 tokenizer.padding_side = "right"
 
-# ============================================================
+# ----------------------------
 # STRICT FILTERS
-# ============================================================
+# ----------------------------
 def strict_filter(example):
-    return (
-        SequenceMatcher(
-            None,
-            example["src_txt"].lower(),
-            example["tgt_txt"].lower()
-        ).ratio() < 0.65
-    )
+    sim = SequenceMatcher(
+        None,
+        example["src_txt"].lower(),
+        example["tgt_txt"].lower()
+    ).ratio()
+    return sim < 0.65
 
 def length_filter(example):
-    return (
-        len(tokenizer(example["src_txt"], truncation=False)["input_ids"]) <= MAX_SRC_LEN
-        and
-        len(tokenizer(example["tgt_txt"], truncation=False)["input_ids"]) <= MAX_TGT_LEN
-    )
+    src_len = len(tokenizer(example["src_txt"], add_special_tokens=True, truncation=False)["input_ids"])
+    tgt_len = len(tokenizer(example["tgt_txt"], add_special_tokens=True, truncation=False)["input_ids"])
+    return (src_len <= MAX_SRC_LEN) and (tgt_len <= MAX_TGT_LEN)
 
 # ============================================================
-# LOAD ALL PRALEKHA LANGUAGE PAIRS (CORRECTLY)
+# LANGUAGE PAIRS
 # ============================================================
-# FIX: The `ai4bharat/Pralekha` dataset uses language pairs (e.g., 'eng_hin') as
-# its dataset *configurations*, and 'train'/'test' as the *splits* within those configs.
-# The arguments to `load_dataset` were previously inverted.
-# Reverting LANG_PAIRS to the actual available splits (English-to-Indic pairs).
-LANG_PAIRS = ['eng_hin', 'eng_ben', 'eng_guj', 'eng_kan', 'eng_mal', 'eng_mar', 'eng_ori', 'eng_pan', 'eng_tam', 'eng_tel', 'eng_urd']
+LANG_PAIRS = ['eng_hin', 'eng_ben', 'eng_guj', 'eng_kan', 'eng_mal',
+              'eng_mar', 'eng_ori', 'eng_pan', 'eng_tam', 'eng_tel', 'eng_urd']
 
-def load_all_pairs(split_name_arg):
-    all_sets = []
-    for lp in LANG_PAIRS:
-        # Correct usage: `name` is the top-level split ('train'/'test'), `split` is the language pair config.
-        ds = load_dataset(DATASET_NAME, split_name_arg, split=lp)
-        ds = ds.add_column("lang_pair", [lp] * len(ds))
-        all_sets.append(ds)
-    return concatenate_datasets(all_sets)
+# ============================================================
+# LOAD TRAIN DATA (ALL LANGUAGE PAIRS)
+# ============================================================
+train_datasets = []
 
-raw_train = load_all_pairs("train")
-raw_test  = load_all_pairs("test")
+for lp in LANG_PAIRS:
+    raw_ds = load_dataset(DATASET_NAME, TRAIN_CONFIG, split=lp)
+    raw_ds = raw_ds.add_column("lang_pair", [lp]*len(raw_ds))
+    
+    # Strict filtering
+    filtered_ds = raw_ds.filter(strict_filter).filter(length_filter)
+    
+    # Apply MAX_TRAIN_SAMPLES cap
+    t_limit = MAX_TRAIN_SAMPLES if MAX_TRAIN_SAMPLES is not None else len(filtered_ds)
+    train_set_lp = filtered_ds.shuffle(seed=42).select(range(t_limit))
+    
+    train_datasets.append(train_set_lp)
 
-# Apply strict filtering
-train_set = raw_train.filter(strict_filter).filter(length_filter)
-test_set  = raw_test.filter(length_filter)
+# Concatenate all language pairs
+train_set = concatenate_datasets(train_datasets)
 
-# Proper sample caps
-if MAX_TRAIN_SAMPLES is not None:
-    train_set = train_set.select(range(min(MAX_TRAIN_SAMPLES, len(train_set))))
+# ============================================================
+# LOAD TEST DATA (ALL LANGUAGE PAIRS)
+# ============================================================
+test_datasets = []
 
-if EVAL_SAMPLES is not None:
-    test_set = test_set.select(range(min(EVAL_SAMPLES, len(test_set))))
+for lp in LANG_PAIRS:
+    raw_ds = load_dataset(DATASET_NAME, EVAL_CONFIG, split=lp)
+    raw_ds = raw_ds.add_column("lang_pair", [lp]*len(raw_ds))
+    
+    # Only length filter for test
+    filtered_ds = raw_ds.filter(length_filter)
+    
+    # Apply EVAL_SAMPLES cap
+    e_limit = EVAL_SAMPLES if EVAL_SAMPLES is not None else len(filtered_ds)
+    test_set_lp = filtered_ds.shuffle(seed=99).select(range(e_limit))
+    
+    test_datasets.append(test_set_lp)
 
-print(f"Loaded {len(LANG_PAIRS)} language pairs")
+# Concatenate all language pairs
+test_set = concatenate_datasets(test_datasets)
+
+print(f"✅ Loaded {len(LANG_PAIRS)} language pairs")
 print(f"Train samples: {len(train_set)} | Test samples: {len(test_set)}")
 
 # ============================================================
@@ -293,4 +309,4 @@ with open(out_dir / "translations_all_langpairs.jsonl", "w", encoding="utf-8") a
     for r in results:
         f.write(json.dumps(r, ensure_ascii=False) + "\n")
 
-print("✅ JSONL export complete")
+print("✅ JSONL export complete") 
