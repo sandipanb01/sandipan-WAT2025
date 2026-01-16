@@ -36,8 +36,8 @@ OUTPUT_DIR = "./gemma3-4b-strict-bidirectional"
 TRAIN_CONFIG = "train"
 EVAL_CONFIG  = "test"
 
-MAX_TRAIN_SAMPLES = 10  # None = use full data
-EVAL_SAMPLES      = 10
+MAX_TRAIN_SAMPLES = None  # None = use full data
+EVAL_SAMPLES      = None
 
 MAX_SRC_LEN = 2400
 MAX_TGT_LEN = 2400
@@ -121,7 +121,7 @@ print(f"Train samples: {len(train_set)} | Test samples: {len(test_set)}")
 # ============================================================
 model = AutoModelForCausalLM.from_pretrained(
     MODEL_ID,
-    torch_dtype=torch.float32,
+    torch_dtype=torch.bfloat16,
     device_map="auto"
 )
 
@@ -181,7 +181,7 @@ trainer = SFTTrainer(
         per_device_train_batch_size=1,
         gradient_accumulation_steps=16,
         #max_length=4800,
-        max_length=1024,
+        max_length=2048,
         learning_rate=5e-5,
         num_train_epochs=2,
         logging_steps=10,
@@ -192,7 +192,7 @@ trainer = SFTTrainer(
         gradient_checkpointing=True,
         report_to="none"
     ),
-) #mx_length=MAX_SRC_LENGTH + MAX+TGT_LENGTH
+) #max_length=MAX_SRC_LEN + MAX+TGT_LEN
 
 trainer.train()
 
@@ -251,11 +251,12 @@ for sample in tqdm(test_set):
         with torch.no_grad():
             output = model.generate(
                 **inputs,
+                #max_new_tokens=MAX_TGT_LEN,
                 max_new_tokens=512,
                 temperature=0.1,
                 do_sample=False,
                 repetition_penalty=1.1
-            ) #max_new_tokens=MAX_TGT_LENGTH
+            ) #max_new_tokens=MAX_TGT_LEN
 
         pred = tokenizer.decode(
             output[0][inputs.input_ids.shape[-1]:],
