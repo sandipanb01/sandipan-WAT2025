@@ -34,8 +34,8 @@ MAX_SRC_LEN = 2400
 MAX_TGT_LEN = 2400
 
 # Dataset caps (Set to None for full data)
-MAX_TRAIN_SAMPLES = None   # Set to None 
-EVAL_SAMPLES = None        # Set to None
+MAX_TRAIN_SAMPLES = 10   # Set to None
+EVAL_SAMPLES = 10        # Set to None
 
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
@@ -68,12 +68,14 @@ def length_filter(example):
 # ============================================================
 # LOAD ALL PRALEKHA LANGUAGE PAIRS (CORRECTLY)
 # ============================================================
-LANG_PAIRS = get_dataset_config_names(DATASET_NAME)
+LANG_PAIRS = ['eng_hin', 'eng_ben', 'eng_guj', 'eng_kan', 'eng_mal', 'eng_mar', 'eng_ori', 'eng_pan', 'eng_tam', 'eng_tel', 'eng_urd'] 
 
-def load_all_pairs(split):
+def load_all_pairs(split_name_arg):
     all_sets = []
     for lp in LANG_PAIRS:
-        ds = load_dataset(DATASET_NAME, lp, split=split)
+        # Corrected: Pass the main split (e.g., "train") as the `name` argument
+        # and the language pair (e.g., "eng_hin") as the `split` argument.
+        ds = load_dataset(DATASET_NAME, split_name_arg, split=lp)
         ds = ds.add_column("lang_pair", [lp] * len(ds))
         all_sets.append(ds)
     return concatenate_datasets(all_sets)
