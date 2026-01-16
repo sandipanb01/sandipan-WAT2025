@@ -151,9 +151,10 @@ trainer.train()
 
 model = trainer.model.merge_and_unload()
 model.eval()
-
+tokenizer.padding_side = "left"
 model.save_pretrained(f"{OUTPUT_DIR}/final_merged")
 tokenizer.save_pretrained(f"{OUTPUT_DIR}/final_merged")
+
 
 # ============================================================
 # 5. STRICT EVALUATION
