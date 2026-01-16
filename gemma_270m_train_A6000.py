@@ -154,7 +154,7 @@ model.eval()
 
 model.save_pretrained(f"{OUTPUT_DIR}/final_merged")
 tokenizer.save_pretrained(f"{OUTPUT_DIR}/final_merged")
-
+tokenizer.padding_side = "left"
 # ============================================================
 # 5. STRICT EVALUATION 
 # ============================================================
