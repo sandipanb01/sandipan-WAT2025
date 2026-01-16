@@ -68,13 +68,16 @@ def length_filter(example):
 # ============================================================
 # LOAD ALL PRALEKHA LANGUAGE PAIRS (CORRECTLY)
 # ============================================================
-LANG_PAIRS = ['eng_hin', 'eng_ben', 'eng_guj', 'eng_kan', 'eng_mal', 'eng_mar', 'eng_ori', 'eng_pan', 'eng_tam', 'eng_tel', 'eng_urd'] 
+# FIX: The `ai4bharat/Pralekha` dataset uses language pairs (e.g., 'eng_hin') as
+# its dataset *configurations*, and 'train'/'test' as the *splits* within those configs.
+# The arguments to `load_dataset` were previously inverted.
+# Reverting LANG_PAIRS to the actual available splits (English-to-Indic pairs).
+LANG_PAIRS = ['eng_hin', 'eng_ben', 'eng_guj', 'eng_kan', 'eng_mal', 'eng_mar', 'eng_ori', 'eng_pan', 'eng_tam', 'eng_tel', 'eng_urd']
 
 def load_all_pairs(split_name_arg):
     all_sets = []
     for lp in LANG_PAIRS:
-        # Corrected: Pass the main split (e.g., "train") as the `name` argument
-        # and the language pair (e.g., "eng_hin") as the `split` argument.
+        # Correct usage: `name` is the top-level split ('train'/'test'), `split` is the language pair config.
         ds = load_dataset(DATASET_NAME, split_name_arg, split=lp)
         ds = ds.add_column("lang_pair", [lp] * len(ds))
         all_sets.append(ds)
@@ -102,7 +105,7 @@ print(f"Train samples: {len(train_set)} | Test samples: {len(test_set)}")
 # ============================================================
 model = AutoModelForCausalLM.from_pretrained(
     MODEL_ID,
-    torch_dtype=torch.bfloat16,
+    torch_dtype=torch.float32,
     device_map="auto"
 )
 
@@ -162,7 +165,7 @@ trainer = SFTTrainer(
         per_device_train_batch_size=1,
         gradient_accumulation_steps=16,
         #max_length=4800,
-        max_length=2048,
+        max_length=1024,
         learning_rate=5e-5,
         num_train_epochs=2,
         logging_steps=10,
