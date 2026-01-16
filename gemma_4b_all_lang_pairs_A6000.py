@@ -5,23 +5,22 @@ import pandas as pd
 import numpy as np
 from pathlib import Path
 from tqdm import tqdm
-from datasets import load_dataset
 from difflib import SequenceMatcher
+from datasets import (
+    load_dataset,
+    get_dataset_config_names,
+    concatenate_datasets
+)
 from transformers import AutoModelForCausalLM, AutoTokenizer, set_seed
-from peft import LoraConfig, PeftModel
+from peft import LoraConfig
 from trl import SFTTrainer, SFTConfig
 import sacrebleu
+import unicodedata
+import matplotlib.pyplot as plt
 
-# --- Dependencies Guard ---
-def install_and_import(package):
-    import subprocess, sys
-    try: __import__(package)
-    except ImportError:
-        subprocess.check_call([sys.executable, "-m", "pip", "install", package])
-
-install_and_import("langdetect")
-from langdetect import detect, DetectorFactory
-DetectorFactory.seed = 42
+# ============================================================
+# SEED
+# ============================================================
 set_seed(42)
 
 # ============================================================
@@ -31,14 +30,14 @@ MODEL_ID = "google/gemma-3-4b-it"
 DATASET_NAME = "ai4bharat/Pralekha"
 OUTPUT_DIR = "./gemma3-4b-strict-bidirectional"
 
-TRAIN_CONFIG = "train"
-EVAL_CONFIG  = "test"
-
-MAX_TRAIN_SAMPLES = None
-EVAL_SAMPLES = None
-
 MAX_SRC_LEN = 2400
 MAX_TGT_LEN = 2400
+
+# Dataset caps (Set to None for full data)
+MAX_TRAIN_SAMPLES = None   # Set to None 
+EVAL_SAMPLES = None        # Set to None
+
+os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 # ============================================================
 # TOKENIZER
@@ -47,22 +46,24 @@ tokenizer = AutoTokenizer.from_pretrained(MODEL_ID)
 tokenizer.pad_token = tokenizer.eos_token
 tokenizer.padding_side = "right"
 
-
 # ============================================================
 # STRICT FILTERS
 # ============================================================
 def strict_filter(example):
-    sim = SequenceMatcher(
-        None,
-        example["src_txt"].lower(),
-        example["tgt_txt"].lower()
-    ).ratio()
-    return sim < 0.65
+    return (
+        SequenceMatcher(
+            None,
+            example["src_txt"].lower(),
+            example["tgt_txt"].lower()
+        ).ratio() < 0.65
+    )
 
 def length_filter(example):
-    src_len = len(tokenizer(example["src_txt"], truncation=False)["input_ids"])
-    tgt_len = len(tokenizer(example["tgt_txt"], truncation=False)["input_ids"])
-    return src_len <= MAX_SRC_LEN and tgt_len <= MAX_TGT_LEN
+    return (
+        len(tokenizer(example["src_txt"], truncation=False)["input_ids"]) <= MAX_SRC_LEN
+        and
+        len(tokenizer(example["tgt_txt"], truncation=False)["input_ids"]) <= MAX_TGT_LEN
+    )
 
 # ============================================================
 # LOAD ALL PRALEKHA LANGUAGE PAIRS (CORRECTLY)
@@ -70,21 +71,30 @@ def length_filter(example):
 LANG_PAIRS = get_dataset_config_names(DATASET_NAME)
 
 def load_all_pairs(split):
-    datasets = []
+    all_sets = []
     for lp in LANG_PAIRS:
         ds = load_dataset(DATASET_NAME, lp, split=split)
         ds = ds.add_column("lang_pair", [lp] * len(ds))
-        datasets.append(ds)
-    return concatenate_datasets(datasets)
+        all_sets.append(ds)
+    return concatenate_datasets(all_sets)
 
 raw_train = load_all_pairs("train")
 raw_test  = load_all_pairs("test")
 
+# Apply strict filtering
 train_set = raw_train.filter(strict_filter).filter(length_filter)
 test_set  = raw_test.filter(length_filter)
 
+# Proper sample caps
+if MAX_TRAIN_SAMPLES is not None:
+    train_set = train_set.select(range(min(MAX_TRAIN_SAMPLES, len(train_set))))
+
+if EVAL_SAMPLES is not None:
+    test_set = test_set.select(range(min(EVAL_SAMPLES, len(test_set))))
+
 print(f"Loaded {len(LANG_PAIRS)} language pairs")
 print(f"Train samples: {len(train_set)} | Test samples: {len(test_set)}")
+
 # ============================================================
 # MODEL + LoRA
 # ============================================================
@@ -95,8 +105,8 @@ model = AutoModelForCausalLM.from_pretrained(
 )
 
 peft_config = LoraConfig(
-    r=64,
-    lora_alpha=128,
+    r=32,
+    lora_alpha=64,
     target_modules=[
         "q_proj","k_proj","v_proj",
         "o_proj","gate_proj","up_proj","down_proj"
@@ -113,9 +123,17 @@ def formatting_prompts_func(example):
 
     for i in range(len(example["src_txt"])):
         if i % 2 == 0:
-            instr, src, tgt = "Translate to INDIC LANGUAGE:", example["src_txt"][i], example["tgt_txt"][i]
+            instr, src, tgt = (
+                "Translate to INDIC LANGUAGE:",
+                example["src_txt"][i],
+                example["tgt_txt"][i]
+            )
         else:
-            instr, src, tgt = "Translate to ENGLISH:", example["tgt_txt"][i], example["src_txt"][i]
+            instr, src, tgt = (
+                "Translate to ENGLISH:",
+                example["tgt_txt"][i],
+                example["src_txt"][i]
+            )
 
         prompts.append(
             f"<start_of_turn>user\n{instr}\n{src}<end_of_turn>\n<start_of_turn>model\n"
@@ -153,7 +171,7 @@ trainer = SFTTrainer(
         gradient_checkpointing=True,
         report_to="none"
     ),
-)# max_length=MAX_SRC_LENGTH+MAX_TGT_LENGTH
+) #mx_length=MAX_SRC_LENGTH + MAX+TGT_LENGTH
 
 trainer.train()
 
@@ -168,8 +186,6 @@ tokenizer.save_pretrained(f"{OUTPUT_DIR}/final_merged")
 # ============================================================
 # TRAINING LOSS PLOT
 # ============================================================
-import matplotlib.pyplot as plt
-
 losses = [x["loss"] for x in trainer.state.log_history if "loss" in x]
 plt.figure()
 plt.plot(losses)
@@ -180,22 +196,26 @@ plt.savefig(f"{OUTPUT_DIR}/training_loss.jpg")
 plt.close()
 
 # ============================================================
-# EVALUATION
+# SCRIPT-LEVEL INDIC LID (ALL SCRIPTS)
 # ============================================================
-results = []
-metrics = {"ENG_to_INDIC": {"preds": [], "refs": []},
-           "INDIC_to_ENG": {"preds": [], "refs": []}}
+INDIC_SCRIPTS = [
+    "DEVANAGARI","BENGALI","GURMUKHI","GUJARATI",
+    "ORIYA","TAMIL","TELUGU","KANNADA","MALAYALAM","SINHALA"
+]
 
-import unicodedata
-
-def is_indic(text):
+def is_indic_script(text):
     for ch in text:
         try:
-            if "DEVANAGARI" in unicodedata.name(ch, ""):
+            if any(s in unicodedata.name(ch) for s in INDIC_SCRIPTS):
                 return True
         except ValueError:
             continue
     return False
+
+# ============================================================
+# EVALUATION
+# ============================================================
+results = []
 
 for sample in tqdm(test_set):
     pairs = [
@@ -210,12 +230,11 @@ for sample in tqdm(test_set):
         with torch.no_grad():
             output = model.generate(
                 **inputs,
-                #max_new_tokens=MAX_TGT_LEN,
                 max_new_tokens=512,
                 temperature=0.1,
                 do_sample=False,
                 repetition_penalty=1.1
-         ) # max_new_tokens=MAX_TGT_LEN
+            ) #max_new_tokens=MAX_TGT_LENGTH
 
         pred = tokenizer.decode(
             output[0][inputs.input_ids.shape[-1]:],
@@ -223,38 +242,41 @@ for sample in tqdm(test_set):
         ).strip()
 
         results.append({
+            "lang_pair": sample["lang_pair"],
             "mode": mode,
             "source": src,
             "reference": ref,
             "prediction": pred
         })
 
-        metrics[mode]["preds"].append(pred)
-        metrics[mode]["refs"].append(ref)
-
 # ============================================================
-# METRICS
+# LID ACCURACY (PER LANGUAGE × DIRECTION)
 # ============================================================
-def calc(preds, refs):
-    return (
-        sacrebleu.corpus_bleu(preds, [refs]).score,
-        sacrebleu.corpus_chrf(preds, [refs]).score
-    )
+lid_rows = []
 
-e2i_bleu, e2i_chrf = calc(metrics["ENG_to_INDIC"]["preds"], metrics["ENG_to_INDIC"]["refs"])
-i2e_bleu, i2e_chrf = calc(metrics["INDIC_to_ENG"]["preds"], metrics["INDIC_to_ENG"]["refs"])
+for lp in LANG_PAIRS:
+    for direction in ["ENG_to_INDIC", "INDIC_to_ENG"]:
+        subset = [r for r in results if r["lang_pair"] == lp and r["mode"] == direction]
+        if not subset:
+            continue
 
-lid_acc = np.mean([
-    is_indic(r["prediction"]) if r["mode"]=="ENG_to_INDIC"
-    else not is_indic(r["prediction"])
-    for r in results
-])
+        correct = []
+        for r in subset:
+            pred_is_indic = is_indic_script(r["prediction"])
+            correct.append(pred_is_indic if direction == "ENG_to_INDIC" else not pred_is_indic)
 
-print("\n" + "="*60)
-print(f"ENG → INDIC | BLEU {e2i_bleu:.2f} | chrF {e2i_chrf:.2f}")
-print(f"INDIC → ENG | BLEU {i2e_bleu:.2f} | chrF {i2e_chrf:.2f}")
-print(f"LID Accuracy: {lid_acc:.2%}")
-print("="*60)
+        lid_rows.append({
+            "Language Pair": lp,
+            "Direction": direction,
+            "LID Accuracy (%)": round(np.mean(correct) * 100, 2),
+            "Samples": len(subset)
+        })
+
+lid_df = pd.DataFrame(lid_rows)
+lid_path = f"{OUTPUT_DIR}/final_lid_accuracy.xlsx"
+lid_df.to_excel(lid_path, index=False)
+
+print(f"\n📊 LID accuracy saved to: {lid_path}")
 
 # ============================================================
 # EXPORT JSONL
@@ -262,18 +284,8 @@ print("="*60)
 out_dir = Path("exports_jsonl")
 out_dir.mkdir(exist_ok=True)
 
-eng_indic = out_dir / "eng_to_indic_src_ref_pred.jsonl"
-indic_eng = out_dir / "indic_to_eng_src_ref_pred.jsonl"
-
-with open(eng_indic,"w",encoding="utf-8") as fe, open(indic_eng,"w",encoding="utf-8") as fi:
+with open(out_dir / "translations_all_langpairs.jsonl", "w", encoding="utf-8") as f:
     for r in results:
-        line = json.dumps(
-            {"src":r["source"],"ref":r["reference"],"pred":r["prediction"]},
-            ensure_ascii=False
-        )
-        if r["mode"]=="ENG_to_INDIC":
-            fe.write(line+"\n")
-        else:
-            fi.write(line+"\n")
+        f.write(json.dumps(r, ensure_ascii=False) + "\n")
 
-print("JSONL files written successfully.")
+print("✅ JSONL export complete")
