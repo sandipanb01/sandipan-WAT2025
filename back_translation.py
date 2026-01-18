@@ -170,11 +170,11 @@ rows = []
 
 for direction in ["ENG_to_HIN", "HIN_to_ENG"]:
     subset = [p for p in filtered_bt if p["direction"] == direction]
-    srcs = [p["src"] for p in subset]
-    tgts = [p["tgt"] for p in subset]
+    bt_texts = [p["bt_back"] for p in subset]
+    refs     = [p["src"] for p in subset]
 
-    bleu = sacrebleu.corpus_bleu(tgts, [srcs]).score
-    chrf = sacrebleu.corpus_chrf(tgts, [srcs]).score
+    bleu = sacrebleu.corpus_bleu(bt_texts, [refs]).score
+    chrf = sacrebleu.corpus_chrf(bt_texts, [refs]).score
 
     rows.append({
         "Direction": direction,
