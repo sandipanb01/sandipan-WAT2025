@@ -124,18 +124,6 @@ print(f"Strict Script Accuracy: {true_lid_acc:.2%}")
 print("="*50)
 
 # ============================================================
-# TOP-10 QUALITATIVE (SRC / REF / PRED)
-# ============================================================
-print("\n TOP-10 DETAILED SAMPLES\n")
-for i in range(min(10, len(df))):
-    r = df.iloc[i]
-    print(f"[{i+1}] {r['mode']}")
-    print("SRC :", r["source"])
-    print("REF :", r["reference"])
-    print("PRED:", r["prediction"])
-    print("-" * 80)
-
-# ============================================================
 # EXPORT JSONL + ZIP
 # ============================================================
 out_dir = Path("exports_jsonl")
@@ -205,12 +193,6 @@ print(f"Files saved in: {out_dir.resolve()}")
 # Metrics
 # ============================================================
 
-import os
-import matplotlib.pyplot as plt
-import pandas as pd
-import numpy as np
-import sacrebleu
-import unicodedata
 # ------------------------------------------------------------
 # 2. METRICS + SCRIPT (LID) ACCURACY
 # ------------------------------------------------------------
