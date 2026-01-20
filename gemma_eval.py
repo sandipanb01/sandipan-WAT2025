@@ -1,4 +1,4 @@
-how is this eval script: import torch
+import torch
 import json
 import pandas as pd
 import numpy as np
@@ -7,6 +7,7 @@ from tqdm import tqdm
 from datasets import load_dataset
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from pathlib import Path
+import os
 import sacrebleu
 
 torch.manual_seed(42)
