@@ -202,7 +202,7 @@ print(f"ENG→HIN JSONL records: {eng_hin_count}")
 print(f"HIN→ENG JSONL records: {hin_eng_count}")
 print(f"Files saved in: {out_dir.resolve()}")
 # ============================================================
-# FINAL ANALYSIS CELL: LOSS CURVE + METRICS REPORT
+# Metrics
 # ============================================================
 
 import os
@@ -211,9 +211,6 @@ import pandas as pd
 import numpy as np
 import sacrebleu
 import unicodedata
-
-
-
 # ------------------------------------------------------------
 # 2. METRICS + SCRIPT (LID) ACCURACY
 # ------------------------------------------------------------
