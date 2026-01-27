@@ -90,8 +90,8 @@ model = AutoModelForCausalLM.from_pretrained(
 )
 
 peft_config = LoraConfig(
-    r=64,
-    lora_alpha=128,
+    r=16,
+    lora_alpha=64,
     target_modules=[
         "q_proj", "k_proj", "v_proj",
         "o_proj", "gate_proj", "up_proj", "down_proj"
