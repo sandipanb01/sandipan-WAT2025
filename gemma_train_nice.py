@@ -1,24 +1,26 @@
 import os
 import json
 import torch
+import random
 import pandas as pd
 import matplotlib.pyplot as plt
 from pathlib import Path
 from tqdm import tqdm
 from difflib import SequenceMatcher
-from itertools import islice
+from itertools import islice, tee
 
-from datasets import load_dataset
+from datasets import load_dataset, Dataset
 from transformers import AutoModelForCausalLM, AutoTokenizer, set_seed, TrainerCallback
 from peft import LoraConfig
 from trl import SFTTrainer, SFTConfig
 import sacrebleu
 
 # ----------------------------
-# Reproducibility
+# 0. Reproducibility
 # ----------------------------
 set_seed(42)
 torch.manual_seed(42)
+random.seed(42)
 
 # ============================================================
 # 1. CONFIGURATION
@@ -33,11 +35,9 @@ VAL_RATIO = 0.1
 
 MAX_TRAIN_SAMPLES = None
 MAX_EVAL_SAMPLES = None
-
 MAX_SRC_LEN = 2400
 MAX_TGT_LEN = 2400
 MAX_TOTAL_LEN = MAX_SRC_LEN + MAX_TGT_LEN
-
 CHECKPOINT_STEPS = 100
 SANITY_SUBSET_SIZE = 5
 
@@ -65,45 +65,64 @@ def length_filter(example):
     tgt_len = len(tokenizer(example["tgt_txt"], truncation=False)["input_ids"])
     return src_len <= MAX_SRC_LEN and tgt_len <= MAX_TGT_LEN
 
-def bidirectional_prompt(example):
-    if "src_txt" in example and "tgt_txt" in example:
-        prompts, completions = [], []
-        instr, src, tgt = "Translate to HINDI DEVANAGARI:", example["src_txt"], example["tgt_txt"]
-        prompts.append(f"<start_of_turn>user\n{instr}\n{src}<end_of_turn>\n<start_of_turn>model\n")
-        completions.append(f"{tgt}<end_of_turn>")
-        return {"prompt": prompts[0], "completion": completions[0]}
-    else:
-        return {"prompt": "", "completion": ""}
-
 # ============================================================
-# 4. STREAMING DATASET GENERATOR
+# 4. STREAMING DATASET WITH OPTIONAL TRAIN/VAL SPLIT
 # ============================================================
 
-def streaming_dataset(split_name, max_samples=None):
+def streaming_dataset(split_name, max_samples=None, val_ratio=0.0, use_full_data=True):
     ds_stream = load_dataset(DATASET_NAME, "train" if split_name=="train" else "test",
                               split="eng_hin", streaming=True)
-    filtered = (
-        bidirectional_prompt(x)
-        for x in ds_stream
-        if strict_filter(x) and length_filter(x)
-    )
-    if max_samples is not None:
+    filtered = (x for x in ds_stream if strict_filter(x) and length_filter(x))
+    if max_samples:
         filtered = islice(filtered, max_samples)
-    return filtered
 
-# Train / Eval split for streaming
+    if use_full_data and split_name=="train":
+        # Split into train/val streams on-the-fly
+        train_stream, val_stream = tee(filtered, 2)
+        train_stream = (x for x in train_stream if random.random() >= val_ratio)
+        val_stream = (x for x in val_stream if random.random() < val_ratio)
+        return list(train_stream), list(val_stream)
+    else:
+        return list(filtered)
+
 if USE_FULL_DATA:
-    # Get a streaming train dataset
-    train_full = list(streaming_dataset("train", max_samples=MAX_TRAIN_SAMPLES))
-    val_size = int(len(train_full) * VAL_RATIO)
-    train_ds = train_full[val_size:]
-    eval_ds  = train_full[:val_size]
+    train_ds, eval_ds = streaming_dataset("train", max_samples=MAX_TRAIN_SAMPLES,
+                                          val_ratio=VAL_RATIO, use_full_data=True)
 else:
-    train_ds = list(streaming_dataset("train", max_samples=MAX_TRAIN_SAMPLES))
-    eval_ds  = list(streaming_dataset("test", max_samples=MAX_EVAL_SAMPLES))
+    train_ds = streaming_dataset("train", max_samples=MAX_TRAIN_SAMPLES, use_full_data=False)
+    eval_ds = streaming_dataset("test", max_samples=MAX_EVAL_SAMPLES, use_full_data=False)
 
 # ============================================================
-# 5. MODEL + LoRA
+# 5. BIDIRECTIONAL PROMPT FORMATTING
+# ============================================================
+
+def format_bidirectional(example):
+    prompts, completions = [], []
+    src_txt = example["src_txt"] if isinstance(example["src_txt"], list) else [example["src_txt"]]
+    tgt_txt = example["tgt_txt"] if isinstance(example["tgt_txt"], list) else [example["tgt_txt"]]
+    for i in range(len(src_txt)):
+        if i % 2 == 0:
+            instr, src, tgt = "Translate to HINDI DEVANAGARI:", src_txt[i], tgt_txt[i]
+        else:
+            instr, src, tgt = "Translate to ENGLISH:", tgt_txt[i], src_txt[i]
+        prompts.append(f"<start_of_turn>user\n{instr}\n{src}<end_of_turn>\n<start_of_turn>model\n")
+        completions.append(f"{tgt}<end_of_turn>")
+    return {"prompt": prompts, "completion": completions}
+
+train_ds = [format_bidirectional(x) for x in train_ds]
+eval_ds  = [format_bidirectional(x) for x in eval_ds]
+
+# Flatten lists for HF Dataset
+train_prompts = [p for ex in train_ds for p in ex["prompt"]]
+train_completions = [c for ex in train_ds for c in ex["completion"]]
+eval_prompts = [p for ex in eval_ds for p in ex["prompt"]]
+eval_completions = [c for ex in eval_ds for c in ex["completion"]]
+
+train_ds = Dataset.from_dict({"prompt": train_prompts, "completion": train_completions})
+eval_ds  = Dataset.from_dict({"prompt": eval_prompts, "completion": eval_completions})
+
+# ============================================================
+# 6. MODEL + LoRA
 # ============================================================
 
 model = AutoModelForCausalLM.from_pretrained(
@@ -124,24 +143,29 @@ peft_config = LoraConfig(
 )
 
 # ============================================================
-# 6. SANITY CHECK CALLBACK
+# 7. SANITY CHECK CALLBACK
 # ============================================================
 
 def run_sanity_subset(model, tokenizer, device, eval_subset, log_path=None):
     sanity_records = []
+    print("\n=== SANITY CHECK ===")
     for s in eval_subset:
         prompt = s["prompt"]
         ref = s["completion"].replace("<end_of_turn>", "").strip()
         inputs = tokenizer(prompt, return_tensors="pt").to(device)
         with torch.no_grad():
-            output = model.generate(**inputs,
-                                    max_new_tokens=MAX_TGT_LEN,
-                                    temperature=0.1,
-                                    do_sample=False,
-                                    repetition_penalty=1.1)
+            output = model.generate(
+                **inputs,
+                max_new_tokens=MAX_TGT_LEN,
+                temperature=0.1,
+                do_sample=False,
+                repetition_penalty=1.1
+            )
         pred = tokenizer.decode(output[0][inputs.input_ids.shape[-1]:], skip_special_tokens=True).strip()
+        print(f"Prompt: {prompt.splitlines()[1]}")
+        print(f"Predicted: {pred}")
+        print(f"Reference: {ref}\n")
         sanity_records.append({"prompt": prompt.splitlines()[1], "predicted": pred, "reference": ref})
-
     if log_path:
         with open(log_path, "w", encoding="utf-8") as f:
             for rec in sanity_records:
@@ -150,15 +174,15 @@ def run_sanity_subset(model, tokenizer, device, eval_subset, log_path=None):
 class SanityCheckCallback(TrainerCallback):
     def __init__(self, eval_subset):
         self.eval_subset = eval_subset
-
     def on_evaluate(self, args, state, control, **kwargs):
         log_file = SANITY_LOG_DIR / f"sanity_step_{state.global_step}.jsonl"
-        run_sanity_subset(kwargs["model"], kwargs["tokenizer"], kwargs["model"].device, self.eval_subset, log_path=log_file)
+        run_sanity_subset(kwargs["model"], kwargs["tokenizer"], kwargs["model"].device,
+                           self.eval_subset, log_path=log_file)
 
-eval_subset = list(islice(eval_ds, SANITY_SUBSET_SIZE))
+eval_subset = eval_ds.select(range(min(SANITY_SUBSET_SIZE, len(eval_ds))))
 
 # ============================================================
-# 7. TRAINER CONFIG
+# 8. TRAINER CONFIG
 # ============================================================
 
 training_args = SFTConfig(
@@ -193,7 +217,7 @@ trainer = SFTTrainer(
 trainer.train()
 
 # ============================================================
-# 8. TRAINING & VALIDATION LOSS ANALYSIS
+# 9. TRAINING & VALIDATION LOSS ANALYSIS
 # ============================================================
 
 log_history = trainer.state.log_history
@@ -232,17 +256,18 @@ plt.savefig(loss_dir / "validation_loss.png")
 plt.close()
 
 # ============================================================
-# 9. SAVE FINAL MODEL
+# 10. SAVE FINAL MODEL
 # ============================================================
 
 final_dir = Path(OUTPUT_DIR) / "final_model"
 final_dir.mkdir(exist_ok=True)
+
 final_model = trainer.model.merge_and_unload()
 final_model.save_pretrained(final_dir)
 tokenizer.save_pretrained(final_dir)
 
 # ============================================================
-# 10. CHECKPOINT EVAL
+# 11. CHECKPOINT EVALUATION
 # ============================================================
 
 def calc_metrics(preds, refs):
@@ -253,11 +278,11 @@ checkpoints = sorted(Path(OUTPUT_DIR).glob("checkpoint-*"), key=lambda x: int(x.
 history = []
 
 for ckpt in checkpoints:
-    print(f"\nEvaluating {ckpt.name}")
+    print(f"\n🔍 Evaluating {ckpt.name}")
     model_ckpt = AutoModelForCausalLM.from_pretrained(ckpt, device_map="auto")
     model_ckpt.eval()
 
-    # --- SANITY CHECK LOG ---
+    # Sanity check
     log_file = SANITY_LOG_DIR / f"{ckpt.name}_sanity.jsonl"
     run_sanity_subset(model_ckpt, tokenizer, model_ckpt.device, eval_subset, log_path=log_file)
 
@@ -270,11 +295,13 @@ for ckpt in checkpoints:
         ref = s["completion"].replace("<end_of_turn>", "").strip()
         inputs = tokenizer(prompt, return_tensors="pt").to(model_ckpt.device)
         with torch.no_grad():
-            out = model_ckpt.generate(**inputs,
-                                      max_new_tokens=MAX_TGT_LEN,
-                                      temperature=0.1,
-                                      do_sample=False,
-                                      repetition_penalty=1.1)
+            out = model_ckpt.generate(
+                **inputs,
+                max_new_tokens=MAX_TGT_LEN,
+                temperature=0.1,
+                do_sample=False,
+                repetition_penalty=1.1
+            )
         pred = tokenizer.decode(out[0][inputs.input_ids.shape[-1]:], skip_special_tokens=True).strip()
         src = prompt.split("\n")[-1].replace("<end_of_turn>", "").strip()
 
@@ -285,8 +312,11 @@ for ckpt in checkpoints:
             hin_eng_preds.append(pred)
             hin_eng_refs.append(ref)
 
-        records.append({"direction": "ENG_to_HIN" if "HINDI DEVANAGARI" in prompt else "HIN_to_ENG",
-                        "src": src, "ref": ref, "pred": pred})
+        records.append({
+            "direction": "ENG_to_HIN" if "HINDI DEVANAGARI" in prompt else "HIN_to_ENG",
+            "src": src, "ref": ref,
+            "pred": pred
+        })
 
     bleu_eh, chrf_eh = calc_metrics(eng_hin_preds, eng_hin_refs)
     bleu_he, chrf_he = calc_metrics(hin_eng_preds, hin_eng_refs)
@@ -316,4 +346,4 @@ plt.plot(df_hist["chrf_hin_eng"], label="chrF2 HIN→ENG")
 plt.legend()
 plt.grid(True)
 plt.savefig(Path(OUTPUT_DIR) / "bleu_chrf_vs_checkpoint.png")
-plt.show()
+plt.show() 
