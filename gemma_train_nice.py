@@ -171,6 +171,59 @@ final_model.save_pretrained(final_dir)
 tokenizer.save_pretrained(final_dir)
 
 # ============================================================
+# 7.5 TRAINING & VALIDATION LOSS PLOTS (ADVISOR-CRITICAL)
+# ============================================================
+
+log_history = trainer.state.log_history
+
+train_steps, train_losses = [], []
+eval_steps, eval_losses = [], []
+
+for log in log_history:
+    if "loss" in log and "eval_loss" not in log:
+        train_steps.append(log.get("step"))
+        train_losses.append(log["loss"])
+    if "eval_loss" in log:
+        eval_steps.append(log.get("step"))
+        eval_losses.append(log["eval_loss"])
+
+# ---- Save CSV ----
+loss_df = pd.DataFrame({
+    "train_step": train_steps,
+    "train_loss": train_losses
+})
+
+eval_loss_df = pd.DataFrame({
+    "eval_step": eval_steps,
+    "eval_loss": eval_losses
+})
+
+loss_df.to_csv(Path(OUTPUT_DIR) / "training_loss.csv", index=False)
+eval_loss_df.to_csv(Path(OUTPUT_DIR) / "validation_loss.csv", index=False)
+
+# ---- Plot TRAINING LOSS ----
+plt.figure()
+plt.plot(train_steps, train_losses, label="Training Loss")
+plt.xlabel("Step")
+plt.ylabel("Loss")
+plt.title("Training Loss vs Steps")
+plt.grid(True)
+plt.legend()
+plt.savefig(Path(OUTPUT_DIR) / "training_loss.png")
+plt.show()
+
+# ---- Plot VALIDATION LOSS ----
+plt.figure()
+plt.plot(eval_steps, eval_losses, label="Validation Loss")
+plt.xlabel("Step")
+plt.ylabel("Loss")
+plt.title("Validation Loss vs Steps")
+plt.grid(True)
+plt.legend()
+plt.savefig(Path(OUTPUT_DIR) / "validation_loss.png")
+plt.show()
+
+# ============================================================
 # 8. CHECKPOINT EVAL + JSONL (CORRECT + ADVISOR-SAFE)
 # ============================================================
 
