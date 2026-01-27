@@ -9,7 +9,7 @@ from pathlib import Path
 from tqdm import tqdm
 from difflib import SequenceMatcher
 from datasets import load_dataset
-from transformers import AutoModelForCausalLM, AutoTokenizer, set_seed
+from transformers import AutoModelForCausalLM, AutoTokenizer, set_seed, TrainerCallback
 from peft import LoraConfig
 from trl import SFTTrainer, SFTConfig
 import sacrebleu
@@ -39,8 +39,11 @@ MAX_TGT_LEN = 2400
 MAX_TOTAL_LEN = MAX_SRC_LEN + MAX_TGT_LEN
 
 CHECKPOINT_STEPS = 100
+SANITY_SUBSET_SIZE = 5  # number of examples for checkpoint sanity check
 
 os.makedirs(OUTPUT_DIR, exist_ok=True)
+SANITY_LOG_DIR = Path(OUTPUT_DIR) / "sanity_check_logs"
+SANITY_LOG_DIR.mkdir(exist_ok=True)
 
 # ============================================================
 # 2. TOKENIZER
@@ -55,11 +58,7 @@ tokenizer.padding_side = "right"
 # ============================================================
 
 def strict_filter(example):
-    sim = SequenceMatcher(
-        None,
-        example["src_txt"].lower(),
-        example["tgt_txt"].lower()
-    ).ratio()
+    sim = SequenceMatcher(None, example["src_txt"].lower(), example["tgt_txt"].lower()).ratio()
     return sim < 0.65
 
 def length_filter(example):
@@ -94,9 +93,7 @@ def formatting_prompts_func(example):
         else:
             instr, src, tgt = "Translate to ENGLISH:", example["tgt_txt"][i], example["src_txt"][i]
 
-        prompts.append(
-            f"<start_of_turn>user\n{instr}\n{src}<end_of_turn>\n<start_of_turn>model\n"
-        )
+        prompts.append(f"<start_of_turn>user\n{instr}\n{src}<end_of_turn>\n<start_of_turn>model\n")
         completions.append(f"{tgt}<end_of_turn>")
 
     return {"prompt": prompts, "completion": completions}
@@ -126,7 +123,50 @@ peft_config = LoraConfig(
 )
 
 # ============================================================
-# 7. TRAINER
+# 7. SANITY CHECK CALLBACK FOR TRAINING
+# ============================================================
+
+def run_sanity_subset(model, tokenizer, device, eval_subset, log_path=None):
+    sanity_records = []
+    print("\n=== SANITY CHECK ===")
+    for s in eval_subset:
+        prompt = s["prompt"]
+        ref = s["completion"].replace("<end_of_turn>", "").strip()
+
+        inputs = tokenizer(prompt, return_tensors="pt").to(device)
+        with torch.no_grad():
+            output = model.generate(
+                **inputs,
+                max_new_tokens=MAX_TGT_LEN,
+                temperature=0.1,
+                do_sample=False,
+                repetition_penalty=1.1
+            )
+        pred = tokenizer.decode(output[0][inputs.input_ids.shape[-1]:], skip_special_tokens=True).strip()
+        print(f"Prompt: {prompt.splitlines()[1]}")
+        print(f"Predicted: {pred}")
+        print(f"Reference: {ref}\n")
+
+        sanity_records.append({"prompt": prompt.splitlines()[1], "predicted": pred, "reference": ref})
+
+    if log_path:
+        with open(log_path, "w", encoding="utf-8") as f:
+            for rec in sanity_records:
+                f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+
+class SanityCheckCallback(TrainerCallback):
+    def __init__(self, eval_subset):
+        self.eval_subset = eval_subset
+
+    def on_evaluate(self, args, state, control, **kwargs):
+        log_file = SANITY_LOG_DIR / f"sanity_step_{state.global_step}.jsonl"
+        run_sanity_subset(kwargs["model"], kwargs["tokenizer"], kwargs["model"].device, self.eval_subset, log_path=log_file)
+
+# Small subset for sanity check
+eval_subset = [eval_ds[i] for i in range(min(SANITY_SUBSET_SIZE, len(eval_ds)))]
+
+# ============================================================
+# 8. TRAINER
 # ============================================================
 
 training_args = SFTConfig(
@@ -154,19 +194,18 @@ trainer = SFTTrainer(
     train_dataset=train_ds,
     eval_dataset=eval_ds,
     peft_config=peft_config,
-    args=training_args
+    args=training_args,
+    callbacks=[SanityCheckCallback(eval_subset)]
 )
 
 trainer.train()
 
 # ============================================================
-# 7.5 TRAINING & VALIDATION LOSS ANALYSIS (ADVISOR-CRITICAL)
+# 9. TRAINING & VALIDATION LOSS ANALYSIS
 # ============================================================
 
 log_history = trainer.state.log_history
-
-train_steps, train_losses = [], []
-eval_steps, eval_losses = [], []
+train_steps, train_losses, eval_steps, eval_losses = [], [], [], []
 
 for entry in log_history:
     if "loss" in entry and "eval_loss" not in entry:
@@ -176,19 +215,10 @@ for entry in log_history:
         eval_steps.append(entry.get("step"))
         eval_losses.append(entry.get("eval_loss"))
 
-# ---- Save loss CSVs ----
 loss_dir = Path(OUTPUT_DIR)
-pd.DataFrame({
-    "step": train_steps,
-    "train_loss": train_losses
-}).to_csv(loss_dir / "train_loss.csv", index=False)
+pd.DataFrame({"step": train_steps, "train_loss": train_losses}).to_csv(loss_dir / "train_loss.csv", index=False)
+pd.DataFrame({"step": eval_steps, "eval_loss": eval_losses}).to_csv(loss_dir / "eval_loss.csv", index=False)
 
-pd.DataFrame({
-    "step": eval_steps,
-    "eval_loss": eval_losses
-}).to_csv(loss_dir / "eval_loss.csv", index=False)
-
-# ---- Plot training loss ----
 plt.figure()
 plt.plot(train_steps, train_losses, label="Training Loss")
 plt.xlabel("Training Step")
@@ -199,7 +229,6 @@ plt.legend()
 plt.savefig(loss_dir / "training_loss.png")
 plt.close()
 
-# ---- Plot validation loss ----
 plt.figure()
 plt.plot(eval_steps, eval_losses, label="Validation Loss")
 plt.xlabel("Training Step")
@@ -211,7 +240,7 @@ plt.savefig(loss_dir / "validation_loss.png")
 plt.close()
 
 # ============================================================
-# 7.6 SAVE FINAL MODEL
+# 10. SAVE FINAL MODEL
 # ============================================================
 
 final_dir = Path(OUTPUT_DIR) / "final_model"
@@ -221,41 +250,37 @@ final_model = trainer.model.merge_and_unload()
 final_model.save_pretrained(final_dir)
 tokenizer.save_pretrained(final_dir)
 
-# =================================
-# 8. CHECKPOINT EVAL + JSONL 
-# ================================
+# ============================================================
+# 11. CHECKPOINT EVAL + JSONL
+# ============================================================
 
 def calc_metrics(preds, refs):
-    return (
-        sacrebleu.corpus_bleu(preds, [refs]).score,
-        sacrebleu.corpus_chrf(preds, [refs]).score
-    )
+    refs_clean = [r.replace("<end_of_turn>", "").strip() for r in refs]
+    return sacrebleu.corpus_bleu(preds, [refs_clean]).score, sacrebleu.corpus_chrf(preds, [refs_clean]).score
 
-checkpoints = sorted(
-    Path(OUTPUT_DIR).glob("checkpoint-*"),
-    key=lambda x: int(x.name.split("-")[-1])
-)
-
+checkpoints = sorted(Path(OUTPUT_DIR).glob("checkpoint-*"), key=lambda x: int(x.name.split("-")[-1]))
 history = []
-jsonl_root = Path("checkpoint_jsonl")
-jsonl_root.mkdir(exist_ok=True)
+
+sanity_eval_subset = [eval_ds[i] for i in range(min(SANITY_SUBSET_SIZE, len(eval_ds)))]
 
 for ckpt in checkpoints:
     print(f"\n🔍 Evaluating {ckpt.name}")
     model_ckpt = AutoModelForCausalLM.from_pretrained(ckpt, device_map="auto")
     model_ckpt.eval()
 
+    # --- SANITY CHECK LOG ---
+    log_file = SANITY_LOG_DIR / f"{ckpt.name}_sanity.jsonl"
+    run_sanity_subset(model_ckpt, tokenizer, model_ckpt.device, sanity_eval_subset, log_path=log_file)
+
     eng_hin_preds, eng_hin_refs = [], []
     hin_eng_preds, hin_eng_refs = [], []
-
     records = []
 
     for s in tqdm(eval_ds, leave=False):
         prompt = s["prompt"]
-        ref = s["completion"]
+        ref = s["completion"].replace("<end_of_turn>", "").strip()
 
         inputs = tokenizer(prompt, return_tensors="pt").to(model_ckpt.device)
-
         with torch.no_grad():
             out = model_ckpt.generate(
                 **inputs,
@@ -265,29 +290,18 @@ for ckpt in checkpoints:
                 repetition_penalty=1.1
             )
 
-        pred = tokenizer.decode(
-            out[0][inputs.input_ids.shape[-1]:],
-            skip_special_tokens=True
-        ).strip()
-
-        # Recover source text from prompt
+        pred = tokenizer.decode(out[0][inputs.input_ids.shape[-1]:], skip_special_tokens=True).strip()
         src = prompt.split("\n", 2)[-1].replace("<end_of_turn>", "").strip()
 
         if "HINDI DEVANAGARI" in prompt:
-            direction = "ENG_to_HIN"
             eng_hin_preds.append(pred)
             eng_hin_refs.append(ref)
         else:
-            direction = "HIN_to_ENG"
             hin_eng_preds.append(pred)
             hin_eng_refs.append(ref)
 
-        records.append({
-            "direction": direction,
-            "src": src,
-            "ref": ref,
-            "pred": pred
-        })
+        records.append({"direction": "ENG_to_HIN" if "HINDI DEVANAGARI" in prompt else "HIN_to_ENG",
+                        "src": src, "ref": ref, "pred": pred})
 
     bleu_eh, chrf_eh = calc_metrics(eng_hin_preds, eng_hin_refs)
     bleu_he, chrf_he = calc_metrics(hin_eng_preds, hin_eng_refs)
@@ -300,13 +314,13 @@ for ckpt in checkpoints:
         "chrf_hin_eng": chrf_he
     })
 
-    # ---- Save JSONL (advisor-critical) ----
-    ckpt_jsonl = jsonl_root / f"{ckpt.name}_translations.jsonl"
+    # Save JSONL for full evaluation
+    ckpt_jsonl = Path(OUTPUT_DIR) / "checkpoint_jsonl" / f"{ckpt.name}_translations.jsonl"
+    ckpt_jsonl.parent.mkdir(exist_ok=True)
     with open(ckpt_jsonl, "w", encoding="utf-8") as f:
         for r in records:
             f.write(json.dumps(r, ensure_ascii=False) + "\n")
 
-# ---- Save metrics ----
 df_hist = pd.DataFrame(history)
 df_hist.to_csv(Path(OUTPUT_DIR) / "checkpoint_translation_metrics.csv", index=False)
 
