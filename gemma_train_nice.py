@@ -70,9 +70,18 @@ def length_filter(example):
 # 4. LOAD + DYNAMIC SPLIT
 # ============================================================
 
+# ============================================================
+# 4. LOAD + DYNAMIC SPLIT WITH SAMPLE LIMITS
+# ============================================================
+
 full_ds = load_dataset(DATASET_NAME, "train", split="eng_hin")
 full_ds = full_ds.filter(strict_filter).filter(length_filter)
 
+# Apply MAX_TRAIN_SAMPLES if set
+if MAX_TRAIN_SAMPLES is not None:
+    full_ds = full_ds.select(range(min(MAX_TRAIN_SAMPLES, len(full_ds))))
+
+# Split train/validation
 if USE_FULL_DATA:
     split = full_ds.train_test_split(test_size=VAL_RATIO, seed=42)
     train_ds = split["train"]
@@ -80,6 +89,11 @@ if USE_FULL_DATA:
 else:
     train_ds = full_ds
     eval_ds = load_dataset(DATASET_NAME, "test", split="eng_hin").filter(length_filter)
+
+# Apply MAX_EVAL_SAMPLES if set
+if MAX_EVAL_SAMPLES is not None:
+    eval_ds = eval_ds.select(range(min(MAX_EVAL_SAMPLES, len(eval_ds))))
+
 
 # ============================================================
 # 5. BIDIRECTIONAL PROMPT FORMAT
