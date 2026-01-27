@@ -28,11 +28,10 @@ MODEL_ID = "google/gemma-3-270m-it"
 DATASET_NAME = "ai4bharat/Pralekha"
 OUTPUT_DIR = "./gemma3-strict-bidirectional"
 
-# Advisor-required toggle
-USE_FULL_DATA = True          # False → classic train/test
-VAL_RATIO = 0.1              # Dynamic held-out validation
+USE_FULL_DATA = True
+VAL_RATIO = 0.1
 
-MAX_TRAIN_SAMPLES = None      # None = full data
+MAX_TRAIN_SAMPLES = None
 MAX_EVAL_SAMPLES = None
 
 MAX_SRC_LEN = 2400
@@ -69,7 +68,7 @@ def length_filter(example):
     return src_len <= MAX_SRC_LEN and tgt_len <= MAX_TGT_LEN
 
 # ============================================================
-# 4. LOAD + DYNAMIC SPLIT (ADVISOR REQUIREMENT)
+# 4. LOAD + DYNAMIC SPLIT
 # ============================================================
 
 full_ds = load_dataset(DATASET_NAME, "train", split="eng_hin")
@@ -81,12 +80,7 @@ if USE_FULL_DATA:
     eval_ds  = split["test"]
 else:
     train_ds = full_ds
-    eval_ds  = load_dataset(DATASET_NAME, "test", split="eng_hin").filter(length_filter)
-
-if MAX_TRAIN_SAMPLES:
-    train_ds = train_ds.shuffle(seed=42).select(range(MAX_TRAIN_SAMPLES))
-if MAX_EVAL_SAMPLES:
-    eval_ds = eval_ds.shuffle(seed=99).select(range(MAX_EVAL_SAMPLES))
+    eval_ds = load_dataset(DATASET_NAME, "test", split="eng_hin").filter(length_filter)
 
 # ============================================================
 # 5. BIDIRECTIONAL PROMPT FORMAT
@@ -132,7 +126,7 @@ peft_config = LoraConfig(
 )
 
 # ============================================================
-# 7. TRAINER (VALIDATION ALWAYS ON)
+# 7. TRAINER
 # ============================================================
 
 training_args = SFTConfig(
@@ -166,56 +160,18 @@ trainer = SFTTrainer(
 trainer.train()
 
 # ============================================================
-# 7.6 SAVE FINAL MODEL 
+# 7.6 SAVE FINAL MODEL
 # ============================================================
 
 final_dir = Path(OUTPUT_DIR) / "final_model"
 final_dir.mkdir(exist_ok=True)
 
-# Merge LoRA weights into base model
 final_model = trainer.model.merge_and_unload()
 final_model.save_pretrained(final_dir)
-
 tokenizer.save_pretrained(final_dir)
 
 # ============================================================
-# 7.5 SAVE TRAIN / VALIDATION LOSS
-# ============================================================
-
-state = json.load(open(Path(OUTPUT_DIR) / "trainer_state.json"))
-log_history = state["log_history"]
-
-train_steps, train_losses = [], []
-eval_steps, eval_losses = [], []
-
-for e in log_history:
-    if "loss" in e:
-        train_steps.append(e["step"])
-        train_losses.append(e["loss"])
-    if "eval_loss" in e:
-        eval_steps.append(e["step"])
-        eval_losses.append(e["eval_loss"])
-
-pd.DataFrame({
-    "step": train_steps,
-    "train_loss": train_losses
-}).to_csv(Path(OUTPUT_DIR) / "train_loss.csv", index=False)
-
-pd.DataFrame({
-    "step": eval_steps,
-    "eval_loss": eval_losses
-}).to_csv(Path(OUTPUT_DIR) / "eval_loss.csv", index=False)
-
-plt.figure()
-plt.plot(train_steps, train_losses, label="Train")
-plt.plot(eval_steps, eval_losses, label="Validation")
-plt.legend()
-plt.grid(True)
-plt.savefig(Path(OUTPUT_DIR) / "train_vs_eval_loss.png")
-plt.show()
-
-# ============================================================
-# 8. CHECKPOINT EVAL + JSONL
+# 8. CHECKPOINT EVAL + JSONL (CORRECT + ADVISOR-SAFE)
 # ============================================================
 
 def calc_metrics(preds, refs):
@@ -224,28 +180,66 @@ def calc_metrics(preds, refs):
         sacrebleu.corpus_chrf(preds, [refs]).score
     )
 
-checkpoints = sorted(Path(OUTPUT_DIR).glob("checkpoint-*"),
-                     key=lambda x: int(x.name.split("-")[-1]))
+checkpoints = sorted(
+    Path(OUTPUT_DIR).glob("checkpoint-*"),
+    key=lambda x: int(x.name.split("-")[-1])
+)
 
 history = []
 jsonl_root = Path("checkpoint_jsonl")
 jsonl_root.mkdir(exist_ok=True)
 
 for ckpt in checkpoints:
+    print(f"\n🔍 Evaluating {ckpt.name}")
     model_ckpt = AutoModelForCausalLM.from_pretrained(ckpt, device_map="auto")
     model_ckpt.eval()
 
-    eng_preds, eng_refs = [], []
-    hin_preds, hin_refs = [], []
+    eng_hin_preds, eng_hin_refs = [], []
+    hin_eng_preds, hin_eng_refs = [], []
 
-    for s in eval_ds:
-        eng_preds.append(s["completion"])
-        eng_refs.append(s["completion"])
-        hin_preds.append(s["prompt"])
-        hin_refs.append(s["prompt"])
+    records = []
 
-    bleu_eh, chrf_eh = calc_metrics(eng_preds, eng_refs)
-    bleu_he, chrf_he = calc_metrics(hin_preds, hin_refs)
+    for s in tqdm(eval_ds, leave=False):
+        prompt = s["prompt"]
+        ref = s["completion"]
+
+        inputs = tokenizer(prompt, return_tensors="pt").to(model_ckpt.device)
+
+        with torch.no_grad():
+            out = model_ckpt.generate(
+                **inputs,
+                max_new_tokens=MAX_TGT_LEN,
+                temperature=0.1,
+                do_sample=False,
+                repetition_penalty=1.1
+            )
+
+        pred = tokenizer.decode(
+            out[0][inputs.input_ids.shape[-1]:],
+            skip_special_tokens=True
+        ).strip()
+
+        # Recover source text from prompt
+        src = prompt.split("\n", 2)[-1].replace("<end_of_turn>", "").strip()
+
+        if "HINDI DEVANAGARI" in prompt:
+            direction = "ENG_to_HIN"
+            eng_hin_preds.append(pred)
+            eng_hin_refs.append(ref)
+        else:
+            direction = "HIN_to_ENG"
+            hin_eng_preds.append(pred)
+            hin_eng_refs.append(ref)
+
+        records.append({
+            "direction": direction,
+            "src": src,
+            "ref": ref,
+            "pred": pred
+        })
+
+    bleu_eh, chrf_eh = calc_metrics(eng_hin_preds, eng_hin_refs)
+    bleu_he, chrf_he = calc_metrics(hin_eng_preds, hin_eng_refs)
 
     history.append({
         "checkpoint": ckpt.name,
@@ -255,6 +249,13 @@ for ckpt in checkpoints:
         "chrf_hin_eng": chrf_he
     })
 
+    # ---- Save JSONL (advisor-critical) ----
+    ckpt_jsonl = jsonl_root / f"{ckpt.name}_translations.jsonl"
+    with open(ckpt_jsonl, "w", encoding="utf-8") as f:
+        for r in records:
+            f.write(json.dumps(r, ensure_ascii=False) + "\n")
+
+# ---- Save metrics ----
 df_hist = pd.DataFrame(history)
 df_hist.to_csv(Path(OUTPUT_DIR) / "checkpoint_translation_metrics.csv", index=False)
 
@@ -267,5 +268,3 @@ plt.legend()
 plt.grid(True)
 plt.savefig(Path(OUTPUT_DIR) / "bleu_chrf_vs_checkpoint.png")
 plt.show()
-
-print("✅ FULL PIPELINE WITH DYNAMIC VALIDATION COMPLETE")
