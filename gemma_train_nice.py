@@ -196,6 +196,7 @@ training_args = SFTConfig(
     gradient_checkpointing=True,
     lr_scheduler_type="cosine",
     warmup_ratio=0.1,
+    weight_decay=0.01,
     report_to="none"
 )
 
