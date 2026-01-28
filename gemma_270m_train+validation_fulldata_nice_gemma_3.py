@@ -78,8 +78,8 @@ model = AutoModelForCausalLM.from_pretrained(
 # model.config.use_cache = False
 # High-rank LoRA for cross-script mapping (Devanagari vs Latin)
 peft_config = LoraConfig(
-    r=64,
-    lora_alpha=128,
+    r=16,
+    lora_alpha=64,
     target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
     task_type="CAUSAL_LM",
     bias="none"
@@ -89,19 +89,17 @@ peft_config = LoraConfig(
 # 3. BIDIRECTIONAL FORMATTING (Gemma-3 Technical Format)
 # ============================================================
 def formatting_prompts_func(example):
-    texts = []
+    prompts, completions = [], []
     for i in range(len(example["src_txt"])):
-        # Balanced Bidirectional Logic
         if i % 2 == 0:
             instr, src, tgt = "Translate to HINDI DEVANAGARI:", example["src_txt"][i], example["tgt_txt"][i]
         else:
             instr, src, tgt = "Translate to ENGLISH:", example["tgt_txt"][i], example["src_txt"][i]
-        
-        texts.append(
-            f"<start_of_turn>user\n{instr}\n{src}<end_of_turn>\n"
-            f"<start_of_turn>model\n{tgt}<end_of_turn>"
-        )
-    return {"text": texts}
+
+        prompts.append(f"<start_of_turn>user\n{instr}\n{src}<end_of_turn>\n<start_of_turn>model\n")
+        completions.append(f"{tgt}<end_of_turn>")
+
+    return {"prompt": prompts, "completion": completions}
 
 dataset = train_set.map(formatting_prompts_func, batched=True, remove_columns=train_set.column_names)
 val_dataset = val_set.map(formatting_prompts_func, batched=True, remove_columns=val_set.column_names)
@@ -116,7 +114,6 @@ trainer = SFTTrainer(
     peft_config=peft_config,
     args=SFTConfig(
         output_dir=OUTPUT_DIR,
-        dataset_text_field="text",
         per_device_train_batch_size=2,
         gradient_accumulation_steps=8,
         learning_rate=2e-4, 
