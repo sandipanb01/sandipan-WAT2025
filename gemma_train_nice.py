@@ -190,6 +190,7 @@ training_args = SFTConfig(
     eval_steps=CHECKPOINT_STEPS,
     save_steps=CHECKPOINT_STEPS,
     do_eval=True,
+    eval_strategy="steps",
     save_strategy="steps",
     save_total_limit=10,
     completion_only_loss=True,
