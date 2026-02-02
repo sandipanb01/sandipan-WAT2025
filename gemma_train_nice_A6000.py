@@ -70,25 +70,47 @@ def length_filter(example):
 # 4. LOAD + DYNAMIC SPLIT WITH SAMPLE LIMITS
 # ============================================================
 
-full_ds = load_dataset(DATASET_NAME, "train", split="eng_hin")
-full_ds = full_ds.filter(strict_filter).filter(length_filter)
+# Load raw dataset
+raw_ds = load_dataset(DATASET_NAME, "train", split="eng_hin")
+
+# ---- SAFE FILTERING: scalar-only, no vectorized decode ----
+filtered_ds = raw_ds.filter(
+    strict_filter,
+    batched=False,          # CRITICAL
+    load_from_cache_file=False
+)
+
+filtered_ds = filtered_ds.filter(
+    length_filter,
+    batched=False,          # CRITICAL
+    load_from_cache_file=False
+)
 
 # Apply MAX_TRAIN_SAMPLES if set
 if MAX_TRAIN_SAMPLES is not None:
-    full_ds = full_ds.select(range(min(MAX_TRAIN_SAMPLES, len(full_ds))))
+    filtered_ds = filtered_ds.select(
+        range(min(MAX_TRAIN_SAMPLES, len(filtered_ds)))
+    )
 
-# Split train/validation
+# Train / validation split
 if USE_FULL_DATA:
-    split = full_ds.train_test_split(test_size=VAL_RATIO, seed=42)
+    split = filtered_ds.train_test_split(
+        test_size=VAL_RATIO,
+        seed=42,
+        shuffle=True
+    )
     train_ds = split["train"]
     eval_ds  = split["test"]
 else:
-    train_ds = full_ds
-    eval_ds = load_dataset(DATASET_NAME, "test", split="eng_hin").filter(length_filter)
+    train_ds = filtered_ds
+    eval_ds = load_dataset(DATASET_NAME, "test", split="eng_hin") \
+        .filter(length_filter, batched=False, load_from_cache_file=False)
 
 # Apply MAX_EVAL_SAMPLES if set
 if MAX_EVAL_SAMPLES is not None:
-    eval_ds = eval_ds.select(range(min(MAX_EVAL_SAMPLES, len(eval_ds))))
+    eval_ds = eval_ds.select(
+        range(min(MAX_EVAL_SAMPLES, len(eval_ds)))
+    )
 
 
 # ============================================================
@@ -96,7 +118,8 @@ if MAX_EVAL_SAMPLES is not None:
 # ============================================================
 
 def formatting_prompts_func(example):
-    prompts, completions = [], []
+    prompts = []
+    completions = []
     for i in range(len(example["src_txt"])):
         if i % 2 == 0:
             instr, src, tgt = "Translate to HINDI DEVANAGARI:", example["src_txt"][i], example["tgt_txt"][i]
@@ -108,8 +131,17 @@ def formatting_prompts_func(example):
 
     return {"prompt": prompts, "completion": completions}
 
-train_ds = train_ds.map(formatting_prompts_func, batched=True, remove_columns=train_ds.column_names)
-eval_ds  = eval_ds.map(formatting_prompts_func, batched=True, remove_columns=eval_ds.column_names)
+train_ds = train_ds.map(
+    formatting_prompts_func,
+    batched=True,               
+    remove_columns=train_ds.column_names
+)
+
+eval_ds = eval_ds.map(
+    formatting_prompts_func,
+    batched=True,
+    remove_columns=eval_ds.column_names
+)
 
 # ============================================================
 # 6. MODEL + LoRA
@@ -119,7 +151,8 @@ model = AutoModelForCausalLM.from_pretrained(
     MODEL_ID,
     torch_dtype=torch.bfloat16,
     device_map="auto",
-    attn_implementation="flash_attention_2"    
+    attn_implementation="flash_attention_2"
+    if torch.cuda.is_available() else "eager"
 )
 
 peft_config = LoraConfig(
