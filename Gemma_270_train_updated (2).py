@@ -45,6 +45,7 @@ VAL_RATIO = 0.1
 
 MAX_SRC_LEN = 2400
 MAX_TGT_LEN = 2400
+MAX_TOTAL_LEN = MAX_SRC_LEN + MAX_TGT_LEN
 
 # NEW: Checkpointing configuration
 CHECKPOINT_STEPS = 500  # Save every 500 steps
@@ -174,8 +175,8 @@ model = AutoModelForCausalLM.from_pretrained(
 )
 
 peft_config = LoraConfig(
-    r=64,
-    lora_alpha=128,
+    r=16,
+    lora_alpha=64,
     target_modules=[
         "q_proj", "k_proj", "v_proj",
         "o_proj", "gate_proj", "up_proj", "down_proj"
@@ -285,7 +286,7 @@ training_args = SFTConfig(
     output_dir=OUTPUT_DIR,
     per_device_train_batch_size=2,
     gradient_accumulation_steps=8,
-    max_length=2048,
+    max_length=MAX_TOTAL_LEN,
     learning_rate=2e-4,
     num_train_epochs=2,
     
@@ -296,7 +297,7 @@ training_args = SFTConfig(
     do_eval=True,
     eval_strategy="steps",
     save_strategy="steps",
-    save_total_limit=10,  # Keep only last 10 checkpoints
+    save_total_limit=100,  # Keep only last 10 checkpoints
     
     lr_scheduler_type="cosine",
     warmup_ratio=0.1,
