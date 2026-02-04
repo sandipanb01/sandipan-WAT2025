@@ -76,13 +76,13 @@ raw_ds = load_dataset(DATASET_NAME, "train", split="eng_hin")
 # ---- SAFE FILTERING: scalar-only, no vectorized decode ----
 filtered_ds = raw_ds.filter(
     strict_filter,
-    batched=False,          # CRITICAL
+    batched=False,          
     load_from_cache_file=False
 )
 
 filtered_ds = filtered_ds.filter(
     length_filter,
-    batched=False,          # CRITICAL
+    batched=False,          
     load_from_cache_file=False
 )
 
