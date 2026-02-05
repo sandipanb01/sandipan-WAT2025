@@ -250,6 +250,7 @@ for ckpt in ckpts:
                 out = model.generate(
                     **inp,
                     max_new_tokens=MAX_TGT_LEN,
+                    temperature=0.1,
                     do_sample=False,
                     repetition_penalty=1.1
                 )
