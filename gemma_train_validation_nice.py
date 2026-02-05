@@ -181,26 +181,19 @@ plt.savefig(OUTPUT_DIR / "loss_curve.png")
 plt.close()
 
 # ============================================================
-# 8. CHECKPOINT-WISE STRICT EVALUATION
+# 8. CHECKPOINT EVALUATION → JSONL
 # ============================================================
 def is_devanagari(text):
-    for ch in text:
-        if "DEVANAGARI" in unicodedata.name(ch, ""):
-            return True
-    return False
+    return any("DEVANAGARI" in unicodedata.name(c, "") for c in text)
 
-def calc_metrics(preds, refs):
-    return (
-        sacrebleu.corpus_bleu(preds, [refs]).score,
-        sacrebleu.corpus_chrf(preds, [refs]).score
-    )
+def load_jsonl(path):
+    with open(path, encoding="utf-8") as f:
+        return [json.loads(l) for l in f]
 
-test_set = val_set  # advisor-safe: held-out split
-
+test_set = val_set
+ckpts = sorted(os.listdir(CKPT_DIR))
 all_stats = {}
 all_outputs = {}
-
-ckpts = sorted(os.listdir(CKPT_DIR))
 
 for ckpt in ckpts:
     print(f"\n🔍 Evaluating {ckpt}")
@@ -210,8 +203,14 @@ for ckpt in ckpts:
         device_map="auto"
     ).eval()
 
-    results = []
-    metrics = {"E2H": {"p": [], "r": []}, "H2E": {"p": [], "r": []}}
+    ckpt_pred_dir = PRED_DIR / ckpt
+    ckpt_pred_dir.mkdir(parents=True, exist_ok=True)
+
+    files = {
+        "E2H": open(ckpt_pred_dir / "E2H.jsonl", "w", encoding="utf-8"),
+        "H2E": open(ckpt_pred_dir / "H2E.jsonl", "w", encoding="utf-8")
+    }
+
     lid = []
 
     for s in tqdm(test_set):
@@ -234,14 +233,26 @@ for ckpt in ckpts:
                 )
 
             pred = tokenizer.decode(out[0][inp.input_ids.shape[-1]:], skip_special_tokens=True).strip()
-            results.append((mode, src, ref, pred))
-            metrics[mode]["p"].append(pred)
-            metrics[mode]["r"].append(ref)
+
+            files[mode].write(json.dumps({
+                "src": src,
+                "ref": ref,
+                "pred": pred
+            }, ensure_ascii=False) + "\n")
 
             lid.append(is_devanagari(pred) if mode == "E2H" else not is_devanagari(pred))
 
-    e2h_bleu, e2h_chrf = calc_metrics(metrics["E2H"]["p"], metrics["E2H"]["r"])
-    h2e_bleu, h2e_chrf = calc_metrics(metrics["H2E"]["p"], metrics["H2E"]["r"])
+    for f in files.values():
+        f.close()
+
+    # Reload JSONL → metrics
+    e2h = load_jsonl(ckpt_pred_dir / "E2H.jsonl")
+    h2e = load_jsonl(ckpt_pred_dir / "H2E.jsonl")
+
+    e2h_bleu = sacrebleu.corpus_bleu([x["pred"] for x in e2h], [[x["ref"] for x in e2h]]).score
+    e2h_chrf = sacrebleu.corpus_chrf([x["pred"] for x in e2h], [[x["ref"] for x in e2h]]).score
+    h2e_bleu = sacrebleu.corpus_bleu([x["pred"] for x in h2e], [[x["ref"] for x in h2e]]).score
+    h2e_chrf = sacrebleu.corpus_chrf([x["pred"] for x in h2e], [[x["ref"] for x in h2e]]).score
 
     all_stats[ckpt] = {
         "ENG→HIN BLEU": round(e2h_bleu, 2),
@@ -251,10 +262,10 @@ for ckpt in ckpts:
         "Script Acc (%)": round(np.mean(lid) * 100, 2)
     }
 
-    all_outputs[ckpt] = results
+    all_outputs[ckpt] = e2h + h2e
 
 # ============================================================
-# 9. METRIC TABLE + REGRESSION ALERTS
+# 9. METRICS + REGRESSION
 # ============================================================
 df = pd.DataFrame.from_dict(all_stats, orient="index")
 df.to_csv(EVAL_DIR / "checkpoint_metrics.csv")
@@ -262,7 +273,7 @@ df.to_csv(EVAL_DIR / "checkpoint_metrics.csv")
 prev = None
 for ckpt, row in df.iterrows():
     if prev and prev - row["ENG→HIN BLEU"] >= BLEU_REGRESSION_DROP:
-        print(f" BLEU REGRESSION at {ckpt}: {prev} → {row['ENG→HIN BLEU']}")
+        print(f"⚠ BLEU REGRESSION at {ckpt}: {prev} → {row['ENG→HIN BLEU']}")
     prev = row["ENG→HIN BLEU"]
 
 # ============================================================
@@ -272,22 +283,21 @@ for metric in ["ENG→HIN BLEU", "HIN→ENG BLEU", "ENG→HIN chrF2", "HIN→ENG
     plt.figure()
     plt.plot(df.index, df[metric])
     plt.xticks(rotation=45)
-    plt.title(metric)
     plt.tight_layout()
     plt.savefig(EVAL_DIR / f"{metric.replace(' ', '_')}.png")
     plt.close()
 
 # ============================================================
-# 11. SIDE-BY-SIDE CHECKPOINT DIFFS
+# 11. SIDE-BY-SIDE DIFFS
 # ============================================================
 for i in range(1, len(ckpts)):
     c1, c2 = ckpts[i-1], ckpts[i]
     with open(DIFF_DIR / f"{c1}_vs_{c2}.txt", "w", encoding="utf-8") as f:
         for r1, r2 in zip(all_outputs[c1], all_outputs[c2]):
-            if r1[3] != r2[3]:
+            if r1["pred"] != r2["pred"]:
                 diff = unified_diff(
-                    r1[3].split(),
-                    r2[3].split(),
+                    r1["pred"].split(),
+                    r2["pred"].split(),
                     fromfile=c1,
                     tofile=c2,
                     lineterm=""
