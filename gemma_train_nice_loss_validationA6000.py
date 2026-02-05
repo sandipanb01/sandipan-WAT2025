@@ -75,7 +75,11 @@ raw = load_dataset(DATASET_NAME, "train", split="eng_hin")
 raw = raw.filter(strict_filter)
 raw = raw.filter(length_filter)
 
-limit = MAX_TRAIN_SAMPLES if MAX_TRAIN_SAMPLES else len(raw)
+if MAX_TRAIN_SAMPLES is None:
+    limit = len(raw)
+else:
+    limit = min(MAX_TRAIN_SAMPLES, len(raw))
+
 raw = raw.shuffle(seed=42).select(range(limit))
 
 split = raw.train_test_split(test_size=0.1, seed=42)
