@@ -181,6 +181,22 @@ plt.savefig(OUTPUT_DIR / "loss_curve.png")
 plt.close()
 
 # ============================================================
+# 7.5 FINAL MERGED MODEL SAVE (LoRA → Base)
+# ============================================================
+# >>> ADDED
+print("\n🔗 Merging LoRA adapters into base model weights...")
+merged_model = trainer.model.merge_and_unload()
+merged_model.eval()
+
+FINAL_MODEL_DIR = OUTPUT_DIR / "final_merged"
+FINAL_MODEL_DIR.mkdir(parents=True, exist_ok=True)
+
+merged_model.save_pretrained(FINAL_MODEL_DIR)
+tokenizer.save_pretrained(FINAL_MODEL_DIR)
+
+print(f"✅ Final merged model saved to: {FINAL_MODEL_DIR}")
+
+# ============================================================
 # 8. CHECKPOINT EVALUATION → JSONL
 # ============================================================
 def is_devanagari(text):
@@ -194,6 +210,10 @@ test_set = val_set
 ckpts = sorted(os.listdir(CKPT_DIR))
 all_stats = {}
 all_outputs = {}
+
+# >>> IMPORTANT NOTE:
+# We evaluate *adapter checkpoints*, NOT the merged model.
+# This preserves training-time parity and avoids leakage.
 
 for ckpt in ckpts:
     print(f"\n🔍 Evaluating {ckpt}")
@@ -232,7 +252,10 @@ for ckpt in ckpts:
                     repetition_penalty=1.1
                 )
 
-            pred = tokenizer.decode(out[0][inp.input_ids.shape[-1]:], skip_special_tokens=True).strip()
+            pred = tokenizer.decode(
+                out[0][inp.input_ids.shape[-1]:],
+                skip_special_tokens=True
+            ).strip()
 
             files[mode].write(json.dumps({
                 "src": src,
@@ -245,14 +268,22 @@ for ckpt in ckpts:
     for f in files.values():
         f.close()
 
-    # Reload JSONL → metrics
+    # Reload JSONL → metrics (strict reproducibility)
     e2h = load_jsonl(ckpt_pred_dir / "E2H.jsonl")
     h2e = load_jsonl(ckpt_pred_dir / "H2E.jsonl")
 
-    e2h_bleu = sacrebleu.corpus_bleu([x["pred"] for x in e2h], [[x["ref"] for x in e2h]]).score
-    e2h_chrf = sacrebleu.corpus_chrf([x["pred"] for x in e2h], [[x["ref"] for x in e2h]]).score
-    h2e_bleu = sacrebleu.corpus_bleu([x["pred"] for x in h2e], [[x["ref"] for x in h2e]]).score
-    h2e_chrf = sacrebleu.corpus_chrf([x["pred"] for x in h2e], [[x["ref"] for x in h2e]]).score
+    e2h_bleu = sacrebleu.corpus_bleu(
+        [x["pred"] for x in e2h], [[x["ref"] for x in e2h]]
+    ).score
+    e2h_chrf = sacrebleu.corpus_chrf(
+        [x["pred"] for x in e2h], [[x["ref"] for x in e2h]]
+    ).score
+    h2e_bleu = sacrebleu.corpus_bleu(
+        [x["pred"] for x in h2e], [[x["ref"] for x in h2e]]
+    ).score
+    h2e_chrf = sacrebleu.corpus_chrf(
+        [x["pred"] for x in h2e], [[x["ref"] for x in h2e]]
+    ).score
 
     all_stats[ckpt] = {
         "ENG→HIN BLEU": round(e2h_bleu, 2),
@@ -263,6 +294,7 @@ for ckpt in ckpts:
     }
 
     all_outputs[ckpt] = e2h + h2e
+
 
 # ============================================================
 # 9. METRICS + REGRESSION
