@@ -62,9 +62,9 @@ def strict_filter(example):
     return sim < 0.65
 
 def length_filter(example):
-    src_len = len(tokenizer(example["src_txt"], truncation=False)["input_ids"])
-    tgt_len = len(tokenizer(example["tgt_txt"], truncation=False)["input_ids"])
-    return src_len <= MAX_SRC_LEN and tgt_len <= MAX_TGT_LEN
+    src_len = len(tokenizer(example["src_txt"], add_special_tokens=True, truncation=False)["input_ids"])
+    tgt_len = len(tokenizer(example["tgt_txt"], add_special_tokens=True, truncation=False)["input_ids"])
+    return (src_len <= MAX_SRC_LEN) and (tgt_len <= MAX_TGT_LEN)
 
 raw = load_dataset(DATASET_NAME, "train", split="eng_hin")
 raw = raw.filter(strict_filter)
