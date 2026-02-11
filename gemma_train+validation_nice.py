@@ -75,8 +75,8 @@ def length_filter(example):
     return (src_len <= MAX_SRC_LEN) and (tgt_len <= MAX_TGT_LEN)
 
 raw = load_dataset(DATASET_NAME, "train", split="eng_hin")
-raw = raw.filter(strict_filter)
-raw = raw.filter(length_filter)
+raw = raw.filter(strict_filter, num_proc=8)
+raw = raw.filter(length_filter, num_proc=8)
 
 if MAX_TRAIN_SAMPLES is None:
     limit = len(raw)
