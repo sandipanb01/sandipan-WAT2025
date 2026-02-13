@@ -40,8 +40,8 @@ OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 CKPT_DIR.mkdir(parents=True, exist_ok=True)
 
 MAX_TRAIN_SAMPLES = None
-MAX_SRC_LEN = 1024
-MAX_TGT_LEN = 1024
+MAX_SRC_LEN = 2400
+MAX_TGT_LEN = 2400
 MAX_SEQ_LEN = MAX_SRC_LEN + MAX_TGT_LEN
 
 # ============================================================
@@ -154,6 +154,7 @@ model = AutoModelForCausalLM.from_pretrained(
 peft_config = LoraConfig(
     r=16,
     lora_alpha=64,
+    lora_dropout=0.05,
     target_modules=[
         "q_proj", "k_proj", "v_proj",
         "o_proj", "gate_proj", "up_proj", "down_proj"
@@ -172,31 +173,31 @@ trainer = SFTTrainer(
     peft_config=peft_config,
     args=SFTConfig(
         output_dir=str(CKPT_DIR),
-        per_device_train_batch_size=4,
-        per_device_eval_batch_size=1,
+        per_device_train_batch_size=2,
+        per_device_eval_batch_size=2,
         gradient_accumulation_steps=4,
         learning_rate=2e-4,
         num_train_epochs=2,
-        logging_steps=10,
+        logging_steps=400,
 
         bf16=True,
         #dataloader_num_workers=16,
 
         eval_strategy="steps",
-        eval_steps=1000,
+        eval_steps=500,
         save_strategy="steps",
-        save_steps=1000,
+        save_steps=500,
         save_total_limit=10,
 
         max_length=MAX_SEQ_LEN,
         gradient_checkpointing=True,
         lr_scheduler_type="cosine",
-        #warmup_ratio=0.1,
-        warmup_steps=11250,
+        warmup_ratio=0.1,
+        
         weight_decay=0.01,
         completion_only_loss=True,
         report_to="none",
-        packing=True,
+        packing=False,
         ddp_find_unused_parameters=False
     )
 )
