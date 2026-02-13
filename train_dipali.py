@@ -182,7 +182,7 @@ trainer = SFTTrainer(
         completion_only_loss=True,
         #packing=False,
         report_to="none",
-        ddp_find_unused_parameters=False
+        #ddp_find_unused_parameters=False
     )
 )
 
