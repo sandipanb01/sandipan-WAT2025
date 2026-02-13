@@ -133,7 +133,8 @@ dev_ds   = dev_raw.map(format_fn,   batched=True, remove_columns=dev_raw.column_
 model = AutoModelForCausalLM.from_pretrained(
     MODEL_ID,
     torch_dtype=torch.bfloat16,
-    attn_implementation="flash_attention_2"
+    attn_implementation="flash_attention_2",
+    device_map="auto"
 )
 
 peft_config = LoraConfig(
@@ -179,7 +180,7 @@ trainer = SFTTrainer(
         weight_decay=0.01,
 
         completion_only_loss=True,
-        packing=True,
+        #packing=False,
         report_to="none",
         ddp_find_unused_parameters=False
     )
