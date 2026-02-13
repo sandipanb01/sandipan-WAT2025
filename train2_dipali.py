@@ -1,9 +1,7 @@
 # ============================================================
-# train.py — MULTI-GPU TRAINING + CHECKPOINTING
+# 0. IMPORTS
 # ============================================================
-
 import os
-#os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
 import torch
 import numpy as np
 import matplotlib.pyplot as plt
@@ -11,7 +9,7 @@ import matplotlib.pyplot as plt
 from tqdm import tqdm
 from pathlib import Path
 from difflib import SequenceMatcher
-from datasets import load_dataset
+from datasets import load_dataset, Value
 from transformers import (
     AutoModelForCausalLM,
     AutoTokenizer,
@@ -21,15 +19,12 @@ from peft import LoraConfig
 from trl import SFTTrainer, SFTConfig
 
 # ============================================================
-# 0. REPRODUCIBILITY (LeCun-style strict determinism)
+# 1. REPRODUCIBILITY (STRICT)
 # ============================================================
 set_seed(42)
-#torch.backends.cudnn.deterministic = True
-#torch.backends.cudnn.benchmark = False
-#torch.use_deterministic_algorithms(True)
 
 # ============================================================
-# 1. CONFIG
+# 2. CONFIG
 # ============================================================
 MODEL_ID = "google/gemma-3-270m-it"
 DATASET_NAME = "ai4bharat/Pralekha"
@@ -39,92 +34,83 @@ CKPT_DIR   = OUTPUT_DIR / "checkpoints"
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 CKPT_DIR.mkdir(parents=True, exist_ok=True)
 
-MAX_TRAIN_SAMPLES = None
+MAX_TRAIN_SAMPLES = None   # set int for debugging
 MAX_SRC_LEN = 2400
 MAX_TGT_LEN = 2400
 MAX_SEQ_LEN = MAX_SRC_LEN + MAX_TGT_LEN
 
 # ============================================================
-# 2. TOKENIZER
+# 3. TOKENIZER
 # ============================================================
 tokenizer = AutoTokenizer.from_pretrained(MODEL_ID)
 tokenizer.pad_token = tokenizer.eos_token
 tokenizer.padding_side = "right"
 
 # ============================================================
-# 3. STRICT DATA FILTERING (ANTI-CHEATING)
-# ============================================================
-from datasets import Value  # <--- Make sure to add this import
-
-
-
-# ============================================================
-# 3. STRICT DATA FILTERING (ANTI-CHEATING)
+# 4. STRICT DATA FILTERING (ANTI-CHEATING)
 # ============================================================
 def strict_filter(example):
-    # Ensure we are working with strings
     s = str(example["src_txt"] or "").lower()
     t = str(example["tgt_txt"] or "").lower()
     sim = SequenceMatcher(None, s, t).ratio()
     return sim < 0.65
 
 def length_filter(example):
-    # Defensive check to ensure data is string
     if not isinstance(example["src_txt"], str) or not isinstance(example["tgt_txt"], str):
         return False
-        
-    src_len = len(tokenizer(example["src_txt"], add_special_tokens=True, truncation=False)["input_ids"])
-    tgt_len = len(tokenizer(example["tgt_txt"], add_special_tokens=True, truncation=False)["input_ids"])
+
+    src_len = len(tokenizer(example["src_txt"], truncation=False)["input_ids"])
+    tgt_len = len(tokenizer(example["tgt_txt"], truncation=False)["input_ids"])
     return (src_len <= MAX_SRC_LEN) and (tgt_len <= MAX_TGT_LEN)
 
-raw = load_dataset(DATASET_NAME, "train", split="eng_hin")
-
-# --- STEP 1: Cast to Binary (to safely load corrupt rows) ---
-print("1. Casting to binary to bypass encoding errors...")
-raw = raw.cast_column("src_txt", Value("binary"))
-raw = raw.cast_column("tgt_txt", Value("binary"))
-
 def clean_utf8(example):
-    # safely decode, defaulting to empty string if None
     s = example["src_txt"]
     t = example["tgt_txt"]
     example["src_txt"] = s.decode("utf-8", errors="ignore") if s is not None else ""
     example["tgt_txt"] = t.decode("utf-8", errors="ignore") if t is not None else ""
     return example
-# --- STEP 2: Decode Bytes to String (Ignoring Errors) ---
-print("2. Cleaning UTF-8 errors...")
-# ADDED num_proc=32 here
-raw = raw.map(clean_utf8, desc="Decoding UTF-8", num_proc=32)
-
-# --- STEP 3: Cast Back to String (CRITICAL FIX) ---
-print("3. Casting back to string format...")
-raw = raw.cast_column("src_txt", Value("string"))
-raw = raw.cast_column("tgt_txt", Value("string"))
-
-# --- STEP 4: Remove Empty Rows ---
-# ADDED num_proc=32 to both filters below
-raw = raw.filter(lambda x: x["src_txt"] and len(x["src_txt"].strip()) > 0, desc="Removing empty src", num_proc=32)
-raw = raw.filter(lambda x: x["tgt_txt"] and len(x["tgt_txt"].strip()) > 0, desc="Removing empty tgt", num_proc=32)
-
-print("4. Applying logic filters...")
-raw = raw.filter(strict_filter, desc="Strict Filter", num_proc=32)
-raw = raw.filter(length_filter, desc="Length Filter")
-
-limit = len(raw) if MAX_TRAIN_SAMPLES is None else min(MAX_TRAIN_SAMPLES, len(raw))
-# ... (rest of script)
-raw = raw.shuffle(seed=42).select(range(limit))
-
-split = raw.train_test_split(test_size=0.1, seed=42)
-train_set = split["train"]
-val_set   = split["test"]
-
-print(f"Train: {len(train_set)} | Val: {len(val_set)}")
 
 # ============================================================
-# 4. BIDIRECTIONAL PROMPT FORMAT (STRICT PARITY)
+# 5. LOAD OFFICIAL TRAIN + DEV SPLITS
+# ============================================================
+print("Loading Pralekha train & dev splits...")
+
+train_raw = load_dataset(DATASET_NAME, "train", split="eng_hin")
+dev_raw   = load_dataset(DATASET_NAME, "dev",   split="eng_hin")
+
+def preprocess(ds, desc):
+    print(f"\nProcessing {desc} split...")
+
+    ds = ds.cast_column("src_txt", Value("binary"))
+    ds = ds.cast_column("tgt_txt", Value("binary"))
+
+    ds = ds.map(clean_utf8, num_proc=32, desc="UTF-8 cleaning")
+
+    ds = ds.cast_column("src_txt", Value("string"))
+    ds = ds.cast_column("tgt_txt", Value("string"))
+
+    ds = ds.filter(lambda x: x["src_txt"].strip(), num_proc=32, desc="Remove empty src")
+    ds = ds.filter(lambda x: x["tgt_txt"].strip(), num_proc=32, desc="Remove empty tgt")
+
+    ds = ds.filter(strict_filter, num_proc=32, desc="Strict similarity filter")
+    ds = ds.filter(length_filter, desc="Length filter")
+
+    return ds
+
+train_raw = preprocess(train_raw, "TRAIN")
+dev_raw   = preprocess(dev_raw,   "DEV")
+
+if MAX_TRAIN_SAMPLES is not None:
+    train_raw = train_raw.shuffle(seed=42).select(range(MAX_TRAIN_SAMPLES))
+
+print(f"\nFinal sizes → Train: {len(train_raw)} | Dev: {len(dev_raw)}")
+
+# ============================================================
+# 6. BIDIRECTIONAL PROMPT FORMAT (STRICT PARITY)
 # ============================================================
 def format_fn(batch):
     prompts, completions = [], []
+
     for i in range(len(batch["src_txt"])):
         if i % 2 == 0:
             instr, src, tgt = "Translate to HINDI DEVANAGARI:", batch["src_txt"][i], batch["tgt_txt"][i]
@@ -138,17 +124,16 @@ def format_fn(batch):
 
     return {"prompt": prompts, "completion": completions}
 
-train_ds = train_set.map(format_fn, batched=True, remove_columns=train_set.column_names)
-val_ds   = val_set.map(format_fn, batched=True, remove_columns=val_set.column_names)
+train_ds = train_raw.map(format_fn, batched=True, remove_columns=train_raw.column_names)
+dev_ds   = dev_raw.map(format_fn,   batched=True, remove_columns=dev_raw.column_names)
 
 # ============================================================
-# 5. MODEL + LoRA
+# 7. MODEL + LoRA
 # ============================================================
 model = AutoModelForCausalLM.from_pretrained(
     MODEL_ID,
-    dtype=torch.bfloat16,
-    attn_implementation="flash_attention_2",
-    #device_map="auto"
+    torch_dtype=torch.bfloat16,
+    attn_implementation="flash_attention_2"
 )
 
 peft_config = LoraConfig(
@@ -164,12 +149,12 @@ peft_config = LoraConfig(
 )
 
 # ============================================================
-# 6. TRAINER (MULTI-GPU + CHECKPOINTS)
+# 8. TRAINER (OFFICIAL DEV SET)
 # ============================================================
 trainer = SFTTrainer(
     model=model,
     train_dataset=train_ds,
-    eval_dataset=val_ds,
+    eval_dataset=dev_ds,
     peft_config=peft_config,
     args=SFTConfig(
         output_dir=str(CKPT_DIR),
@@ -181,8 +166,6 @@ trainer = SFTTrainer(
         logging_steps=400,
 
         bf16=True,
-        #dataloader_num_workers=16,
-
         eval_strategy="steps",
         eval_steps=500,
         save_strategy="steps",
@@ -193,11 +176,11 @@ trainer = SFTTrainer(
         gradient_checkpointing=True,
         lr_scheduler_type="cosine",
         warmup_ratio=0.1,
-        
         weight_decay=0.01,
+
         completion_only_loss=True,
-        report_to="none",
         packing=False,
+        report_to="none",
         ddp_find_unused_parameters=False
     )
 )
@@ -205,7 +188,7 @@ trainer = SFTTrainer(
 trainer.train()
 
 # ============================================================
-# 7. LOSS CURVES
+# 9. LOSS CURVES
 # ============================================================
 logs = trainer.state.log_history
 train_loss = [(x["step"], x["loss"]) for x in logs if "loss" in x]
@@ -213,17 +196,17 @@ val_loss   = [(x["step"], x["eval_loss"]) for x in logs if "eval_loss" in x]
 
 plt.figure()
 plt.plot(*zip(*train_loss), label="Train Loss")
-plt.plot(*zip(*val_loss), label="Val Loss")
+plt.plot(*zip(*val_loss), label="Dev Loss")
 plt.legend()
 plt.xlabel("Steps")
 plt.ylabel("Loss")
-plt.title("Training vs Validation Loss")
+plt.title("Training vs Dev Loss")
 plt.tight_layout()
 plt.savefig(OUTPUT_DIR / "loss_curve.png")
 plt.close()
 
 # ============================================================
-# 8. FINAL MERGED MODEL SAVE
+# 10. FINAL MERGED MODEL SAVE
 # ============================================================
 merged_model = trainer.model.merge_and_unload()
 merged_model = merged_model.to("cpu").eval()
@@ -234,5 +217,6 @@ FINAL_MODEL_DIR.mkdir(exist_ok=True)
 merged_model.save_pretrained(FINAL_MODEL_DIR)
 tokenizer.save_pretrained(FINAL_MODEL_DIR)
 
-print("\n✅ TRAINING COMPLETE")
+print("\n✅ TRAINING COMPLETE (OFFICIAL DEV SET USED)")
 print(f"📁 Checkpoints: {CKPT_DIR}")
+print(f"📦 Final model: {FINAL_MODEL_DIR}")
