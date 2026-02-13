@@ -179,7 +179,7 @@ trainer = SFTTrainer(
         weight_decay=0.01,
 
         completion_only_loss=True,
-        packing=False,
+        packing=True,
         report_to="none",
         ddp_find_unused_parameters=False
     )
