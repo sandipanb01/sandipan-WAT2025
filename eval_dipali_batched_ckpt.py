@@ -27,7 +27,7 @@ DATASET_NAME = "ai4bharat/Pralekha"
 EVAL_SPLIT = "test"
 
 MAX_TGT_LEN = 2400
-BATCH_SIZE = 4  # adjust based on GPU memory
+BATCH_SIZE = 8  # adjust based on GPU memory
 DEVICE = "cuda"
 
 # ============================================================
