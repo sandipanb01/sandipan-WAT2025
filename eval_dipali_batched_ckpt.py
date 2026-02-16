@@ -5,9 +5,7 @@ import os
 import json
 import torch
 import sacrebleu
-import numpy as np
 import pandas as pd
-import unicodedata
 import matplotlib.pyplot as plt
 
 from tqdm import tqdm
@@ -25,12 +23,12 @@ torch.cuda.manual_seed_all(42)
 BASE_MODEL_ID = "google/gemma-3-270m-it"
 DATASET_NAME = "ai4bharat/Pralekha"
 EVAL_SPLIT = "test"
-DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 CHECKPOINT_ROOT = Path("./gemma3_outputs/checkpoints")
 OUTPUT_ROOT = Path("./checkpoint_eval_outputs")
 OUTPUT_ROOT.mkdir(parents=True, exist_ok=True)
 
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 BATCH_SIZE = 8
 MAX_NEW_TOKENS = 2400
 
@@ -43,33 +41,28 @@ def calc_metrics(preds, refs):
     return round(bleu, 2), round(chrf, 2)
 
 # ============================================================
-# 3. LOAD DATA (ONCE)
+# 3. LOAD TEST DATA (ONCE)
 # ============================================================
-print("📥 Loading Pralekha test split...")
+print("📥 Loading Pralekha TEST split...")
 raw_dataset = load_dataset(DATASET_NAME, EVAL_SPLIT, split="eng_hin")
 
 # ============================================================
-# 4. TOKENIZER (ONCE)
+# 4. TOKENIZER (SAME AS TRAINING)
 # ============================================================
 tokenizer = AutoTokenizer.from_pretrained(BASE_MODEL_ID)
 tokenizer.pad_token = tokenizer.eos_token
-tokenizer.padding_side = "right"
+#tokenizer.padding_side = "right"
 
 # ============================================================
-# 5. PROMPT BUILDERS (ADVISOR STYLE)
+# 5. PROMPT BUILDERS (EXACT TRAINING PARITY)
 # ============================================================
 def build_prompt_eng_to_hin(example):
     prompt = (
-        "Translate the following text from English to Hindi:\n"
-        f"English: {example['src_txt']}\n"
-        "Hindi:"
-    )
-
-    messages = [{"role": "user", "content": prompt}]
-    prompt = tokenizer.apply_chat_template(
-        messages,
-        tokenize=False,
-        add_generation_prompt=True,
+        "<start_of_turn>user\n"
+        "Translate to HINDI DEVANAGARI:\n"
+        f"{example['src_txt']}"
+        "<end_of_turn>\n"
+        "<start_of_turn>model\n"
     )
 
     tokens = tokenizer(prompt, truncation=True)
@@ -83,16 +76,11 @@ def build_prompt_eng_to_hin(example):
 
 def build_prompt_hin_to_eng(example):
     prompt = (
-        "Translate the following text from Hindi to English:\n"
-        f"Hindi: {example['tgt_txt']}\n"
-        "English:"
-    )
-
-    messages = [{"role": "user", "content": prompt}]
-    prompt = tokenizer.apply_chat_template(
-        messages,
-        tokenize=False,
-        add_generation_prompt=True,
+        "<start_of_turn>user\n"
+        "Translate to ENGLISH:\n"
+        f"{example['tgt_txt']}"
+        "<end_of_turn>\n"
+        "<start_of_turn>model\n"
     )
 
     tokens = tokenizer(prompt, truncation=True)
@@ -104,16 +92,22 @@ def build_prompt_hin_to_eng(example):
         "source": example["tgt_txt"],
     }
 
-# Build datasets ONCE
-dataset_e2h = raw_dataset.map(build_prompt_eng_to_hin, remove_columns=raw_dataset.column_names)
-dataset_h2e = raw_dataset.map(build_prompt_hin_to_eng, remove_columns=raw_dataset.column_names)
+# Build datasets ONCE (fast)
+dataset_e2h = raw_dataset.map(
+    build_prompt_eng_to_hin,
+    remove_columns=raw_dataset.column_names,
+)
+dataset_h2e = raw_dataset.map(
+    build_prompt_hin_to_eng,
+    remove_columns=raw_dataset.column_names,
+)
 
 # ============================================================
 # 6. DISCOVER CHECKPOINTS
 # ============================================================
 checkpoints = sorted(
     [p for p in CHECKPOINT_ROOT.iterdir() if p.name.startswith("checkpoint-")],
-    key=lambda x: int(x.name.split("-")[-1])
+    key=lambda x: int(x.name.split("-")[-1]),
 )
 
 assert checkpoints, "❌ No checkpoints found"
@@ -150,17 +144,18 @@ for ckpt in checkpoints:
     jsonl_rows = []
 
     # --------------------------------------------------------
-    # 7.2 BATCHED INFERENCE FUNCTION
+    # 7.2 BATCHED INFERENCE (ADVISOR STYLE)
     # --------------------------------------------------------
     def run_eval(dataset, mode):
         for i in tqdm(range(0, len(dataset), BATCH_SIZE), desc=mode):
-            batch = dataset[i:i+BATCH_SIZE]
+            batch = dataset[i:i + BATCH_SIZE]
 
             padded = tokenizer.pad(
                 {
                     "input_ids": batch["input_ids"],
                     "attention_mask": batch["attention_mask"],
                 },
+                padding=True,
                 return_tensors="pt",
             )
 
@@ -179,7 +174,10 @@ for ckpt in checkpoints:
                 )
 
             new_tokens = outputs[:, input_ids.shape[1]:]
-            decoded = tokenizer.batch_decode(new_tokens, skip_special_tokens=True)
+            decoded = tokenizer.batch_decode(
+                new_tokens,
+                skip_special_tokens=True,
+            )
 
             for pred, ref, src in zip(decoded, batch["reference"], batch["source"]):
                 all_preds[mode].append(pred)
@@ -224,7 +222,7 @@ for ckpt in checkpoints:
         for r in jsonl_rows:
             line = json.dumps(
                 {"src": r["src"], "ref": r["ref"], "pred": r["pred"]},
-                ensure_ascii=False
+                ensure_ascii=False,
             )
             if r["mode"] == "ENG_to_HIN":
                 fe.write(line + "\n")
