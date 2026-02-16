@@ -32,7 +32,7 @@ DEVICE = "cuda"
 dataset = load_dataset(DATASET_NAME, EVAL_SPLIT, split="eng_hin")
 
 from huggingface_hub import login
-login("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")
+login("HF_TOKEN")
 tokenizer = AutoTokenizer.from_pretrained(BASE_MODEL_ID)
 tokenizer.pad_token = tokenizer.eos_token
 # tokenizer.padding_side = "right"
