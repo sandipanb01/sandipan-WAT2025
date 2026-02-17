@@ -20,6 +20,7 @@ import evaluate
 # ============================================================
 torch.manual_seed(42)
 torch.cuda.manual_seed_all(42)
+!git clone https://github.com/salesforce/localization-xml-mt.git
 
 BASE_MODELS = {
     "gemma_270m_it": "google/gemma-3-270m-it",
