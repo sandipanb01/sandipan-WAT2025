@@ -91,7 +91,7 @@ def load_dev_as_test(root, lang_pair):
 
     return src_texts, tgt_texts
 
-print(type(src_texts[0]), src_texts[0][:80])
+#print(type(src_texts[0]), src_texts[0][:80])
 
 
 # ============================================================
