@@ -251,4 +251,137 @@ if "google.colab" in sys.modules:
     files.download(f"{OUTPUT_FOLDER}.zip")
 else:
     print("Not running in Colab — download the ZIP manually.")
+# ============================================================
+# │ XML MARKUP RETENTION CHECK
+# ============================================================
+
+import re
+from collections import Counter
+
+def extract_xml_tags(text):
+    """
+    Extract all XML-like tags from a string.
+    Example: "<b>Hello</b>" -> ['<b>', '</b>']
+    """
+    return re.findall(r"</?[^>]+>", text)
+
+def compute_xml_retention(src_texts, predictions):
+    """
+    Compute percentage of XML tags in source that are present in prediction.
+    Returns a list of retention percentages for each sample.
+    """
+    retention_scores = []
+
+    for src, pred in zip(src_texts, predictions):
+        src_tags = extract_xml_tags(src)
+        if not src_tags:
+            retention_scores.append(1.0)  # no tags to preserve, consider 100%
+            continue
+
+        pred_tags = extract_xml_tags(pred)
+        # Count tags in source and prediction
+        src_count = Counter(src_tags)
+        pred_count = Counter(pred_tags)
+
+        # Compute proportion of tags in src that appear in pred
+        retained = sum(min(src_count[tag], pred_count.get(tag, 0)) for tag in src_count)
+        total = sum(src_count.values())
+        retention_scores.append(retained / total)
+
+    return retention_scores
+
+# Run XML retention check
+xml_retention_scores = compute_xml_retention(src_texts, predictions)
+avg_xml_retention = np.mean(xml_retention_scores)
+
+print(f"Average XML tag retention: {avg_xml_retention*100:.2f}%")
+
+# Optionally, save per-sample retention
+xml_csv_file = os.path.join(OUTPUT_FOLDER, f"xml_retention_{lang_pair}_{model_key}.csv")
+pd.DataFrame({
+    "src": src_texts,
+    "pred": predictions,
+    "xml_retention": xml_retention_scores
+}).to_csv(xml_csv_file, index=False)
+print(f"Saved XML retention per sample to {xml_csv_file}")
+# ============================================================
+# │ XML MARKUP RETENTION PER LANGUAGE DIRECTION
+# ============================================================
+
+import re
+import numpy as np
+import pandas as pd
+import os
+
+def extract_xml_tags(text):
+    """Extract all XML-like tags from a string."""
+    return re.findall(r"</?[^>]+>", text)
+
+def compute_xml_retention(src_texts, predictions):
+    """
+    Compute percentage of XML tags in source preserved in prediction.
+    Returns a list of retention percentages per sample.
+    """
+    retention_scores = []
+
+    for src, pred in zip(src_texts, predictions):
+        src_tags = extract_xml_tags(src)
+        if not src_tags:
+            retention_scores.append(1.0)  # no tags to preserve → 100%
+            continue
+
+        pred_tags = extract_xml_tags(pred)
+        # Count tags in source and prediction
+        from collections import Counter
+        src_count = Counter(src_tags)
+        pred_count = Counter(pred_tags)
+
+        # Calculate proportion of source tags retained
+        retained = sum(min(src_count[tag], pred_count.get(tag, 0)) for tag in src_count)
+        total = sum(src_count.values())
+        retention_scores.append(retained / total)
+
+    return retention_scores
+
+# =========================
+# Run per language direction
+# =========================
+
+xml_retention_summary = {}
+
+for lang_pair in LANG_PAIRS:
+    # Load previous predictions and sources
+    jsonl_file = os.path.join(OUTPUT_FOLDER, f"{lang_pair}_{model_key}_predictions.jsonl")
+    if not os.path.exists(jsonl_file):
+        print(f"Predictions file missing for {lang_pair}, skipping XML retention check.")
+        continue
+
+    src_texts_lang = []
+    pred_texts_lang = []
+
+    with open(jsonl_file, "r", encoding="utf-8") as f:
+        for line in f:
+            item = json.loads(line)
+            src_texts_lang.append(item["src"])
+            pred_texts_lang.append(item["pred"])
+
+    # Compute retention
+    xml_scores = compute_xml_retention(src_texts_lang, pred_texts_lang)
+    avg_retention = np.mean(xml_scores)
+    xml_retention_summary[lang_pair] = avg_retention
+
+    # Save per-language CSV
+    csv_file = os.path.join(OUTPUT_FOLDER, f"xml_retention_{lang_pair}_{model_key}.csv")
+    pd.DataFrame({
+        "src": src_texts_lang,
+        "pred": pred_texts_lang,
+        "xml_retention": xml_scores
+    }).to_csv(csv_file, index=False)
+    print(f"[{lang_pair}] Saved per-sample XML retention CSV: {csv_file}")
+    print(f"[{lang_pair}] Average XML tag retention: {avg_retention*100:.2f}%\n")
+
+# Summary table
+summary_file = os.path.join(OUTPUT_FOLDER, f"xml_retention_summary_{model_key}.csv")
+pd.DataFrame.from_dict(xml_retention_summary, orient="index", columns=["avg_xml_retention"]).to_csv(summary_file)
+print(f"Saved XML retention summary across languages: {summary_file}")
 
