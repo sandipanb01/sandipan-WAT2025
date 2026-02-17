@@ -13,6 +13,7 @@ from transformers import AutoTokenizer
 # ------------------------------------------------------------
 # 1) CONFIGURATION
 # ------------------------------------------------------------
+!git clone https://github.com/salesforce/localization-xml-mt.git
 DATA_ROOT = "localization-xml-mt/data"  # root folder of Salesforce JSONs
 LANG_PAIRS = ["ende", "enfr", "ennl", "enfi", "enru"]
 SMOKE_TEST = False  # toggle True for quick test
