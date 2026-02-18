@@ -44,7 +44,7 @@ MAX_SEQ_LEN = MAX_SRC_LEN + MAX_TGT_LEN
 # ============================================================
 tokenizer = AutoTokenizer.from_pretrained(MODEL_ID)
 tokenizer.pad_token = tokenizer.eos_token
-tokenizer.padding_side = "right"
+#tokenizer.padding_side = "right"
 
 # ============================================================
 # 4. STRICT DATA FILTERING (ANTI-CHEATING)
@@ -133,6 +133,7 @@ dev_ds   = dev_raw.map(format_fn,   batched=True, remove_columns=dev_raw.column_
 model = AutoModelForCausalLM.from_pretrained(
     MODEL_ID,
     torch_dtype=torch.bfloat16,
+    device_map="auto",
     attn_implementation="sdpa"
 )
 
