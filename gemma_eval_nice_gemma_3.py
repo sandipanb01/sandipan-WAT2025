@@ -19,7 +19,7 @@ os.makedirs(OUTPUT_DIR, exist_ok=True)
 MODEL_DIR = "./gemma3-4b-train/final_merged"
 DATASET_NAME = "ai4bharat/Pralekha"
 EVAL_CONFIG = "test"
-MAX_TGT_LEN = 2400
+MAX_TGT_LEN = 2400 #doubt here
 
 # ===============================
 # LOAD MODEL (SINGLE GPU)
