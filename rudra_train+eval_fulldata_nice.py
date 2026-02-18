@@ -1,20 +1,4 @@
 # ============================================================
-# 0. INSTALL DEPENDENCIES
-# ============================================================
-!pip install -U \
-  transformers \
-  datasets \
-  accelerate \
-  peft \
-  trl \
-  sentencepiece \
-  sacrebleu \
-  langid
-
-from huggingface_hub import notebook_login
-notebook_login()
-
-# ============================================================
 # 0. IMPORTS (TRAIN)
 # ============================================================
 import torch
@@ -67,13 +51,13 @@ hin_eng = dataset["train"].filter(
 def format_example(example):
     if example["src_lang"] == "eng":
         prompt = (
-            "Translate the following sentence from English to Hindi.\n\n"
+            "Translate the following sentence from English to Hindi Devanagari.\n\n"
             f"English: {example['src_txt']}"
         )
     else:
         prompt = (
-            "Translate the following sentence from Hindi to English.\n\n"
-            f"Hindi: {example['src_txt']}"
+            "Translate the following sentence from Hindi Devanagari to English.\n\n"
+            f"Hindi Devanagari: {example['src_txt']}"
         )
 
     return {
@@ -184,15 +168,34 @@ merged_model.save_pretrained(FINAL_DIR)
 tokenizer.save_pretrained(FINAL_DIR)
 
 print("✅ TRUE BIDIRECTIONAL MODEL SAVED AT:", FINAL_DIR)
+
+# ============================================================
+# EVALUATION (ADVISOR-STRICT & DATASET-CORRECT)
+# ============================================================
+
+import torch
+import numpy as np
+import sacrebleu
+import json
+from tqdm import tqdm
+from pathlib import Path
+from datasets import load_dataset
+from transformers import AutoTokenizer, AutoModelForCausalLM
+from langdetect import detect
+
+# ============================================================
+# CONFIG
+# ============================================================
 torch.manual_seed(42)
 torch.cuda.manual_seed_all(42)
 
-BASE_MODEL_ID = "./gemma-eng-hin-bidirectional/final_merged"  # trained model
+BASE_MODEL_ID = "./gemma-eng-hin-bidirectional/final_merged"
 DATASET_NAME = "ai4bharat/Pralekha"
-EVAL_SPLIT = "test"
+DATASET_SPLIT = "eng_hin"   # ✅ ONLY valid split
+EVAL_CONFIG = "test"
+
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
-# QUICK TOGGLE
 SANITY_RUN = True
 SANITY_SAMPLES = 50
 
@@ -202,6 +205,9 @@ MAX_NEW_TOKENS = 512
 RESULTS_DIR = Path("./gemma-eng-hin-bidirectional/eval")
 RESULTS_DIR.mkdir(parents=True, exist_ok=True)
 
+# ============================================================
+# TOKENIZER + MODEL
+# ============================================================
 tokenizer = AutoTokenizer.from_pretrained(BASE_MODEL_ID)
 tokenizer.pad_token = tokenizer.eos_token
 
@@ -211,103 +217,91 @@ model = AutoModelForCausalLM.from_pretrained(
     device_map="auto",
     attn_implementation="sdpa",
 )
-
 model.eval()
 
-def build_prompt_eng_hin(example, current_tokenizer):
-    # Example will always be from 'eng_hin' split.
-    # For ENG->HIN, src_txt is English, tgt_txt is Hindi.
-    src = example["src_txt"]
-    ref = example["tgt_txt"]
+# ============================================================
+# UTILS
+# ============================================================
+def safe_detect(text):
+    try:
+        return detect(text)
+    except Exception:
+        return "unk"
+
+# ============================================================
+# PROMPT BUILDERS (ADVISOR STYLE)
+# ============================================================
+def build_prompt_eng_hin(example):
+    src = example["src_txt"]   # English
+    ref = example["tgt_txt"]   # Hindi
 
     prompt = (
-        "Translate the following text from English to Hindi:\n"
+        "Translate the following sentence from English to Hindi Devanagari.\n\n"
         f"English: {src}\n"
-        "Hindi: "
+        "Hindi Devanagari: "
     )
 
     messages = [{"role": "user", "content": prompt}]
-
-    prompt_text = current_tokenizer.apply_chat_template(
-        messages,
-        tokenize=False,
-        add_generation_prompt=True,
+    prompt_text = tokenizer.apply_chat_template(
+        messages, tokenize=False, add_generation_prompt=True
     )
 
-    tokens = current_tokenizer(
-        prompt_text, # Use the generated prompt text
-        truncation=True,
-        padding=False,
-    )
+    tokens = tokenizer(prompt_text, truncation=True, padding=False)
 
     return {
         "input_ids": tokens["input_ids"],
         "attention_mask": tokens["attention_mask"],
+        "source": src,
         "reference": ref,
-        "source": src, # The actual English source
     }
 
 
-def build_prompt_hin_eng(example, current_tokenizer):
-    # Example will always be from 'eng_hin' split.
-    # For HIN->ENG, src_txt from example is English, tgt_txt from example is Hindi.
-    # So, we need to swap them for prompt building.
-    src = example["tgt_txt"] # Hindi text from dataset's target
-    ref = example["src_txt"] # English text from dataset's source
+def build_prompt_hin_eng(example):
+    src = example["tgt_txt"]   # Hindi
+    ref = example["src_txt"]   # English
 
     prompt = (
-        "Translate the following text from Hindi to English:\n"
-        f"Hindi: {src}\n"
+        "Translate the following sentence from Hindi Devanagari to English.\n\n"
+        f"Hindi Devanagari: {src}\n"
         "English: "
     )
 
     messages = [{"role": "user", "content": prompt}]
-
-    prompt_text = current_tokenizer.apply_chat_template(
-        messages,
-        tokenize=False,
-        add_generation_prompt=True,
+    prompt_text = tokenizer.apply_chat_template(
+        messages, tokenize=False, add_generation_prompt=True
     )
 
-    tokens = current_tokenizer(
-        prompt_text, # Use the generated prompt text
-        truncation=True,
-        padding=False,
-    )
+    tokens = tokenizer(prompt_text, truncation=True, padding=False)
 
     return {
         "input_ids": tokens["input_ids"],
         "attention_mask": tokens["attention_mask"],
+        "source": src,
         "reference": ref,
-        "source": src, # The actual Hindi source
     }
 
-def run_direction(eval_src_lang, eval_tgt_lang, build_fn, tag):
+# ============================================================
+# EVALUATION RUNNER
+# ============================================================
+def run_eval(build_fn, tag):
 
-    # Always load the 'eng_hin' split from the test config
-    loaded_dataset = load_dataset(DATASET_NAME, EVAL_SPLIT, split="eng_hin")
-
-    if SANITY_RUN:
-        loaded_dataset = loaded_dataset.select(range(min(SANITY_SAMPLES, len(loaded_dataset))))
-
-    # Map the dataset using the build_fn, passing additional parameters
-    dataset = loaded_dataset.map(
-        lambda ex: build_fn(ex, tokenizer), # Pass the tokenizer to the build_fn
-        remove_columns=loaded_dataset.column_names
+    dataset = load_dataset(
+        DATASET_NAME,
+        name=EVAL_CONFIG,
+        split=DATASET_SPLIT
     )
 
+    if SANITY_RUN:
+        dataset = dataset.select(range(min(SANITY_SAMPLES, len(dataset))))
 
-    print(dataset)
+    dataset = dataset.map(build_fn, remove_columns=dataset.column_names)
 
-    predictions = []
-    references = []
-    sources = []
+    predictions, references, sources = [], [], []
 
-    print(f"\nRunning inference: {eval_src_lang} → {eval_tgt_lang}")
+    print(f"\n==== Evaluating {tag} ====")
 
     for i in tqdm(range(0, len(dataset), BATCH_SIZE)):
-
-        batch = dataset[i:i+BATCH_SIZE]
+        batch = dataset[i:i + BATCH_SIZE]
 
         padded = tokenizer.pad(
             {
@@ -329,63 +323,44 @@ def run_direction(eval_src_lang, eval_tgt_lang, build_fn, tag):
                 do_sample=False,
                 use_cache=True,
                 temperature=0.1,
-                repetition_penalty=1.1
+                repetition_penalty=1.1,
             )
 
         new_tokens = outputs[:, input_ids.shape[1]:]
-
-        decoded = tokenizer.batch_decode(
-            new_tokens,
-            skip_special_tokens=True,
-        )
+        decoded = tokenizer.batch_decode(new_tokens, skip_special_tokens=True)
 
         predictions.extend(decoded)
         references.extend(batch["reference"])
         sources.extend(batch["source"])
+
+    # ---------------- Metrics ----------------
     bleu = sacrebleu.corpus_bleu(predictions, [references]).score
     chrf = sacrebleu.corpus_chrf(predictions, [references]).score
     exact = np.mean([p.strip() == r.strip() for p, r in zip(predictions, references)])
 
-    lid_acc = np.mean([
-        safe_detect(p) == ("hi" if eval_tgt_lang == "hin" else "en")
-        for p in predictions
-    ])
+    target_lang = "hi" if tag == "eng_hin" else "en"
+    lid = np.mean([safe_detect(p) == target_lang for p in predictions])
 
-    df = pd.DataFrame({
-        "src": sources,
-        "ref": references,
-        "pred": predictions,
-    })
+    print(f"BLEU     : {bleu:.2f}")
+    print(f"chrF     : {chrf:.2f}")
+    print(f"Exact    : {exact:.4f}")
+    print(f"LID Acc  : {lid:.4f}")
 
-    df.to_json(
-        RESULTS_DIR / f"{tag}.jsonl",
-        orient="records",
-        lines=True,
-        force_ascii=False,
-    )
+    # ---------------- Save JSONL ----------------
+    out_path = RESULTS_DIR / f"{tag}.jsonl"
+    with open(out_path, "w", encoding="utf-8") as f:
+        for s, r, p in zip(sources, references, predictions):
+            f.write(json.dumps(
+                {"src": s, "ref": r, "pred": p},
+                ensure_ascii=False
+            ) + "\n")
 
-    print(f"\nTOP-5 SAMPLES ({eval_src_lang}→{eval_tgt_lang})")
-    print(df.head(5))
+    print(f"📁 Saved → {out_path}")
 
-    return {
-        "direction": f"{eval_src_lang}->{eval_tgt_lang}",
-        "BLEU": bleu,
-        "chrF": chrf,
-        "ExactMatch": exact,
-        "LID_Accuracy": lid_acc,
-    }
-metrics = []
+    return bleu, chrf, exact, lid
 
-metrics.append(
-    run_direction("eng", "hin", build_prompt_eng_hin, "eng_hin")
-)
-
-metrics.append(
-    run_direction("hin", "eng", build_prompt_hin_eng, "hin_eng")
-)
-
-metrics_df = pd.DataFrame(metrics)
-metrics_df.to_csv(RESULTS_DIR / "metrics.csv", index=False)
-
-print("\n===== FINAL METRICS =====")
-print(metrics_df)
+# ============================================================
+# RUN BOTH DIRECTIONS (CORRECT)
+# ============================================================
+run_eval(build_prompt_eng_hin, "eng_hin")
+run_eval(build_prompt_hin_eng, "hin_eng") 
