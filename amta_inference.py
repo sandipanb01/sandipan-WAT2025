@@ -45,6 +45,12 @@ MAX_NEW_TOKENS = 512
 OUTPUT_FOLDER = "salesforce_eval_outputs"
 Path(OUTPUT_FOLDER).mkdir(exist_ok=True)
 
+# =======================
+# 🔁 SANITY TEST TOGGLE
+# =======================
+SANITY_TEST = True          # ← SET False FOR FULL RUN
+SANITY_SAMPLES = 100         # ← fast smoke test size
+
 # ============================================================
 # 3. LOAD SALESFORCE DATA
 # ============================================================
@@ -74,7 +80,7 @@ def load_dev_as_test(root, lang_pair):
     return src_texts, tgt_texts
 
 # ============================================================
-# 4. PRALekha-STYLE PROMPT (VERBATIM STYLE)
+# 4. PRALekha-STYLE PROMPT (STRICT)
 # ============================================================
 def build_prompt(src, tgt_lang):
     return (
@@ -116,6 +122,13 @@ def compute_xml_retention(srcs, preds):
 for lang_pair in LANG_PAIRS:
     print(f"\n=== {lang_pair.upper()} ===")
     src_texts, tgt_texts = load_dev_as_test(DATA_ROOT, lang_pair)
+
+    # 🔹 SANITY SLICE
+    if SANITY_TEST:
+        src_texts = src_texts[:SANITY_SAMPLES]
+        tgt_texts = tgt_texts[:SANITY_SAMPLES]
+        print(f"⚡ SANITY MODE: {SANITY_SAMPLES} samples")
+
     tgt_lang = LANG_MAP[lang_pair]
 
     dataset = Dataset.from_dict({
@@ -128,7 +141,7 @@ for lang_pair in LANG_PAIRS:
 
         tokenizer = AutoTokenizer.from_pretrained(model_name)
         tokenizer.pad_token = tokenizer.eos_token
-        #tokenizer.padding_side = "right"
+        tokenizer.padding_side = "right"
 
         model = AutoModelForCausalLM.from_pretrained(
             model_name,
@@ -155,13 +168,12 @@ for lang_pair in LANG_PAIRS:
                     **inputs,
                     max_new_tokens=MAX_NEW_TOKENS,
                     do_sample=False,
-                    use_cache=True
                     temperature=0.1,
                     repetition_penalty=1.1,
                 )
 
             # ================================
-            # DECODING LOGIC
+            # ✅ SAFE MT DECODING (YOUR CHOICE)
             # ================================
             decoded = tokenizer.batch_decode(
                 outputs,
@@ -222,7 +234,8 @@ for lang_pair in LANG_PAIRS:
             "BLEU": bleu_score,
             "chrF": chrf_score,
             "chrF++": chrf2_score,
-            "XML_retention": avg_xml
+            "XML_retention": avg_xml,
+            "sanity_mode": SANITY_TEST
         }]).to_csv(
             f"{OUTPUT_FOLDER}/{lang_pair}_{model_key}_metrics.csv",
             index=False
@@ -232,4 +245,4 @@ for lang_pair in LANG_PAIRS:
 # 8. ZIP RESULTS
 # ============================================================
 shutil.make_archive(OUTPUT_FOLDER, "zip", OUTPUT_FOLDER)
-print(f"\n✅ All results saved and zipped → {OUTPUT_FOLDER}.zip")
+print(f"\n✅ DONE → {OUTPUT_FOLDER}.zip")
