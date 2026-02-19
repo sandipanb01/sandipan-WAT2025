@@ -29,8 +29,9 @@ OUTPUT_ROOT = Path("./checkpoint_eval_outputs")
 OUTPUT_ROOT.mkdir(parents=True, exist_ok=True)
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+
 BATCH_SIZE = 8
-MAX_NEW_TOKENS = 2400
+MAX_NEW_TOKENS = 3500
 
 # ============================================================
 # 2. METRICS
@@ -41,92 +42,42 @@ def calc_metrics(preds, refs):
     return round(bleu, 2), round(chrf, 2)
 
 # ============================================================
-# 3. LOAD TEST DATA (ONCE)
+# 3. LOAD TEST DATA (RAW, UNTOUCHED)
 # ============================================================
-print("📥 Loading Pralekha TEST split...")
-raw_dataset = load_dataset(DATASET_NAME, EVAL_SPLIT, split="eng_hin")
+print("Loading Pralekha TEST split...")
+test_set = load_dataset(DATASET_NAME, EVAL_SPLIT, split="eng_hin")
 
 # ============================================================
-# 4. TOKENIZER (SAME AS TRAINING)
+# 4. TOKENIZER (IDENTICAL TO TRAINING)
 # ============================================================
 tokenizer = AutoTokenizer.from_pretrained(BASE_MODEL_ID)
 tokenizer.pad_token = tokenizer.eos_token
-#tokenizer.padding_side = "right"
 
 # ============================================================
-# 5. PROMPT BUILDERS (EXACT TRAINING PARITY)
-# ============================================================
-def build_prompt_eng_to_hin(example):
-    prompt = (
-        "<start_of_turn>user\n"
-        "Translate to HINDI DEVANAGARI:\n"
-        f"{example['src_txt']}"
-        "<end_of_turn>\n"
-        "<start_of_turn>model\n"
-    )
-
-    tokens = tokenizer(prompt, truncation=True)
-
-    return {
-        "input_ids": tokens["input_ids"],
-        "attention_mask": tokens["attention_mask"],
-        "reference": example["tgt_txt"],
-        "source": example["src_txt"],
-    }
-
-def build_prompt_hin_to_eng(example):
-    prompt = (
-        "<start_of_turn>user\n"
-        "Translate to ENGLISH:\n"
-        f"{example['tgt_txt']}"
-        "<end_of_turn>\n"
-        "<start_of_turn>model\n"
-    )
-
-    tokens = tokenizer(prompt, truncation=True)
-
-    return {
-        "input_ids": tokens["input_ids"],
-        "attention_mask": tokens["attention_mask"],
-        "reference": example["src_txt"],
-        "source": example["tgt_txt"],
-    }
-
-# Build datasets ONCE (fast)
-dataset_e2h = raw_dataset.map(
-    build_prompt_eng_to_hin,
-    remove_columns=raw_dataset.column_names,
-)
-dataset_h2e = raw_dataset.map(
-    build_prompt_hin_to_eng,
-    remove_columns=raw_dataset.column_names,
-)
-
-# ============================================================
-# 6. DISCOVER CHECKPOINTS
+# 5. DISCOVER CHECKPOINTS
 # ============================================================
 checkpoints = sorted(
     [p for p in CHECKPOINT_ROOT.iterdir() if p.name.startswith("checkpoint-")],
     key=lambda x: int(x.name.split("-")[-1]),
 )
 
-assert checkpoints, "❌ No checkpoints found"
-print(f"✅ Found {len(checkpoints)} checkpoints")
+assert checkpoints, "No checkpoints found"
+print(f" Found {len(checkpoints)} checkpoints")
 
 summary_rows = []
 
 # ============================================================
-# 7. MAIN CHECKPOINT LOOP
+# 6. MAIN CHECKPOINT LOOP
 # ============================================================
 for ckpt in checkpoints:
     step = int(ckpt.name.split("-")[-1])
-    print(f"\n🚀 Evaluating checkpoint-{step}")
+    print(f"\n Evaluating checkpoint-{step}")
 
     ckpt_out = OUTPUT_ROOT / ckpt.name
     ckpt_out.mkdir(exist_ok=True)
 
     # --------------------------------------------------------
-    # 7.1 LOAD BASE + LoRA → MERGE
+    # 6.1 LOAD BASE + LORA → MERGE
     # --------------------------------------------------------
     base_model = AutoModelForCausalLM.from_pretrained(
         BASE_MODEL_ID,
@@ -144,59 +95,72 @@ for ckpt in checkpoints:
     jsonl_rows = []
 
     # --------------------------------------------------------
-    # 7.2 BATCHED INFERENCE (ADVISOR STYLE)
+    # 6.2 STRICT PROMPT-PARITY BATCHED INFERENCE
     # --------------------------------------------------------
-    def run_eval(dataset, mode):
-        for i in tqdm(range(0, len(dataset), BATCH_SIZE), desc=mode):
-            batch = dataset[i:i + BATCH_SIZE]
+    for i in tqdm(range(0, len(test_set), BATCH_SIZE), desc="Inference"):
+        batch = test_set[i:i + BATCH_SIZE]
 
-            padded = tokenizer.pad(
-                {
-                    "input_ids": batch["input_ids"],
-                    "attention_mask": batch["attention_mask"],
-                },
-                padding=True,
-                return_tensors="pt",
-            )
+        prompts = []
+        modes = []
+        refs = []
+        srcs = []
 
-            input_ids = padded["input_ids"].to(model.device)
-            attention_mask = padded["attention_mask"].to(model.device)
+        for src_txt, tgt_txt in zip(batch["src_txt"], batch["tgt_txt"]):
+            pairs = [
+                ("ENG_to_HIN", "Translate to HINDI DEVANAGARI:", src_txt, tgt_txt),
+                ("HIN_to_ENG", "Translate to ENGLISH:", tgt_txt, src_txt),
+            ]
 
-            with torch.no_grad():
-                outputs = model.generate(
-                    input_ids=input_ids,
-                    attention_mask=attention_mask,
-                    max_new_tokens=MAX_NEW_TOKENS,
-                    do_sample=False,
-                    use_cache=True,
-                    temperature=0.1,
-                    repetition_penalty=1.1
+            for mode, instr, src, ref in pairs:
+                # EXACT TRAINING PROMPT 
+                prompt = (
+                    f"<start_of_turn>user\n"
+                    f"{instr}\n"
+                    f"{src}"
+                    f"<end_of_turn>\n"
+                    f"<start_of_turn>model\n"
                 )
 
-            new_tokens = outputs[:, input_ids.shape[1]:]
-            decoded = tokenizer.batch_decode(
-                new_tokens,
-                skip_special_tokens=True,
+                prompts.append(prompt)
+                modes.append(mode)
+                refs.append(ref)
+                srcs.append(src)
+
+        inputs = tokenizer(
+            prompts,
+            padding=True,
+            return_tensors="pt",
+        ).to(model.device)
+
+        with torch.no_grad():
+            outputs = model.generate(
+                **inputs,
+                max_new_tokens=MAX_NEW_TOKENS,
+                do_sample=False,
+                temperature=0.1,
+                repetition_penalty=1.1,
+                use_cache=True,
             )
 
-            for pred, ref, src in zip(decoded, batch["reference"], batch["source"]):
-                all_preds[mode].append(pred)
-                all_refs[mode].append(ref)
-                jsonl_rows.append({
-                    "mode": mode,
-                    "src": src,
-                    "ref": ref,
-                    "pred": pred,
-                })
+        # Slice off prompt tokens EXACTLY
+        gen_tokens = outputs[:, inputs.input_ids.shape[1]:]
+        decoded = tokenizer.batch_decode(gen_tokens, skip_special_tokens=True)
+
+        for mode, pred, ref, src in zip(modes, decoded, refs, srcs):
+            pred = pred.strip()
+
+            all_preds[mode].append(pred)
+            all_refs[mode].append(ref)
+
+            jsonl_rows.append({
+                "mode": mode,
+                "src": src,
+                "ref": ref,
+                "pred": pred,
+            })
 
     # --------------------------------------------------------
-    # 7.3 RUN BOTH DIRECTIONS
-    # --------------------------------------------------------
-    run_eval(dataset_e2h, "ENG_to_HIN")
-    run_eval(dataset_h2e, "HIN_to_ENG")
-
-    # --------------------------------------------------------
-    # 7.4 METRICS
+    # 6.3 METRICS
     # --------------------------------------------------------
     e2h_bleu, e2h_chrf = calc_metrics(
         all_preds["ENG_to_HIN"], all_refs["ENG_to_HIN"]
@@ -214,7 +178,7 @@ for ckpt in checkpoints:
     })
 
     # --------------------------------------------------------
-    # 7.5 SAVE JSONL
+    # 6.4 SAVE JSONL
     # --------------------------------------------------------
     with open(ckpt_out / "eng_to_hin.jsonl", "w", encoding="utf-8") as fe, \
          open(ckpt_out / "hin_to_eng.jsonl", "w", encoding="utf-8") as fh:
@@ -230,13 +194,13 @@ for ckpt in checkpoints:
                 fh.write(line + "\n")
 
     # --------------------------------------------------------
-    # 7.6 CLEANUP
+    # 6.5 CLEANUP
     # --------------------------------------------------------
     del model, base_model
     torch.cuda.empty_cache()
 
 # ============================================================
-# 8. SAVE METRICS + PLOTS
+# 7. SAVE METRICS + PLOTS
 # ============================================================
 df = pd.DataFrame(summary_rows).sort_values("step")
 df.to_csv(OUTPUT_ROOT / "checkpoint_metrics.csv", index=False)
@@ -261,6 +225,6 @@ plt.tight_layout()
 plt.savefig(OUTPUT_ROOT / "chrf_vs_steps.png")
 plt.close()
 
-print("\n✅ ALL CHECKPOINTS EVALUATED")
-print("📊 Metrics → checkpoint_metrics.csv")
-print("📈 Plots saved")
+print("\n ALL CHECKPOINTS EVALUATED")
+print(" Metrics → checkpoint_metrics.csv")
+print(" Plots saved")
