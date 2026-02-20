@@ -30,9 +30,10 @@ DATASET_NAME = "ai4bharat/Pralekha"
 EVAL_CONFIG = "test"
 
 EVAL_SAMPLES = None
-MAX_SRC_LEN = 2400
-MAX_TGT_LEN = 2400
+MAX_SRC_LEN = 3500
+MAX_TGT_LEN = 3500
 BATCH_SIZE = 8
+MAX_TOKENS = 3500
 
 OUTPUT_DIR = "baseline_eval_outputs"
 Path(OUTPUT_DIR).mkdir(exist_ok=True)
@@ -77,8 +78,9 @@ print(f"✅ Evaluation samples: {len(eval_dataset)}")
 # ============================================================
 model = AutoModelForCausalLM.from_pretrained(
     MODEL_ID,
-    torch_dtype=torch.bfloat16,
-    device_map="auto"
+    torch_dtype=torch.bfloat16 if torch.cuda.is_available() else torch.float32,
+    device_map="auto",
+    attn_implementation="sdpa"
 )
 model.eval()
 
@@ -119,18 +121,12 @@ for sample in tqdm(eval_dataset, desc="Evaluating"):
         )
         meta.append((mode, src, ref))
 
-    inputs = tokenizer(
-        prompts,
-        return_tensors="pt",
-        padding=True,
-        truncation=True,
-        max_length=MAX_SRC_LEN
-    ).to(model.device)
+    inputs = tokenizer(prompt, truncation=True, padding=False, return_tensors="pt").to(model.device)
 
     with torch.no_grad():
         outputs = model.generate(
             **inputs,
-            max_new_tokens=MAX_TGT_LEN,
+            max_new_tokens=MAX_TOKENS,
             do_sample=False,
             use_cache=True, 
             temperature=0.1,
