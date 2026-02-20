@@ -121,7 +121,7 @@ for sample in tqdm(eval_dataset, desc="Evaluating"):
         )
         meta.append((mode, src, ref))
 
-    inputs = tokenizer(prompt, truncation=True, padding=False, return_tensors="pt").to(model.device)
+    inputs = tokenizer(prompt, truncation=False, padding=False, return_tensors="pt").to(model.device)
 
     with torch.no_grad():
         outputs = model.generate(
