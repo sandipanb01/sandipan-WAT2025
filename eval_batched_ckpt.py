@@ -128,7 +128,7 @@ for ckpt in checkpoints:
 
         inputs = tokenizer(
             prompts,
-            truncation=True,
+            truncation=False,
             padding=False,
             return_tensors="pt",
         ).to(model.device)
