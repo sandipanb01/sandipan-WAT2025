@@ -10,6 +10,7 @@ import unicodedata
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
+
 from tqdm import tqdm
 from pathlib import Path
 from difflib import SequenceMatcher
@@ -25,7 +26,7 @@ import sacrebleu
 set_seed(42)
 
 # ============================================================
-# 2. CONFIG (STRICTLY FROM SCRIPT B)
+# 2. CONFIG (STRICT)
 # ============================================================
 MODEL_ID = "google/gemma-3-4b-it"
 DATASET_NAME = "ai4bharat/Pralekha"
@@ -44,15 +45,17 @@ MAX_TGT_LEN = 2400
 MAX_TOKENS = 3500
 MAX_SEQ_LEN = MAX_SRC_LEN + MAX_TGT_LEN
 
+BATCH_SIZE_INFER = 4   # 🔒 SAFE FOR 4B ON A100 / L4
+
 # ============================================================
 # 3. TOKENIZER
 # ============================================================
 tokenizer = AutoTokenizer.from_pretrained(MODEL_ID)
 tokenizer.pad_token = tokenizer.eos_token
-#tokenizer.padding_side = "right"
+tokenizer.padding_side = "left"   # REQUIRED FOR BATCHED INFERENCE
 
 # ============================================================
-# 4. STRICT FILTERS (ANTI-CHEATING)
+# 4. STRICT FILTERS
 # ============================================================
 def strict_filter(example):
     s = example["src_txt"].lower()
@@ -70,7 +73,7 @@ def clean_utf8(example):
     return example
 
 # ============================================================
-# 5. LOAD TRAIN + DEV + TEST (OFFICIAL)
+# 5. LOAD DATA (OFFICIAL SPLITS)
 # ============================================================
 print("Loading Pralekha splits...")
 
@@ -93,13 +96,10 @@ train_raw = preprocess(train_raw)
 dev_raw   = preprocess(dev_raw)
 test_raw  = preprocess(test_raw)
 
-if MAX_TRAIN_SAMPLES:
-    train_raw = train_raw.shuffle(seed=42).select(range(MAX_TRAIN_SAMPLES))
-
 print(f"Train: {len(train_raw)} | Dev: {len(dev_raw)} | Test: {len(test_raw)}")
 
 # ============================================================
-# 6. BIDIRECTIONAL PROMPT FORMAT (STRICT PARITY)
+# 6. BIDIRECTIONAL PROMPTS
 # ============================================================
 def format_fn(batch):
     prompts, completions = [], []
@@ -129,7 +129,7 @@ model = AutoModelForCausalLM.from_pretrained(
 )
 
 peft_config = LoraConfig(
-    r=16,
+    r=32,
     lora_alpha=64,
     lora_dropout=0.05,
     target_modules=[
@@ -141,7 +141,7 @@ peft_config = LoraConfig(
 )
 
 # ============================================================
-# 8. TRAINER (OFFICIAL DEV)
+# 8. TRAINING
 # ============================================================
 trainer = SFTTrainer(
     model=model,
@@ -174,20 +174,7 @@ trainer = SFTTrainer(
 trainer.train()
 
 # ============================================================
-# 9. LOSS CURVE
-# ============================================================
-logs = trainer.state.log_history
-train_loss = [(x["step"], x["loss"]) for x in logs if "loss" in x]
-val_loss   = [(x["step"], x["eval_loss"]) for x in logs if "eval_loss" in x]
-
-plt.plot(*zip(*train_loss), label="Train")
-plt.plot(*zip(*val_loss), label="Dev")
-plt.legend()
-plt.savefig(OUTPUT_DIR / "loss_curve.png")
-plt.close()
-
-# ============================================================
-# 10. MERGE FINAL MODEL
+# 9. MERGE FINAL MODEL
 # ============================================================
 model = trainer.model.merge_and_unload().eval()
 FINAL_MODEL_DIR = OUTPUT_DIR / "final_merged"
@@ -196,44 +183,70 @@ model.save_pretrained(FINAL_MODEL_DIR)
 tokenizer.save_pretrained(FINAL_MODEL_DIR)
 
 # ============================================================
-# 11. STRICT EVALUATION (TEST)
+# 10. STRICT BATCHED INFERENCE (TEST)
 # ============================================================
 def is_devanagari(txt):
     return any("DEVANAGARI" in unicodedata.name(c, "") for c in txt)
 
-results, metrics = [], {"ENG_to_HIN": {"p": [], "r": []}, "HIN_to_ENG": {"p": [], "r": []}}
+results = []
+metrics = {"ENG_to_HIN": {"p": [], "r": []}, "HIN_to_ENG": {"p": [], "r": []}}
 
-for s in tqdm(test_raw):
-    pairs = [
-        ("ENG_to_HIN","Translate to HINDI DEVANAGARI:", s["src_txt"], s["tgt_txt"]),
-        ("HIN_to_ENG","Translate to ENGLISH:", s["tgt_txt"], s["src_txt"])
+pairs = []
+for s in test_raw:
+    pairs.append(("ENG_to_HIN", "Translate to HINDI DEVANAGARI:", s["src_txt"], s["tgt_txt"]))
+    pairs.append(("HIN_to_ENG", "Translate to ENGLISH:", s["tgt_txt"], s["src_txt"]))
+
+for i in tqdm(range(0, len(pairs), BATCH_SIZE_INFER)):
+    batch = pairs[i:i+BATCH_SIZE_INFER]
+
+    prompts = [
+        f"<start_of_turn>user\n{instr}\n{src}<end_of_turn>\n<start_of_turn>model\n"
+        for _, instr, src, _ in batch
     ]
-    for mode, instr, src, ref in pairs:
-        prompt = f"<start_of_turn>user\n{instr}\n{src}<end_of_turn>\n<start_of_turn>model\n"
-        inp = tokenizer(prompt, return_tensors="pt").to(model.device)
-        out = model.generate(**inp, max_new_tokens=MAX_TOKENS, use_cache=True, do_sample=False)
-        pred = tokenizer.decode(out[0][inp.input_ids.shape[-1]:], skip_special_tokens=True)
 
-        results.append({"mode":mode,"source":src,"reference":ref,"prediction":pred})
+    enc = tokenizer(prompts, return_tensors="pt", padding=True).to(model.device)
+
+    with torch.no_grad():
+        outs = model.generate(
+            **enc,
+            max_new_tokens=MAX_TOKENS,
+            do_sample=False,
+            use_cache=True
+        )
+
+    for j, (mode, _, src, ref) in enumerate(batch):
+        gen = outs[j][enc["input_ids"].shape[1]:]
+        pred = tokenizer.decode(gen, skip_special_tokens=True)
+
+        results.append({
+            "mode": mode,
+            "source": src,
+            "reference": ref,
+            "prediction": pred
+        })
+
         metrics[mode]["p"].append(pred)
         metrics[mode]["r"].append(ref)
 
 # ============================================================
-# 12. METRICS + EXPORTS
+# 11. METRICS + EXPORT
 # ============================================================
-def score(p,r): 
-    return sacrebleu.corpus_bleu(p,[r]).score, sacrebleu.corpus_chrf(p,[r]).score
+def score(p, r):
+    return sacrebleu.corpus_bleu(p, [r]).score, sacrebleu.corpus_chrf(p, [r]).score
 
 summary = []
 for k in metrics:
-    b,c = score(metrics[k]["p"], metrics[k]["r"])
-    lid = np.mean([(is_devanagari(p) if k=="ENG_to_HIN" else not is_devanagari(p)) for p in metrics[k]["p"]])
-    summary.append([k,b,c,lid*100])
+    bleu, chrf = score(metrics[k]["p"], metrics[k]["r"])
+    lid = np.mean([
+        is_devanagari(p) if k == "ENG_to_HIN" else not is_devanagari(p)
+        for p in metrics[k]["p"]
+    ])
+    summary.append([k, round(bleu,2), round(chrf,2), round(lid*100,2)])
 
 df = pd.DataFrame(summary, columns=["Direction","BLEU","chrF","ScriptAcc"])
 df.to_excel(OUTPUT_DIR / "final_translation_report.xlsx", index=False)
 
 with open(OUTPUT_DIR / "final_eval_strict.json","w",encoding="utf-8") as f:
-    json.dump(results,f,ensure_ascii=False,indent=2)
+    json.dump(results, f, ensure_ascii=False, indent=2)
 
-print("\n END-TO-END STRICT PIPELINE COMPLETE")
+print("\n✅ END-TO-END STRICT PIPELINE COMPLETE (BATCHED INFERENCE)")
