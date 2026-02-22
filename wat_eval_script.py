@@ -24,6 +24,71 @@ def calc_metrics(preds, refs):
     chrf = sacrebleu.corpus_chrf(preds, [refs]).score
     return round(bleu, 2), round(chrf, 2)
 
+def load_wat_dataset_train(tokenizer=None):
+    logging.info(f"Loading Machine Translation dataset")
+
+    dataset = load_dataset("ai4bharat/Pralekha", data_dir="train")
+
+    def format_example(example):
+        src_lang = example["src_lang"]
+        tgt_lang = example["tgt_lang"]
+
+        source_lang = "English"
+        target_lang = ""
+
+        if tgt_lang == "ben":
+            target_lang = "Bengali"
+        elif tgt_lang == "guj":
+            target_lang = "Gujarati"
+        elif tgt_lang == "hin":
+            target_lang = "Hindi"
+        elif tgt_lang == "kan":
+            target_lang = "Kannada"
+        elif tgt_lang == "mal":
+            target_lang = "Malayalam"
+        elif tgt_lang == "mar":
+            target_lang = "Marathi"
+        elif tgt_lang == "Ori":
+            target_lang = "Odiya"
+        elif tgt_lang == "pan":
+            target_lang = "Punjabi"
+        elif tgt_lang == "tam":
+            target_lang = "Tamil"
+        elif tgt_lang == "tel":
+            target_lang = "Telugu"
+        elif tgt_lang == "urd":
+            target_lang = "Urdu"
+
+        messages = {
+            "prompt": [
+                {
+                    "role": "user",
+                    "content": f"Translate the following sentence from English to {target_lang}.\n\n"
+                    f"English: {example['src_txt']}",
+                }
+            ],
+            "completion": [{"role": "assistant", "content": example["tgt_txt"]}],
+        }
+
+        return messages
+
+    dataset = dataset.filter(
+        lambda x: x["src_txt"] != x["tgt_txt"],
+        num_proc=4,
+    )["train"]
+    dataset = dataset.map(format_example)
+    logging.info(dataset)
+
+    dev_dataset = load_dataset("ai4bharat/Pralekha", data_dir="dev")
+    dev_dataset = dev_dataset.filter(
+        lambda x: x["src_txt"] != x["tgt_txt"],
+        num_proc=4,
+    )["train"]
+    dev_dataset = dev_dataset.map(format_example)
+
+    return dataset, dev_dataset
+
+
 def build_prompt_wat(example, tokenizer):
     src = example["src_txt"]
     ref = example["tgt_txt"]
