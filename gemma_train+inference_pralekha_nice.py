@@ -2,19 +2,16 @@
 # 0. IMPORTS
 # ============================================================
 import os
-import sys
 import json
 import torch
-import shutil
 import unicodedata
 import numpy as np
 import pandas as pd
-import matplotlib.pyplot as plt
 
 from tqdm import tqdm
 from pathlib import Path
 from difflib import SequenceMatcher
-from datasets import load_dataset, Value
+from datasets import load_dataset
 from transformers import AutoModelForCausalLM, AutoTokenizer, set_seed
 from peft import LoraConfig
 from trl import SFTTrainer, SFTConfig
@@ -29,7 +26,10 @@ set_seed(42)
 # 2. CONFIG (STRICT)
 # ============================================================
 MODEL_ID = "google/gemma-3-4b-it"
-DATASET_NAME = "ai4bharat/Pralekha"
+DATASET_NAME = "ai4bharat/pralekha"
+
+SRC_LANG = "eng"
+TGT_LANG = "hin"
 
 OUTPUT_DIR = Path("./gemma3_outputs")
 CKPT_DIR   = OUTPUT_DIR / "checkpoints"
@@ -39,23 +39,22 @@ OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 CKPT_DIR.mkdir(parents=True, exist_ok=True)
 EXPORT_DIR.mkdir(exist_ok=True)
 
-MAX_TRAIN_SAMPLES = None
 MAX_SRC_LEN = 2400
 MAX_TGT_LEN = 2400
-MAX_TOKENS = 3500
+MAX_TOKENS  = 3500
 MAX_SEQ_LEN = MAX_SRC_LEN + MAX_TGT_LEN
 
-BATCH_SIZE_INFER = 4   # 🔒 SAFE FOR 4B ON A100 / L4
+BATCH_SIZE_INFER = 4
 
 # ============================================================
 # 3. TOKENIZER
 # ============================================================
 tokenizer = AutoTokenizer.from_pretrained(MODEL_ID)
 tokenizer.pad_token = tokenizer.eos_token
-tokenizer.padding_side = "left"   # REQUIRED FOR BATCHED INFERENCE
+tokenizer.padding_side = "left"
 
 # ============================================================
-# 4. STRICT FILTERS
+# 4. SAFE FILTERS (NO UTF-8 CASTING)
 # ============================================================
 def strict_filter(example):
     s = example["src_txt"].lower()
@@ -67,52 +66,60 @@ def length_filter(example):
     tgt_len = len(tokenizer(example["tgt_txt"], truncation=False)["input_ids"])
     return src_len <= MAX_SRC_LEN and tgt_len <= MAX_TGT_LEN
 
-def clean_utf8(example):
-    example["src_txt"] = example["src_txt"].decode("utf-8", "ignore")
-    example["tgt_txt"] = example["tgt_txt"].decode("utf-8", "ignore")
-    return example
-
 # ============================================================
-# 5. LOAD DATA (OFFICIAL SPLITS)
+# 5. LOAD DATA (ADVISOR WAY — CRITICAL FIX)
 # ============================================================
-print("Loading Pralekha splits...")
+print("Loading Pralekha splits (advisor-style)...")
 
-train_raw = load_dataset(DATASET_NAME, "train", split="eng_hin")
-dev_raw   = load_dataset(DATASET_NAME, "dev",   split="eng_hin")
-test_raw  = load_dataset(DATASET_NAME, "test",  split="eng_hin")
-
-def preprocess(ds):
-    ds = ds.cast_column("src_txt", Value("binary"))
-    ds = ds.cast_column("tgt_txt", Value("binary"))
-    ds = ds.map(clean_utf8, num_proc=32)
-    ds = ds.cast_column("src_txt", Value("string"))
-    ds = ds.cast_column("tgt_txt", Value("string"))
-    ds = ds.filter(lambda x: x["src_txt"].strip() and x["tgt_txt"].strip())
-    ds = ds.filter(strict_filter)
-    ds = ds.filter(length_filter)
+def load_split(split_name):
+    ds = load_dataset(
+        DATASET_NAME,
+        data_dir=split_name,   # ✅ THIS IS THE FIX
+        split="train"
+    )
+    ds = ds.filter(
+        lambda x: (
+            x["src_lang"] == SRC_LANG and
+            x["tgt_lang"] == TGT_LANG and
+            x["src_txt"].strip() and
+            x["tgt_txt"].strip()
+        ),
+        num_proc=4
+    )
+    ds = ds.filter(strict_filter, num_proc=4)
+    ds = ds.filter(length_filter, num_proc=4)
     return ds
 
-train_raw = preprocess(train_raw)
-dev_raw   = preprocess(dev_raw)
-test_raw  = preprocess(test_raw)
+train_raw = load_split("train")
+dev_raw   = load_split("dev")
+test_raw  = load_split("test")
 
 print(f"Train: {len(train_raw)} | Dev: {len(dev_raw)} | Test: {len(test_raw)}")
 
 # ============================================================
-# 6. BIDIRECTIONAL PROMPTS
+# 6. BIDIRECTIONAL PROMPTING
 # ============================================================
 def format_fn(batch):
     prompts, completions = [], []
     for i in range(len(batch["src_txt"])):
         if i % 2 == 0:
-            instr, src, tgt = "Translate to HINDI DEVANAGARI:", batch["src_txt"][i], batch["tgt_txt"][i]
+            instr, src, tgt = (
+                "Translate to HINDI DEVANAGARI:",
+                batch["src_txt"][i],
+                batch["tgt_txt"][i],
+            )
         else:
-            instr, src, tgt = "Translate to ENGLISH:", batch["tgt_txt"][i], batch["src_txt"][i]
+            instr, src, tgt = (
+                "Translate to ENGLISH:",
+                batch["tgt_txt"][i],
+                batch["src_txt"][i],
+            )
 
         prompts.append(
             f"<start_of_turn>user\n{instr}\n{src}<end_of_turn>\n<start_of_turn>model\n"
         )
         completions.append(f"{tgt}<end_of_turn>")
+
     return {"prompt": prompts, "completion": completions}
 
 train_ds = train_raw.map(format_fn, batched=True, remove_columns=train_raw.column_names)
@@ -167,7 +174,7 @@ trainer = SFTTrainer(
         lr_scheduler_type="cosine",
         warmup_ratio=0.1,
         packing=False,
-        report_to="none"
+        report_to="none",
     )
 )
 
@@ -177,8 +184,10 @@ trainer.train()
 # 9. MERGE FINAL MODEL
 # ============================================================
 model = trainer.model.merge_and_unload().eval()
+
 FINAL_MODEL_DIR = OUTPUT_DIR / "final_merged"
 FINAL_MODEL_DIR.mkdir(exist_ok=True)
+
 model.save_pretrained(FINAL_MODEL_DIR)
 tokenizer.save_pretrained(FINAL_MODEL_DIR)
 
@@ -232,7 +241,10 @@ for i in tqdm(range(0, len(pairs), BATCH_SIZE_INFER)):
 # 11. METRICS + EXPORT
 # ============================================================
 def score(p, r):
-    return sacrebleu.corpus_bleu(p, [r]).score, sacrebleu.corpus_chrf(p, [r]).score
+    return (
+        sacrebleu.corpus_bleu(p, [r]).score,
+        sacrebleu.corpus_chrf(p, [r]).score
+    )
 
 summary = []
 for k in metrics:
@@ -241,12 +253,12 @@ for k in metrics:
         is_devanagari(p) if k == "ENG_to_HIN" else not is_devanagari(p)
         for p in metrics[k]["p"]
     ])
-    summary.append([k, round(bleu,2), round(chrf,2), round(lid*100,2)])
+    summary.append([k, round(bleu, 2), round(chrf, 2), round(lid * 100, 2)])
 
-df = pd.DataFrame(summary, columns=["Direction","BLEU","chrF","ScriptAcc"])
+df = pd.DataFrame(summary, columns=["Direction", "BLEU", "chrF", "ScriptAcc"])
 df.to_excel(OUTPUT_DIR / "final_translation_report.xlsx", index=False)
 
-with open(OUTPUT_DIR / "final_eval_strict.json","w",encoding="utf-8") as f:
+with open(OUTPUT_DIR / "final_eval_strict.json", "w", encoding="utf-8") as f:
     json.dump(results, f, ensure_ascii=False, indent=2)
 
-print("\n✅ END-TO-END STRICT PIPELINE COMPLETE (BATCHED INFERENCE)")
+print("\n✅ END-TO-END STRICT PIPELINE COMPLETE")
