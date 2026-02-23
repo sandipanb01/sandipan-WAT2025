@@ -97,9 +97,13 @@ def load_dev_as_test(root, lang_pair):
 # ============================================================
 # 4. PAPER-STRICT VERBATIM PROMPT
 # ============================================================
-def build_prompt(src_text, source_lang, src_lang_code, target_lang, tgt_lang_code):
-    return (
-        f"You are a professional {source_lang} ({src_lang_code}) to {target_lang} ({tgt_lang_code}) translator. "
+def build_messages(src_text, lang_pair):
+    source_lang = LANG_NAME_SRC[lang_pair]
+    target_lang = LANG_NAME_TGT[lang_pair]
+    tgt_lang_code = LANG_CODE_MAP[lang_pair]
+
+    prompt = (
+        f"You are a professional {source_lang} ({SOURCE_LANG_CODE}) to {target_lang} ({tgt_lang_code}) translator. "
         f"Your goal is to accurately convey the meaning and nuances of the original {source_lang} text while adhering to "
         f"{target_lang} grammar, vocabulary, and cultural sensitivities. "
         f"Produce only the {target_lang} translation, without any additional explanations or commentary. "
@@ -107,22 +111,14 @@ def build_prompt(src_text, source_lang, src_lang_code, target_lang, tgt_lang_cod
         f"{src_text}"
     )
 
-def build_messages(src_text, lang_pair):
-    tgt_code = LANG_CODE_MAP[lang_pair]
     return [{
         "role": "user",
-        "content": [{
-            "type": "text",
-            "text": build_prompt(
-                src_text,
-                LANG_NAME_SRC[lang_pair],
-                SOURCE_LANG_CODE,
-                LANG_NAME_TGT[lang_pair],
-                tgt_code
-            ),
-        }]
+        "content": {
+            "source_lang": SOURCE_LANG_CODE,
+            "target_lang": tgt_lang_code,
+            "text": prompt
+        }
     }]
-
 # ============================================================
 # 5. METRICS
 # ============================================================
@@ -181,7 +177,9 @@ for lang_pair in LANG_PAIRS:
     for model_key, model_name in BASE_MODELS.items():
         print(f"\n→ Model: {model_key}")
 
-        processor = AutoProcessor.from_pretrained(model_name)
+        processor = AutoProcessor.from_pretrained(
+                    model_name,
+                    use_fast=False)
         model = AutoModelForImageTextToText.from_pretrained(
             model_name,
             torch_dtype=torch.bfloat16,
