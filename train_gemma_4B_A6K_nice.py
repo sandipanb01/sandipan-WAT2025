@@ -1,12 +1,9 @@
 # ============================================================
-# TRAIN SCRIPT — STRICT (ADVISOR-ALIGNED)
+# TRAIN SCRIPT — SIMPLE (ADVISOR STYLE)
 # ============================================================
 
-import os
-import json
 import torch
 from pathlib import Path
-from difflib import SequenceMatcher
 
 from datasets import load_dataset
 from transformers import AutoModelForCausalLM, AutoTokenizer, set_seed
@@ -46,20 +43,7 @@ tokenizer = AutoTokenizer.from_pretrained(MODEL_ID)
 tokenizer.pad_token = tokenizer.eos_token
 
 # ============================================================
-# 4. FILTERS
-# ============================================================
-def strict_filter(example):
-    s = example["src_txt"].lower()
-    t = example["tgt_txt"].lower()
-    return SequenceMatcher(None, s, t).ratio() < 0.65
-
-def length_filter(example):
-    src_len = len(tokenizer(example["src_txt"], truncation=False)["input_ids"])
-    tgt_len = len(tokenizer(example["tgt_txt"], truncation=False)["input_ids"])
-    return src_len <= MAX_SRC_LEN and tgt_len <= MAX_TGT_LEN
-
-# ============================================================
-# 5. LOAD DATA (ADVISOR WAY)
+# 4. LOAD DATA (ADVISOR WAY — SIMPLE)
 # ============================================================
 def load_split(split_name):
     ds = load_dataset(
@@ -67,6 +51,7 @@ def load_split(split_name):
         data_dir=split_name,
         split="train"
     )
+
     ds = ds.filter(
         lambda x: (
             x["src_lang"] == SRC_LANG and
@@ -76,8 +61,6 @@ def load_split(split_name):
         ),
         num_proc=4
     )
-    ds = ds.filter(strict_filter, num_proc=4)
-    ds = ds.filter(length_filter, num_proc=4)
     return ds
 
 print("Loading datasets...")
@@ -87,27 +70,36 @@ dev_raw   = load_split("dev")
 print(f"Train: {len(train_raw)} | Dev: {len(dev_raw)}")
 
 # ============================================================
-# 6. BIDIRECTIONAL PROMPTING
+# 5. BIDIRECTIONAL PROMPTING (UNCHANGED)
 # ============================================================
 def format_fn(batch):
     prompts, completions = [], []
     for i in range(len(batch["src_txt"])):
         if i % 2 == 0:
-            instr, src, tgt = "Translate to HINDI DEVANAGARI:", batch["src_txt"][i], batch["tgt_txt"][i]
+            instr, src, tgt = (
+                "Translate to HINDI DEVANAGARI:",
+                batch["src_txt"][i],
+                batch["tgt_txt"][i],
+            )
         else:
-            instr, src, tgt = "Translate to ENGLISH:", batch["tgt_txt"][i], batch["src_txt"][i]
+            instr, src, tgt = (
+                "Translate to ENGLISH:",
+                batch["tgt_txt"][i],
+                batch["src_txt"][i],
+            )
 
         prompts.append(
             f"<start_of_turn>user\n{instr}\n{src}<end_of_turn>\n<start_of_turn>model\n"
         )
         completions.append(f"{tgt}<end_of_turn>")
+
     return {"prompt": prompts, "completion": completions}
 
 train_ds = train_raw.map(format_fn, batched=True, remove_columns=train_raw.column_names)
 dev_ds   = dev_raw.map(format_fn,   batched=True, remove_columns=dev_raw.column_names)
 
 # ============================================================
-# 7. MODEL + LoRA
+# 6. MODEL + LoRA
 # ============================================================
 model = AutoModelForCausalLM.from_pretrained(
     MODEL_ID,
@@ -121,15 +113,20 @@ peft_config = LoraConfig(
     lora_alpha=64,
     lora_dropout=0.05,
     target_modules=[
-        "q_proj","k_proj","v_proj",
-        "o_proj","gate_proj","up_proj","down_proj"
+        "q_proj",
+        "k_proj",
+        "v_proj",
+        "o_proj",
+        "gate_proj",
+        "up_proj",
+        "down_proj",
     ],
     task_type="CAUSAL_LM",
-    bias="none"
+    bias="none",
 )
 
 # ============================================================
-# 8. TRAINING
+# 7. TRAINING
 # ============================================================
 trainer = SFTTrainer(
     model=model,
@@ -153,14 +150,14 @@ trainer = SFTTrainer(
         lr_scheduler_type="cosine",
         warmup_ratio=0.1,
         packing=False,
-        report_to="none"
-    )
+        report_to="none",
+    ),
 )
 
 trainer.train()
 
 # ============================================================
-# 9. MERGE FINAL MODEL
+# 8. MERGE FINAL MODEL
 # ============================================================
 model = trainer.model.merge_and_unload().eval()
 model.save_pretrained(FINAL_MODEL_DIR)
