@@ -7,7 +7,7 @@ import torch
 import sacrebleu
 
 from transformers import AutoModelForCausalLM, AutoTokenizer
-from datasets import load_dataset
+from datasets import load_dataset, get_dataset_config_names
 from peft import AutoPeftModelForCausalLM
 
 def free_gpu():
@@ -74,7 +74,7 @@ def load_wat_dataset_train(tokenizer=None):
 
     dataset = dataset.filter(
         lambda x: x["src_txt"] != x["tgt_txt"],
-        num_proc=4,
+        num_proc=32,
     )["train"]
     dataset = dataset.map(format_example)
     logging.info(dataset)
@@ -82,14 +82,13 @@ def load_wat_dataset_train(tokenizer=None):
     dev_dataset = load_dataset("ai4bharat/Pralekha", data_dir="dev")
     dev_dataset = dev_dataset.filter(
         lambda x: x["src_txt"] != x["tgt_txt"],
-        num_proc=4,
+        num_proc=32,
     )["train"]
     dev_dataset = dev_dataset.map(format_example)
 
     return dataset, dev_dataset
 
 
-# ONLY change: make prompt dynamic instead of hardcoded Hindi
 def build_prompt_wat(example, tokenizer):
     src = example["src_txt"]
     ref = example["tgt_txt"]
@@ -156,38 +155,16 @@ def parse_args():
         description="Evaluate model"
     )
 
-    parser.add_argument(
-        "--model_name",
-        type=str,
-        default="ibm-granite/granite-4.0-h-350m",
-        help="The model ID or path to the pretrained model.",
-    )
+    parser.add_argument("--model_name", type=str,
+                        default="ibm-granite/granite-4.0-h-350m")
 
-    parser.add_argument(
-        "--dataset",
-        type=str,
-        default="wat",
-        help="The model ID or path to the pretrained model.",
-    )
+    parser.add_argument("--dataset", type=str, default="wat")
 
-    parser.add_argument(
-        "--output_dir",
-        type=str,
-        default="./output",
-        help="Output directory for checkpoints and logs.",
-    )
+    parser.add_argument("--output_dir", type=str, default="./output")
 
-    parser.add_argument(
-        "--use_lora",
-        action="store_true",
-        help="Whether to use LoRA or full finetuning",
-    )
+    parser.add_argument("--use_lora", action="store_true")
 
-    parser.add_argument(
-        "--bf16",
-        action="store_true",
-        help="Use bfloat16 precision.",
-    )
+    parser.add_argument("--bf16", action="store_true")
 
     return parser.parse_args()
 
@@ -235,13 +212,14 @@ def evaluate_wat(model, tokenizer, dataset, batch_size=4):
 
     return references, predictions
 
+
 def main():
     args = parse_args()
     
     model = AutoModelForCausalLM.from_pretrained(
         args.model_name,
         device_map="auto",
-        torch_dtype=torch.bfloat16,  # changed to bf16 only
+        torch_dtype=torch.bfloat16,
     )
     model.config.use_cache = False
 
@@ -253,24 +231,41 @@ def main():
 
     DATASET_NAME = "ai4bharat/Pralekha"
     EVAL_SPLIT = "test"
-    dataset = load_dataset(DATASET_NAME, EVAL_SPLIT, split="eng_hin")
 
-    dataset = dataset.map(build_prompt_wat, fn_kwargs={"tokenizer": tokenizer})
-    
-    references, predictions = evaluate_wat(model, tokenizer, dataset)
+    # ===== CHANGE: evaluate ALL eng_* splits instead of eng_hin =====
+    all_configs = get_dataset_config_names(DATASET_NAME)
+    test_splits = [c for c in all_configs if c.startswith("eng_")]
 
-    bleu, chrf = calc_metrics(predictions, references)
     results = {}
-    results["BLEU"] = bleu
-    results["CHRF"] = chrf
+
+    for split_name in test_splits:
+        dataset = load_dataset(DATASET_NAME, EVAL_SPLIT, split=split_name)
+        dataset = dataset.map(build_prompt_wat,
+                              fn_kwargs={"tokenizer": tokenizer})
+
+        references, predictions = evaluate_wat(model, tokenizer, dataset)
+
+        bleu, chrf = calc_metrics(predictions, references)
+
+        results[split_name] = {"BLEU": bleu, "CHRF": chrf}
+
+    avg_bleu = sum(r["BLEU"] for r in results.values()) / len(results)
+    avg_chrf = sum(r["CHRF"] for r in results.values()) / len(results)
+
+    results["average"] = {
+        "BLEU": round(avg_bleu, 2),
+        "CHRF": round(avg_chrf, 2),
+    }
 
     results_path = (
         f"{args.output_dir}/wat_-1_{args.model_name.split('/')[-1]}.json"
     )
 
     with open(results_path, "w") as outfile:
-        json.dump(results, outfile)
-        
+        json.dump(results, outfile, indent=2)
+
+    # ===== checkpoint loop remains structurally identical =====
+
     base_dir = args.output_dir
 
     for name in sorted(os.listdir(base_dir)):
@@ -302,27 +297,35 @@ def main():
             if tokenizer.pad_token is None:
                 tokenizer.pad_token = tokenizer.eos_token
 
-            if args.dataset == "wat":
-                DATASET_NAME = "ai4bharat/Pralekha"
-                EVAL_SPLIT = "test"
-                dataset = load_dataset(DATASET_NAME, EVAL_SPLIT, split="eng_hin")
+            results = {}
 
-                dataset = dataset.map(build_prompt_wat, fn_kwargs={"tokenizer": tokenizer})
-                
+            for split_name in test_splits:
+                dataset = load_dataset(DATASET_NAME, EVAL_SPLIT,
+                                       split=split_name)
+
+                dataset = dataset.map(build_prompt_wat,
+                                      fn_kwargs={"tokenizer": tokenizer})
+
                 references, predictions = evaluate_wat(model, tokenizer, dataset)
 
                 bleu, chrf = calc_metrics(predictions, references)
-                
-                results = {}
-                results["BLEU"] = bleu
-                results["CHRF"] = chrf
 
-                results_path = (
-                    f"{args.output_dir}/wat_{ckpt_num}.json"
-                )
+                results[split_name] = {"BLEU": bleu, "CHRF": chrf}
 
-                with open(results_path, "w") as outfile:
-                    json.dump(results, outfile)
+            avg_bleu = sum(r["BLEU"] for r in results.values()) / len(results)
+            avg_chrf = sum(r["CHRF"] for r in results.values()) / len(results)
+
+            results["average"] = {
+                "BLEU": round(avg_bleu, 2),
+                "CHRF": round(avg_chrf, 2),
+            }
+
+            results_path = (
+                f"{args.output_dir}/wat_{ckpt_num}.json"
+            )
+
+            with open(results_path, "w") as outfile:
+                json.dump(results, outfile, indent=2)
 
 if __name__ == "__main__":
     main()
