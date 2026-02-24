@@ -155,8 +155,10 @@ def parse_args():
         description="Evaluate model"
     )
 
-    parser.add_argument("--model_name", type=str,
-                        default="ibm-granite/granite-4.0-h-350m")
+    parser.add_argument(
+    "--model_name",
+    type=str,
+    default="ibm-iitr-mt-research/gemma-3-1b-it_wat_sft")
 
     parser.add_argument("--dataset", type=str, default="wat")
 
