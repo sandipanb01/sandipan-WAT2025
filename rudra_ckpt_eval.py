@@ -1,3 +1,5 @@
+import logging
+logging.basicConfig(level=logging.INFO)
 import json
 import os
 import re
@@ -217,6 +219,7 @@ def evaluate_wat(model, tokenizer, dataset, batch_size=4):
 
 def main():
     args = parse_args()
+    os.makedirs(args.output_dir, exist_ok=True)
     
     model = AutoModelForCausalLM.from_pretrained(
         args.model_name,
