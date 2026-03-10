@@ -2,7 +2,7 @@
 # INSTALL DEPENDENCIES
 # ===============================
 
-!pip install huggingface_hub
+!pip install -q transformers datasets sacrebleu peft huggingface_hub
 
 
 # ===============================
@@ -30,7 +30,7 @@ REPO_ID = "ibm-iitr-mt-research/gemma-3-1b-it_wat_sft"
 
 OUTPUT_DIR = "./output"
 
-USE_LORA = False
+USE_LORA = True
 FP16 = True
 
 os.makedirs(OUTPUT_DIR, exist_ok=True)
@@ -238,7 +238,7 @@ for name in checkpoints:
         model = AutoPeftModelForCausalLM.from_pretrained(
             path,
             device_map="auto",
-            torch_dtype=torch.bfloat16 if FP16 else torch.float32,
+            torch_dtype=torch.float16 if FP16 else torch.float32,
         )
 
         model = model.merge_and_unload()
@@ -248,7 +248,7 @@ for name in checkpoints:
         model = AutoModelForCausalLM.from_pretrained(
             path,
             device_map="auto",
-            torch_dtype=torch.bfloat16 if FP16 else torch.float32,
+            torch_dtype=torch.float16 if FP16 else torch.float32,
         )
 
     model.eval()
