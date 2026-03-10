@@ -2,7 +2,7 @@
 # INSTALL DEPENDENCIES
 # ===============================
 
-!pip install -q transformers datasets sacrebleu peft huggingface_hub
+!pip install -q huggingface_hub
 
 
 # ===============================
@@ -275,7 +275,8 @@ for name in checkpoints:
 
         dataset = dataset.map(
             build_prompt_wat,
-            fn_kwargs={"tokenizer": tokenizer}
+            fn_kwargs={"tokenizer": tokenizer},
+            num_proc=32
         )
 
         references, predictions = evaluate_wat(
