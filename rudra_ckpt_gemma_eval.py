@@ -73,7 +73,6 @@ def calc_metrics(preds, refs):
 
 def build_prompt_wat(example, tokenizer):
 
-    src = example["src_txt"]
     ref = example["tgt_txt"]
     tgt_lang = example["tgt_lang"]
 
@@ -93,21 +92,23 @@ def build_prompt_wat(example, tokenizer):
 
     target_lang = lang_map[tgt_lang]
 
-    prompt = (
-        f"Translate the following text from English to {target_lang}:\n"
-        f"English: {src}\n"
-        f"{target_lang}: "
-    )
+    # EXACT STRUCTURE FROM ADVISOR
+    messages = {
+        "prompt": [
+            {
+                "role": "user",
+                "content": f"Translate the following sentence from English to {target_lang}.\n\n"
+                f"English: {example['src_txt']}",
+            }
+        ],
+        "completion": [
+            {"role": "assistant", "content": example["tgt_txt"]}
+        ],
+    }
 
-    messages = [
-        {
-            "role": "user",
-            "content": prompt
-        }
-    ]
-
+    # For inference we only use the prompt
     prompt = tokenizer.apply_chat_template(
-        messages,
+        messages["prompt"],
         tokenize=False,
         add_generation_prompt=True,
     )
