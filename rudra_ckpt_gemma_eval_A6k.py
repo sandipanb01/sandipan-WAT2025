@@ -91,7 +91,7 @@ def build_prompt_wat(example, tokenizer):
 
     target_lang = lang_map[tgt_lang]
 
-    # EXACT STRUCTURE FROM ADVISOR
+    
     messages = {
         "prompt": [
             {
