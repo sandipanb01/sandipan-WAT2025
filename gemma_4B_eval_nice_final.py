@@ -1,32 +1,48 @@
+# ============================================================
+# IMPORTS
+# ============================================================
+
 import torch
 import json
+import os
+import unicodedata
 import pandas as pd
 import numpy as np
-import unicodedata
 from tqdm import tqdm
-from datasets import load_dataset
-from transformers import AutoModelForCausalLM, AutoTokenizer
 from pathlib import Path
-import os
 import sacrebleu
 
-torch.manual_seed(42)
-torch.cuda.manual_seed_all(42)
+from transformers import AutoModelForCausalLM, AutoTokenizer
+from datasets import load_dataset
+
+
+# ============================================================
+# SETTINGS
+# ============================================================
+
+MODEL_DIR = "./gemma3_outputs/final_merged"
+DATASET_NAME = "ai4bharat/Pralekha"
 
 OUTPUT_DIR = "final_eval_outputs"
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-MODEL_DIR = "./gemma3-4b-train/final_merged"
-DATASET_NAME = "ai4bharat/Pralekha"
-EVAL_CONFIG = "test"
 MAX_TGT_LEN = 4096
+BATCH_SIZE = 4
 
-# ===============================
-# LOAD MODEL (SINGLE GPU)
-# ===============================
+torch.manual_seed(42)
+torch.cuda.manual_seed_all(42)
+
+
+# ============================================================
+# LOAD MODEL
+# ============================================================
+
+print("Loading model...")
+
 tokenizer = AutoTokenizer.from_pretrained(MODEL_DIR)
-tokenizer.pad_token = tokenizer.eos_token
-tokenizer.padding_side = "right"
+
+if tokenizer.pad_token is None:
+    tokenizer.pad_token = tokenizer.eos_token
 
 model = AutoModelForCausalLM.from_pretrained(
     MODEL_DIR,
@@ -34,66 +50,177 @@ model = AutoModelForCausalLM.from_pretrained(
 ).to("cuda")
 
 model.eval()
-# ===============================
-# DATA
-# ===============================
-dataset = load_dataset(DATASET_NAME, EVAL_CONFIG, split="eng_hin")
 
-# ===============================
-# EVALUATION
-# ===============================
-results = []
-metrics = {"ENG_to_HIN": {"preds": [], "refs": []},
-           "HIN_to_ENG": {"preds": [], "refs": []}}
 
-for sample in tqdm(dataset):
+# ============================================================
+# PROMPT BUILDER (DATASET MAP)
+# ============================================================
+
+def build_prompt(example, tokenizer):
+
     pairs = [
-        ("ENG_to_HIN", "Translate to HINDI DEVANAGARI:", sample["src_txt"], sample["tgt_txt"]),
-        ("HIN_to_ENG", "Translate to ENGLISH:", sample["tgt_txt"], sample["src_txt"]),
+        ("ENG_to_HIN", "Translate to HINDI DEVANAGARI:", example["src_txt"], example["tgt_txt"]),
+        ("HIN_to_ENG", "Translate to ENGLISH:", example["tgt_txt"], example["src_txt"])
     ]
 
+    rows = []
+
     for mode, instr, src, ref in pairs:
-        prompt = f"<start_of_turn>user\n{instr}\n{src}<end_of_turn>\n<start_of_turn>model\n"
-        inputs = tokenizer(prompt, return_tensors="pt").to("cuda")
 
-        with torch.inference_mode():
-            output = model.generate(
-                **inputs,
-                max_new_tokens=MAX_TGT_LEN,
-                #temperature=0.1,
-                use_cache=True
-                do_sample=False,
-                repetition_penalty=1.1
-            )
+        prompt = (
+            f"<start_of_turn>user\n{instr}\n"
+            f"{src}<end_of_turn>\n"
+            f"<start_of_turn>model\n"
+        )
 
-        pred = tokenizer.decode(
-            output[0][inputs.input_ids.shape[-1]:],
-            skip_special_tokens=True
-        ).strip()
+        tokens = tokenizer(
+            prompt,
+            truncation=True,
+            padding=False
+        )
 
-        results.append({
-            "mode": mode,
-            "source": src,
+        rows.append({
+            "input_ids": tokens["input_ids"],
+            "attention_mask": tokens["attention_mask"],
             "reference": ref,
-            "prediction": pred
+            "mode": mode,
+            "source": src
         })
 
-        metrics[mode]["preds"].append(pred)
-        metrics[mode]["refs"].append(ref)
+    return rows
+
 
 # ============================================================
-# >>> FIX START: LID + JSON
+# LOAD DATASET
 # ============================================================
-import unicodedata
+
+print("Loading dataset...")
+
+dataset = load_dataset(
+    DATASET_NAME,
+    "test",
+    split="eng_hin"
+)
+
+dataset = dataset.map(
+    build_prompt,
+    fn_kwargs={"tokenizer": tokenizer},
+    num_proc=32
+)
+
+dataset = dataset.flatten()
+
+
+# ============================================================
+# BATCHED INFERENCE (ADVISOR STYLE)
+# ============================================================
+
+def evaluate(model, tokenizer, dataset, batch_size=4):
+
+    predictions = []
+    references = []
+    modes = []
+    sources = []
+
+    print("Running inference...")
+
+    for i in tqdm(range(0, len(dataset), batch_size)):
+
+        batch = dataset[i:i+batch_size]
+
+        padded = tokenizer.pad(
+            {
+                "input_ids": batch["input_ids"],
+                "attention_mask": batch["attention_mask"]
+            },
+            padding=True,
+            return_tensors="pt"
+        )
+
+        input_ids = padded["input_ids"].to(model.device)
+        attention_mask = padded["attention_mask"].to(model.device)
+
+        with torch.no_grad():
+
+            outputs = model.generate(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                max_new_tokens=MAX_TGT_LEN,
+                do_sample=False,
+                use_cache=True
+            )
+
+        new_tokens = outputs[:, input_ids.shape[1]:]
+
+        decoded = tokenizer.batch_decode(
+            new_tokens,
+            skip_special_tokens=True
+        )
+
+        predictions.extend(decoded)
+
+        references.extend(batch["reference"])
+        modes.extend(batch["mode"])
+        sources.extend(batch["source"])
+
+    return predictions, references, modes, sources
+
+
+# ============================================================
+# RUN EVALUATION
+# ============================================================
+
+preds, refs, modes, sources = evaluate(
+    model,
+    tokenizer,
+    dataset,
+    batch_size=BATCH_SIZE
+)
+
+
+# ============================================================
+# BUILD RESULTS TABLE
+# ============================================================
+
+results = []
+
+metrics = {
+    "ENG_to_HIN": {"preds": [], "refs": []},
+    "HIN_to_ENG": {"preds": [], "refs": []}
+}
+
+for pred, ref, mode, src in zip(preds, refs, modes, sources):
+
+    pred = pred.strip()
+
+    results.append({
+        "mode": mode,
+        "source": src,
+        "reference": ref,
+        "prediction": pred
+    })
+
+    metrics[mode]["preds"].append(pred)
+    metrics[mode]["refs"].append(ref)
+
+
+# ============================================================
+# SCRIPT DETECTION
+# ============================================================
 
 def is_devanagari(text):
+
     for ch in text:
         if "DEVANAGARI" in unicodedata.name(ch, ""):
             return True
+
     return False
 
+
 lid_correct = []
+
 for r in results:
+
     if r["mode"] == "ENG_to_HIN":
         lid_correct.append(is_devanagari(r["prediction"]))
     else:
@@ -101,172 +228,139 @@ for r in results:
 
 true_lid_acc = np.mean(lid_correct)
 
-with open("final_eval_strict.json", "w", encoding="utf-8") as f:
-    json.dump(results, f, ensure_ascii=False, indent=2)
 
-df = pd.DataFrame(results)
-# >>> FIX END
+# ============================================================
+# METRICS
 # ============================================================
 
 def calc_metrics(preds, refs):
+
     bleu = sacrebleu.corpus_bleu(preds, [refs]).score
     chrf = sacrebleu.corpus_chrf(preds, [refs]).score
+
     return round(bleu, 2), round(chrf, 2)
 
-e2h_bleu, e2h_chrf = calc_metrics(metrics["ENG_to_HIN"]["preds"], metrics["ENG_to_HIN"]["refs"])
-h2e_bleu, h2e_chrf = calc_metrics(metrics["HIN_to_ENG"]["preds"], metrics["HIN_to_ENG"]["refs"])
 
-print("\n" + "="*50)
-print("STRICT PAPER-STANDARD METRICS")
+e2h_bleu, e2h_chrf = calc_metrics(
+    metrics["ENG_to_HIN"]["preds"],
+    metrics["ENG_to_HIN"]["refs"]
+)
+
+h2e_bleu, h2e_chrf = calc_metrics(
+    metrics["HIN_to_ENG"]["preds"],
+    metrics["HIN_to_ENG"]["refs"]
+)
+
+
+print("\n" + "="*60)
+print("FINAL METRICS")
 print(f"ENG → HIN | BLEU: {e2h_bleu} | chrF: {e2h_chrf}")
 print(f"HIN → ENG | BLEU: {h2e_bleu} | chrF: {h2e_chrf}")
-print("="*50)
-print(f"Strict Script Accuracy: {true_lid_acc:.2%}")
-print("="*50)
+print("="*60)
+print(f"Script Accuracy: {true_lid_acc:.2%}")
+print("="*60)
+
 
 # ============================================================
-# TOP-10 QUALITATIVE (SRC / REF / PRED)
+# SAVE JSON
 # ============================================================
-print("\n TOP-10 DETAILED SAMPLES\n")
-for i in range(min(10, len(df))):
-    r = df.iloc[i]
-    print(f"[{i+1}] {r['mode']}")
-    print("SRC :", r["source"])
-    print("REF :", r["reference"])
-    print("PRED:", r["prediction"])
-    print("-" * 80)
+
+with open("final_eval_strict.json", "w", encoding="utf-8") as f:
+    json.dump(results, f, ensure_ascii=False, indent=2)
+
 
 # ============================================================
-# EXPORT JSONL + ZIP
+# JSONL EXPORT
 # ============================================================
+
 out_dir = Path("exports_jsonl")
 out_dir.mkdir(exist_ok=True)
 
 eng_path = out_dir / "eng_to_hin_src_ref_pred.jsonl"
 hin_path = out_dir / "hin_to_eng_src_ref_pred.jsonl"
 
-with open(eng_path, "w", encoding="utf-8") as fe, open(hin_path, "w", encoding="utf-8") as fh:
+with open(eng_path, "w", encoding="utf-8") as fe, \
+     open(hin_path, "w", encoding="utf-8") as fh:
+
     for r in results:
+
         line = json.dumps(
-            {"src": r["source"], "ref": r["reference"], "pred": r["prediction"]},
+            {
+                "src": r["source"],
+                "ref": r["reference"],
+                "pred": r["prediction"]
+            },
             ensure_ascii=False
         )
+
         if r["mode"] == "ENG_to_HIN":
             fe.write(line + "\n")
         else:
             fh.write(line + "\n")
 
-import shutil
-shutil.make_archive("translation_outputs", "zip", out_dir)
 
-print("\n JSONL + ZIP CREATED")
-print("translation_outputs.zip")
 # ============================================================
-# CREATE CLEAN JSONL FILES (SRC / REF / PRED ONLY)
+# EXCEL METRICS
 # ============================================================
-
-import json
-from pathlib import Path
-
-# Load your final evaluation JSON
-with open("final_eval_strict.json", "r", encoding="utf-8") as f:
-    records = json.load(f)
-
-out_dir = Path("exports_jsonl")
-out_dir.mkdir(exist_ok=True)
-
-eng_hin_path = out_dir / "eng_to_hin_src_ref_pred.jsonl"
-hin_eng_path = out_dir / "hin_to_eng_src_ref_pred.jsonl"
-
-eng_hin_count = 0
-hin_eng_count = 0
-
-with open(eng_hin_path, "w", encoding="utf-8") as f_eng, \
-     open(hin_eng_path, "w", encoding="utf-8") as f_hin:
-
-    for r in records:
-        line = {
-            "src": r["source"],
-            "ref": r["reference"],
-            "pred": r["prediction"]
-        }
-
-        if r["mode"] == "ENG_to_HIN":
-            f_eng.write(json.dumps(line, ensure_ascii=False) + "\n")
-            eng_hin_count += 1
-
-        elif r["mode"] == "HIN_to_ENG":
-            f_hin.write(json.dumps(line, ensure_ascii=False) + "\n")
-            hin_eng_count += 1
-
-print(f"ENG→HIN JSONL records: {eng_hin_count}")
-print(f"HIN→ENG JSONL records: {hin_eng_count}")
-print(f"Files saved in: {out_dir.resolve()}")
-# ============================================================
-# Metrics
-# ============================================================
-
-import os
-import matplotlib.pyplot as plt
-import pandas as pd
-import numpy as np
-import sacrebleu
-import unicodedata
-# ------------------------------------------------------------
-# 2. METRICS + SCRIPT (LID) ACCURACY
-# ------------------------------------------------------------
-def is_devanagari(text):
-    if not text:
-        return False
-    for ch in text:
-        try:
-            if "DEVANAGARI" in unicodedata.name(ch):
-                return True
-        except ValueError:
-            continue
-    return False
 
 summary_rows = []
-directions = ["ENG_to_HIN", "HIN_to_ENG"]
 
-for direction in directions:
+for direction in ["ENG_to_HIN", "HIN_to_ENG"]:
+
     subset = [r for r in results if r["mode"] == direction]
 
-    if not subset:
-        continue
-
     preds = [r["prediction"] for r in subset]
-    refs  = [r["reference"] for r in subset]
+    refs = [r["reference"] for r in subset]
 
-    bleu_score = sacrebleu.corpus_bleu(preds, [refs]).score
-    chrf_score = sacrebleu.corpus_chrf(preds, [refs]).score
+    bleu = sacrebleu.corpus_bleu(preds, [refs]).score
+    chrf = sacrebleu.corpus_chrf(preds, [refs]).score
 
     lid_hits = []
+
     for p in preds:
-        has_dev = is_devanagari(p)
-        correct = has_dev if direction == "ENG_to_HIN" else not has_dev
+
+        dev = is_devanagari(p)
+        correct = dev if direction == "ENG_to_HIN" else not dev
+
         lid_hits.append(correct)
 
-    script_acc = np.mean(lid_hits) * 100 if lid_hits else 0.0
+    script_acc = np.mean(lid_hits) * 100
 
     summary_rows.append({
-        "Direction": direction.replace("_", " "),
-        "BLEU": round(bleu_score, 2),
-        "chrF": round(chrf_score, 2),
-        "Script Accuracy (%)": round(script_acc, 2),
+        "Direction": direction.replace("_"," "),
+        "BLEU": round(bleu,2),
+        "chrF": round(chrf,2),
+        "Script Accuracy (%)": round(script_acc,2),
         "Total Samples": len(subset)
     })
 
-# ------------------------------------------------------------
-# 3. SAVE METRICS REPORT TO EXCEL
-# ------------------------------------------------------------
+
 metrics_df = pd.DataFrame(summary_rows)
 
-excel_path = os.path.join(OUTPUT_DIR, "final_translation_metrics.xlsx")
+excel_path = os.path.join(
+    OUTPUT_DIR,
+    "final_translation_metrics.xlsx"
+)
+
 metrics_df.to_excel(excel_path, index=False)
 
-print("\n" + "═" * 70)
-print(f"📊 Final metrics report saved to: {excel_path}")
-print("═" * 70)
-print(metrics_df.to_string(index=False))
-print("═" * 70)
+
+print("\nMetrics saved to:")
+print(excel_path)
+
+
+# ============================================================
+# SAMPLE OUTPUTS
+# ============================================================
+
+print("\nTop-10 examples\n")
+
+for i in range(min(10, len(results))):
+
+    r = results[i]
+
+    print(f"[{i+1}] {r['mode']}")
+    print("SRC :", r["source"])
+    print("REF :", r["reference"])
+    print("PRED:", r["prediction"])
+    print("-"*80)
