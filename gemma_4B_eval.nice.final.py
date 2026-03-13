@@ -19,7 +19,7 @@ os.makedirs(OUTPUT_DIR, exist_ok=True)
 MODEL_DIR = "./gemma3-4b-train/final_merged"
 DATASET_NAME = "ai4bharat/Pralekha"
 EVAL_CONFIG = "test"
-MAX_TGT_LEN = 512
+MAX_TGT_LEN = 4096
 
 # ===============================
 # LOAD MODEL (SINGLE GPU)
@@ -60,7 +60,8 @@ for sample in tqdm(dataset):
             output = model.generate(
                 **inputs,
                 max_new_tokens=MAX_TGT_LEN,
-                temperature=0.1,
+                #temperature=0.1,
+                use_cache=True
                 do_sample=False,
                 repetition_penalty=1.1
             )
