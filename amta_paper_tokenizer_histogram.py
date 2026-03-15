@@ -18,7 +18,7 @@ DATA_ROOT = "localization-xml-mt/data"  # root folder of Salesforce JSONs
 LANG_PAIRS = ["ende", "enfr", "ennl", "enfi", "enru"]
 SMOKE_TEST = False  # toggle True for quick test
 SMOKE_SAMPLES = 100
-MODEL_ID = "google/gemma-3-270m-it"  # tokenizer for stats
+MODEL_ID = "google/gemma-3-4b-it"  # tokenizer for stats
 
 tokenizer = AutoTokenizer.from_pretrained(MODEL_ID)
 
@@ -147,3 +147,87 @@ with open("salesforce_token_stats.json", "w") as f:
 
 print("\n✅ Complete analysis for all language pairs done.")
 print("Generated files: histograms PNGs + salesforce_token_stats.json")
+# ============================================================
+# TOKENIZER STATISTICS TABLE + DOWNLOAD
+# ============================================================
+
+import pandas as pd
+import json
+from IPython.display import display
+
+TOKENIZER_USED = "google/gemma-3-4b-it"
+
+# ------------------------------------------------------------
+# LOAD STATS JSON
+# ------------------------------------------------------------
+with open("salesforce_token_stats.json", "r") as f:
+    stats = json.load(f)
+
+rows = []
+
+for lang_pair in stats:
+    for split in stats[lang_pair]:
+        src = stats[lang_pair][split]["src"]
+        tgt = stats[lang_pair][split]["tgt"]
+
+        rows.append({
+            "Tokenizer": TOKENIZER_USED,
+            "Language Pair": lang_pair,
+            "Split": split,
+
+            "SRC Min": src["min"],
+            "SRC Median": src["median"],
+            "SRC Mean": src["mean"],
+            "SRC P90": src["p90"],
+            "SRC P95": src["p95"],
+            "SRC P99": src["p99"],
+            "SRC Max": src["max"],
+
+            "TGT Min": tgt["min"],
+            "TGT Median": tgt["median"],
+            "TGT Mean": tgt["mean"],
+            "TGT P90": tgt["p90"],
+            "TGT P95": tgt["p95"],
+            "TGT P99": tgt["p99"],
+            "TGT Max": tgt["max"]
+        })
+
+df = pd.DataFrame(rows)
+
+# ------------------------------------------------------------
+# COLORFUL DISPLAY
+# ------------------------------------------------------------
+styled = (
+    df.style
+    .set_caption(f"Tokenizer Length Statistics (Tokenizer = {TOKENIZER_USED})")
+    .background_gradient(cmap="viridis")
+    .set_properties(**{
+        "border-color": "black",
+        "text-align": "center"
+    })
+)
+
+display(styled)
+
+# ------------------------------------------------------------
+# SAVE FILES
+# ------------------------------------------------------------
+csv_file = "tokenizer_length_statistics.csv"
+excel_file = "tokenizer_length_statistics.xlsx"
+
+df.to_csv(csv_file, index=False)
+df.to_excel(excel_file, index=False)
+
+print("✅ Saved files:")
+print(csv_file)
+print(excel_file)
+
+# ------------------------------------------------------------
+# AUTO DOWNLOAD (Colab)
+# ------------------------------------------------------------
+try:
+    from google.colab import files
+    files.download(csv_file)
+    files.download(excel_file)
+except:
+    print("📥 If not using Colab, files are saved locally in the working directory.")
