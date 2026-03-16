@@ -212,7 +212,7 @@ for split in language_splits:
 
     dataset = load_dataset(
         "ai4bharat/Pralekha",
-        "dev",
+        "test",
         split=split
     )
 
@@ -245,5 +245,5 @@ for split in language_splits:
     print("Saved:", results_path)
 
 
-print("\n✅ Base model evaluation complete.")
+print("\n Base model evaluation complete.")
 print("Results stored in:", OUTPUT_DIR)
