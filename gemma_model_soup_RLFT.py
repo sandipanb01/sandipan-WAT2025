@@ -48,6 +48,9 @@ DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 RL_STEPS = 500
 
+BATCH_SIZE = 4
+KL_BETA = 0.02
+
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 # ==========================================================
@@ -55,17 +58,8 @@ os.makedirs(OUTPUT_DIR, exist_ok=True)
 # ==========================================================
 
 language_splits = [
-    "eng_ben",
-    "eng_guj",
-    "eng_hin",
-    "eng_kan",
-    "eng_mal",
-    "eng_mar",
-    "eng_ori",
-    "eng_pan",
-    "eng_tam",
-    "eng_tel",
-    "eng_urd"
+    "eng_ben","eng_guj","eng_hin","eng_kan","eng_mal",
+    "eng_mar","eng_ori","eng_pan","eng_tam","eng_tel","eng_urd"
 ]
 
 # ==========================================================
@@ -79,13 +73,8 @@ val_sets = []
 
 for split in language_splits:
 
-    train_sets.append(
-        load_dataset("ai4bharat/Pralekha","train",split=split)
-    )
-
-    val_sets.append(
-        load_dataset("ai4bharat/Pralekha","validation",split=split)
-    )
+    train_sets.append(load_dataset("ai4bharat/Pralekha","train",split=split))
+    val_sets.append(load_dataset("ai4bharat/Pralekha","validation",split=split))
 
 train_dataset = concatenate_datasets(train_sets)
 val_dataset = concatenate_datasets(val_sets)
@@ -104,21 +93,13 @@ if tokenizer.pad_token is None:
 # ==========================================================
 
 lang_map = {
-    "ben":"Bengali",
-    "guj":"Gujarati",
-    "hin":"Hindi",
-    "kan":"Kannada",
-    "mal":"Malayalam",
-    "mar":"Marathi",
-    "ori":"Odiya",
-    "pan":"Punjabi",
-    "tam":"Tamil",
-    "tel":"Telugu",
-    "urd":"Urdu"
+    "ben":"Bengali","guj":"Gujarati","hin":"Hindi","kan":"Kannada",
+    "mal":"Malayalam","mar":"Marathi","ori":"Odiya","pan":"Punjabi",
+    "tam":"Tamil","tel":"Telugu","urd":"Urdu"
 }
 
 # ==========================================================
-# PROMPT BUILDER (STRICT VERBATIM)
+# PROMPT BUILDER (UNCHANGED)
 # ==========================================================
 
 def build_prompt(example):
@@ -152,24 +133,69 @@ train_dataset = train_dataset.map(build_prompt)
 val_dataset = val_dataset.map(build_prompt)
 
 # ==========================================================
-# TOKENIZATION
+# TOKENIZATION (PACKED TRAINING)
 # ==========================================================
+
+print("Tokenizing datasets")
 
 def tokenize(example):
 
     tok = tokenizer(
         example["text"],
         truncation=True,
-        padding="max_length",
         max_length=MAX_LEN
     )
 
-    tok["labels"] = tok["input_ids"].copy()
+    return {"input_ids": tok["input_ids"]}
 
-    return tok
+train_dataset = train_dataset.map(tokenize, remove_columns=train_dataset.column_names)
+val_dataset = val_dataset.map(tokenize, remove_columns=val_dataset.column_names)
 
-train_dataset = train_dataset.map(tokenize)
-val_dataset = val_dataset.map(tokenize)
+# ==========================================================
+# PACKING FUNCTION
+# ==========================================================
+
+def pack_dataset(dataset):
+
+    packed_input_ids = []
+
+    current = []
+
+    current_len = 0
+
+    for ex in dataset:
+
+        ids = ex["input_ids"]
+
+        if current_len + len(ids) > MAX_LEN:
+
+            packed_input_ids.append(current)
+
+            current = []
+            current_len = 0
+
+        current.extend(ids)
+        current_len += len(ids)
+
+    if len(current) > 0:
+        packed_input_ids.append(current)
+
+    packed = {
+        "input_ids": packed_input_ids,
+        "labels": packed_input_ids
+    }
+
+    return packed
+
+print("Packing sequences")
+
+train_packed = pack_dataset(train_dataset)
+val_packed = pack_dataset(val_dataset)
+
+from datasets import Dataset
+
+train_dataset = Dataset.from_dict(train_packed)
+val_dataset = Dataset.from_dict(val_packed)
 
 train_dataset.set_format("torch")
 val_dataset.set_format("torch")
@@ -183,7 +209,7 @@ def build_lora(model):
     config = LoraConfig(
         r=16,
         lora_alpha=32,
-        target_modules=[  "q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
+        target_modules=["q_proj","k_proj","v_proj","o_proj","gate_proj","up_proj","down_proj"],
         lora_dropout=0.05,
         bias="none",
         task_type="CAUSAL_LM"
@@ -239,71 +265,90 @@ for seed in SEEDS:
     ckpts.append(out_dir)
 
 # ==========================================================
-# MODEL SOUP
+# GREEDY MODEL SOUP
 # ==========================================================
 
-print("Building model soup")
+print("Building greedy soup")
 
-base = AutoModelForCausalLM.from_pretrained(
-    MODEL_NAME,
-    torch_dtype=torch.bfloat16
-)
+def eval_model(path):
 
-base = build_lora(base)
+    model = PeftModel.from_pretrained(
+        AutoModelForCausalLM.from_pretrained(MODEL_NAME),
+        path
+    ).to(DEVICE)
 
-lora_weights = []
+    sample = val_dataset.select(range(200))
 
-for p in ckpts:
+    preds=[]
+    refs=[]
 
-    m = PeftModel.from_pretrained(base,p)
+    for ex in sample:
 
-    sd = m.state_dict()
+        ids = ex["input_ids"].unsqueeze(0).to(DEVICE)
 
-    lora = {k:v for k,v in sd.items() if "lora" in k}
+        out = model.generate(ids,max_new_tokens=4096)
 
-    lora_weights.append(lora)
+        text = tokenizer.decode(out[0],skip_special_tokens=True)
 
-avg = {}
+        preds.append(text)
+        refs.append(tokenizer.decode(ex["labels"],skip_special_tokens=True))
 
-for k in lora_weights[0]:
+    bleu = sacrebleu.corpus_bleu(preds,[refs]).score
 
-    avg[k] = torch.stack([w[k] for w in lora_weights]).mean(0)
+    return bleu
 
-state = base.state_dict()
+scores = [(p,eval_model(p)) for p in ckpts]
 
-for k in avg:
-    state[k] = avg[k]
+scores.sort(key=lambda x:x[1],reverse=True)
 
-base.load_state_dict(state)
+soup = scores[0][0]
+
+print("Best checkpoint:",soup)
 
 SOUP_DIR = f"{OUTPUT_DIR}/soup"
 
-base.save_pretrained(SOUP_DIR)
+base = AutoModelForCausalLM.from_pretrained(MODEL_NAME)
+base = build_lora(base)
+
+best = PeftModel.from_pretrained(base,soup)
+
+best.save_pretrained(SOUP_DIR)
 
 # ==========================================================
-# BUILD PREFERENCE DATASET
+# BUILD REWARD DATASET (FIXED)
 # ==========================================================
 
-prefs = []
+print("Building preference dataset")
 
-for ex in train_dataset:
+policy = AutoModelForCausalLM.from_pretrained(
+    SOUP_DIR,
+    torch_dtype=torch.bfloat16,
+    device_map="auto"
+)
 
-    src = ex["src_txt"]
-    tgt = ex["tgt_txt"]
-    lang = lang_map[ex["tgt_lang"]]
+prefs=[]
 
-    prompt = f"Translate the following sentence from English to {lang}.\n\nEnglish: {src}"
+sample = train_dataset.select(range(2000))
 
-    bad = tgt[::-1]
+for ex in tqdm(sample):
 
-    prefs.append({
-        "prompt":prompt,
-        "chosen":tgt,
-        "rejected":bad
-    })
+    src = ex["input_ids"].unsqueeze(0).to(DEVICE)
+
+    out = policy.generate(src,max_new_tokens=4096)
+
+    pred = tokenizer.decode(out[0],skip_special_tokens=True)
+
+    ref = tokenizer.decode(ex["labels"],skip_special_tokens=True)
+
+    if pred!=ref:
+
+        prefs.append({
+            "chosen":ref,
+            "rejected":pred
+        })
 
 # ==========================================================
-# SIMPLE REWARD MODEL
+# REWARD MODEL
 # ==========================================================
 
 class RewardModel(torch.nn.Module):
@@ -312,26 +357,23 @@ class RewardModel(torch.nn.Module):
 
         super().__init__()
 
-        self.base = base
+        self.base=base
 
-        self.head = torch.nn.Linear(base.config.hidden_size,1)
+        self.head=torch.nn.Linear(base.config.hidden_size,1)
 
     def forward(self,input_ids,attention_mask):
 
-        out = self.base(
+        out=self.base(
             input_ids=input_ids,
             attention_mask=attention_mask,
             output_hidden_states=True
         )
 
-        h = out.hidden_states[-1][:,-1,:]
+        h=out.hidden_states[-1][:,-1,:]
 
         return self.head(h)
 
-base_rm = AutoModelForCausalLM.from_pretrained(
-    MODEL_NAME,
-    torch_dtype=torch.bfloat16
-)
+base_rm = AutoModelForCausalLM.from_pretrained(MODEL_NAME)
 
 reward_model = RewardModel(base_rm).to(DEVICE)
 
@@ -339,24 +381,33 @@ opt = torch.optim.AdamW(reward_model.parameters(),lr=1e-5)
 
 print("Training reward model")
 
-for epoch in range(1):
+for i in tqdm(range(0,len(prefs),BATCH_SIZE)):
 
-    for p in tqdm(prefs):
+    batch=prefs[i:i+BATCH_SIZE]
 
-        c = tokenizer(p["prompt"]+p["chosen"],return_tensors="pt").to(DEVICE)
-        r = tokenizer(p["prompt"]+p["rejected"],return_tensors="pt").to(DEVICE)
+    chosen = tokenizer(
+        [b["chosen"] for b in batch],
+        return_tensors="pt",
+        padding=True
+    ).to(DEVICE)
 
-        rc = reward_model(c["input_ids"],c["attention_mask"])
-        rr = reward_model(r["input_ids"],r["attention_mask"])
+    rejected = tokenizer(
+        [b["rejected"] for b in batch],
+        return_tensors="pt",
+        padding=True
+    ).to(DEVICE)
 
-        loss = -torch.nn.functional.logsigmoid(rc-rr).mean()
+    rc = reward_model(**chosen)
+    rr = reward_model(**rejected)
 
-        opt.zero_grad()
-        loss.backward()
-        opt.step()
+    loss = -torch.nn.functional.logsigmoid(rc-rr).mean()
+
+    opt.zero_grad()
+    loss.backward()
+    opt.step()
 
 # ==========================================================
-# RLHF
+# RLHF (KL REGULARIZED)
 # ==========================================================
 
 policy = AutoModelForCausalLM.from_pretrained(
@@ -365,7 +416,11 @@ policy = AutoModelForCausalLM.from_pretrained(
     device_map="auto"
 )
 
-policy = build_lora(policy)
+ref_model = AutoModelForCausalLM.from_pretrained(
+    SOUP_DIR,
+    torch_dtype=torch.bfloat16,
+    device_map="auto"
+)
 
 optimizer = torch.optim.AdamW(policy.parameters(),lr=1e-6)
 
@@ -373,32 +428,30 @@ print("Running RLHF")
 
 for step in tqdm(range(RL_STEPS)):
 
-    sample = random.choice(prefs)
+    batch=random.sample(prefs,BATCH_SIZE)
 
-    prompt = sample["prompt"]
+    texts=[b["chosen"] for b in batch]
 
-    inputs = tokenizer(prompt,return_tensors="pt").to(DEVICE)
+    tok=tokenizer(texts,return_tensors="pt",padding=True).to(DEVICE)
 
-    out = policy.generate(
-        **inputs,
-        max_new_tokens=GEN_LEN
+    logits=policy(**tok).logits
+    ref_logits=ref_model(**tok).logits
+
+    reward=reward_model(**tok)
+
+    kl=torch.nn.functional.kl_div(
+        logits.log_softmax(-1),
+        ref_logits.softmax(-1),
+        reduction="batchmean"
     )
 
-    gen = out[0][inputs["input_ids"].shape[1]:]
-
-    txt = tokenizer.decode(gen,skip_special_tokens=True)
-
-    tok = tokenizer(txt,return_tensors="pt").to(DEVICE)
-
-    reward = reward_model(tok["input_ids"],tok["attention_mask"])
-
-    loss = -reward.mean()
+    loss=-(reward.mean()-KL_BETA*kl)
 
     optimizer.zero_grad()
     loss.backward()
     optimizer.step()
 
-FINAL_DIR = f"{OUTPUT_DIR}/final_model"
+FINAL_DIR=f"{OUTPUT_DIR}/final_model"
 
 policy.save_pretrained(FINAL_DIR)
 
@@ -418,20 +471,16 @@ for split in language_splits:
 
     print("Testing",split)
 
-    dataset = load_dataset(
-        "ai4bharat/Pralekha",
-        "test",
-        split=split
-    )
+    dataset = load_dataset("ai4bharat/Pralekha","test",split=split)
 
-    preds = []
-    refs = []
+    preds=[]
+    refs=[]
 
     for ex in tqdm(dataset):
 
         tgt = lang_map[ex["tgt_lang"]]
 
-        messages = {
+        messages={
             "prompt":[
                 {
                     "role":"user",
@@ -441,28 +490,28 @@ for split in language_splits:
             ]
         }
 
-        prompt = tokenizer.apply_chat_template(
+        prompt=tokenizer.apply_chat_template(
             messages["prompt"],
             tokenize=False,
             add_generation_prompt=True
         )
 
-        inputs = tokenizer(prompt,return_tensors="pt").to(DEVICE)
+        inputs=tokenizer(prompt,return_tensors="pt").to(DEVICE)
 
-        out = model.generate(
+        out=model.generate(
             **inputs,
             max_new_tokens=GEN_LEN
         )
 
-        gen = out[0][inputs["input_ids"].shape[1]:]
+        gen=out[0][inputs["input_ids"].shape[1]:]
 
-        text = tokenizer.decode(gen,skip_special_tokens=True)
+        text=tokenizer.decode(gen,skip_special_tokens=True)
 
         preds.append(text)
         refs.append(ex["tgt_txt"])
 
-    bleu = sacrebleu.corpus_bleu(preds,[refs]).score
-    chrf = sacrebleu.corpus_chrf(preds,[refs]).score
+    bleu=sacrebleu.corpus_bleu(preds,[refs]).score
+    chrf=sacrebleu.corpus_chrf(preds,[refs]).score
 
     print(split,"BLEU:",round(bleu,2),"chrF:",round(chrf,2))
 
