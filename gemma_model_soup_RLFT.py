@@ -39,7 +39,7 @@ MODEL_NAME = "google/gemma-3-270m-it"
 
 OUTPUT_DIR = "./outputs"
 
-MAX_LEN = 4096
+MAX_LEN = 4800
 GEN_LEN = 4096
 
 SEEDS = [1,2,3]
