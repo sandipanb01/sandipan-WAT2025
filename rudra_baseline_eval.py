@@ -212,14 +212,14 @@ for split in language_splits:
 
     dataset = load_dataset(
         "ai4bharat/Pralekha",
-        "test",
+        "dev",
         split=split
     )
 
     dataset = dataset.map(
         build_prompt_wat,
         fn_kwargs={"tokenizer": tokenizer},
-        num_proc=16
+        num_proc=32
     )
 
     references, predictions = evaluate_wat(
