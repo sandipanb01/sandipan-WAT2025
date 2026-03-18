@@ -106,6 +106,13 @@ for split in language_splits:
 
 train_dataset = concatenate_datasets(train_sets)
 val_dataset = concatenate_datasets(val_sets)
+print("Packing dataset")
+
+train_dataset = pack_dataset(train_dataset)
+val_dataset = pack_dataset(val_dataset)
+
+train_dataset.set_format("torch")
+val_dataset.set_format("torch")
 
 # ==========================================================
 # TOKENIZER
