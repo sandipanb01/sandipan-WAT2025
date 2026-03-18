@@ -174,8 +174,7 @@ val_dataset=val_dataset.map(
 # SAVE COPY FOR REWARD DATASET
 # ==========================================================
 
-reward_dataset = train_dataset
-
+reward_dataset = train_dataset.select(range(len(train_dataset)))
 # ==========================================================
 # TOKENIZATION
 # ==========================================================
@@ -196,40 +195,32 @@ val_dataset=val_dataset.map(tokenize)
 # ==========================================================
 # PACKING
 # ==========================================================
-
 def pack_dataset(dataset):
 
-    packed=[]
-    current=[]
-    length=0
+    packed_input_ids=[]
+    packed_labels=[]
+    packed_masks=[]
+
+    buffer=[]
 
     for ex in dataset:
 
-        ids=ex["input_ids"]
+        buffer += ex["input_ids"]
 
-        if length+len(ids)>MAX_LEN:
-            packed.append(current)
-            current=[]
-            length=0
+        while len(buffer) >= MAX_LEN:
 
-        current+=ids
-        length+=len(ids)
+            chunk = buffer[:MAX_LEN]
+            buffer = buffer[MAX_LEN:]
 
-    if current:
-        packed.append(current)
+            packed_input_ids.append(chunk)
+            packed_labels.append(chunk.copy())
+            packed_masks.append([1]*MAX_LEN)
 
     return Dataset.from_dict({
-        "input_ids":packed,
-        "labels":packed
+        "input_ids": packed_input_ids,
+        "labels": packed_labels,
+        "attention_mask": packed_masks
     })
-
-print("Packing dataset")
-
-train_dataset=pack_dataset(train_dataset)
-val_dataset=pack_dataset(val_dataset)
-
-train_dataset.set_format("torch")
-val_dataset.set_format("torch")
 
 # ==========================================================
 # LORA
@@ -290,7 +281,7 @@ for seed in SEEDS:
         args=args,
         train_dataset=train_dataset,
         eval_dataset=val_dataset,
-        data_collator=DataCollatorForLanguageModeling(tokenizer,mlm=False)
+        data_collator=None
     )
 
     trainer.train()
