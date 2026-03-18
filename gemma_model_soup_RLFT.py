@@ -1,9 +1,4 @@
 # ==========================================================
-# INSTALL
-# ==========================================================
-# pip install transformers datasets peft sacrebleu accelerate tqdm
-
-# ==========================================================
 # IMPORTS
 # ==========================================================
 
@@ -272,7 +267,7 @@ for seed in SEEDS:
     args=TrainingArguments(
         output_dir=out,
         per_device_train_batch_size=2,
-        gradient_accumulation_steps=8,
+        gradient_accumulation_steps=4,
         learning_rate=3e-5,
         num_train_epochs=2,
         bf16=True,
@@ -284,14 +279,15 @@ for seed in SEEDS:
         model=model,
         args=args,
         train_dataset=train_dataset,
-        eval_dataset=val_dataset,
-        data_collator=None
+        eval_dataset=val_dataset
     )
 
     trainer.train()
     trainer.save_model(out)
 
     ckpts.append(out)
+
+    free_gpu()
 
 # ==========================================================
 # MODEL SOUP
@@ -334,8 +330,10 @@ base.load_state_dict(state)
 SOUP_DIR=f"{OUTPUT_DIR}/soup"
 base.save_pretrained(SOUP_DIR)
 
+free_gpu()
+
 # ==========================================================
-# BUILD PREFERENCE DATASET
+# BUILD PREFERENCE DATASET (BATCHED)
 # ==========================================================
 
 print("Building preference dataset")
@@ -350,40 +348,48 @@ prefs=[]
 
 sample=reward_dataset.select(range(5000))
 
-for ex in tqdm(sample):
+for i in tqdm(range(0,len(sample),BATCH_SIZE)):
 
-    prompt=ex["prompt"]
+    batch = sample[i:i+BATCH_SIZE]
+
+    prompts=[ex["prompt"] for ex in batch]
 
     inputs=tokenizer(
-        prompt,
-        return_tensors="pt"
+        prompts,
+        return_tensors="pt",
+        padding=True
     ).to(DEVICE)
 
     with torch.no_grad():
         out=policy.generate(
             **inputs,
             max_new_tokens=GEN_LEN,
-            do_sample=True,
+            do_sample=False,
+            use_cache=True,
             temperature=0.8,
             top_p=0.9
         )
 
-    gen = out[0][inputs["input_ids"].shape[1]:]
+    for j,ex in enumerate(batch):
 
-    pred=tokenizer.decode(
-        gen,
-        skip_special_tokens=True
-    )
+        gen = out[j][inputs["input_ids"].shape[1]:]
 
-    ref=ex["reference"]
+        pred=tokenizer.decode(
+            gen,
+            skip_special_tokens=True
+        )
 
-    if pred!=ref:
+        ref=ex["reference"]
 
-        prefs.append({
-            "prompt":prompt,
-            "chosen":ref,
-            "rejected":pred
-        })
+        if pred!=ref:
+
+            prefs.append({
+                "prompt":ex["prompt"],
+                "chosen":ref,
+                "rejected":pred
+            })
+
+free_gpu()
 
 # ==========================================================
 # REWARD MODEL
@@ -446,6 +452,8 @@ for i in tqdm(range(0,len(prefs),BATCH_SIZE)):
     loss.backward()
     opt.step()
 
+free_gpu()
+
 # ==========================================================
 # RLHF
 # ==========================================================
@@ -483,7 +491,8 @@ for step in tqdm(range(RL_STEPS)):
         outputs=policy.generate(
             **inputs,
             max_new_tokens=GEN_LEN,
-            do_sample=True,
+            do_sample=False,
+            use_cache=True,
             temperature=0.8,
             top_p=0.9
         )
@@ -545,6 +554,8 @@ for step in tqdm(range(RL_STEPS)):
     optimizer.zero_grad()
     loss.backward()
     optimizer.step()
+
+free_gpu()
 
 # ==========================================================
 # SAVE FINAL MODEL
