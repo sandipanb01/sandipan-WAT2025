@@ -48,7 +48,7 @@ def load_wat_dataset_train(tokenizer=None):
             target_lang = "Malayalam"
         elif tgt_lang == "mar":
             target_lang = "Marathi"
-        elif tgt_lang == "Ori":
+        elif tgt_lang == "ori":
             target_lang = "Odiya"
         elif tgt_lang == "pan":
             target_lang = "Punjabi"
