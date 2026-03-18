@@ -101,7 +101,7 @@ for split in language_splits:
     )
 
     val_sets.append(
-        load_dataset("ai4bharat/Pralekha","validation",split=split)
+        load_dataset("ai4bharat/Pralekha","dev",split=split)
     )
 
 train_dataset = concatenate_datasets(train_sets)
