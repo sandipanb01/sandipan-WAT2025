@@ -11,6 +11,7 @@ import sacrebleu
 from tqdm import tqdm
 
 from datasets import load_dataset, concatenate_datasets, Dataset
+from transformers import DataCollatorForSeq2Seq
 
 from transformers import (
     AutoTokenizer,
@@ -109,6 +110,11 @@ tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
 if tokenizer.pad_token is None:
     tokenizer.pad_token = tokenizer.eos_token
 
+data_collator = DataCollatorForSeq2Seq(
+    tokenizer=tokenizer,
+    padding=True
+)
+
 # ==========================================================
 # PROMPT BUILDER
 # ==========================================================
@@ -196,7 +202,6 @@ def tokenize(example):
         "labels": labels
     }
 
-# FIX — ACTUALLY TOKENIZE DATASET
 train_dataset = train_dataset.map(tokenize, remove_columns=train_dataset.column_names)
 val_dataset = val_dataset.map(tokenize, remove_columns=val_dataset.column_names)
 
@@ -265,7 +270,8 @@ for seed in SEEDS:
         model=model,
         args=args,
         train_dataset=train_dataset,
-        eval_dataset=val_dataset
+        eval_dataset=val_dataset,
+        data_collator=data_collator
     )
 
     trainer.train()
@@ -285,7 +291,6 @@ lora_weights=[]
 
 for p in ckpts:
 
-    # FIX — reload base each time
     base=AutoModelForCausalLM.from_pretrained(MODEL_NAME)
     base=build_lora(base)
 
@@ -352,7 +357,7 @@ for i in tqdm(range(0,len(sample),BATCH_SIZE)):
         out=policy.generate(
             **inputs,
             max_new_tokens=GEN_LEN,
-            do_sample=True,   # FIX
+            do_sample=True,
             temperature=0.8,
             top_p=0.9
         )
@@ -509,20 +514,22 @@ for step in tqdm(range(RL_STEPS)):
     logits = outputs_policy.logits
     ref_logits = outputs_ref.logits
 
-    log_probs = torch.log_softmax(logits, dim=-1)
-    ref_log_probs = torch.log_softmax(ref_logits, dim=-1)
+    log_probs = torch.log_softmax(logits[:, :-1], dim=-1)
+    ref_log_probs = torch.log_softmax(ref_logits[:, :-1], dim=-1)
+
+    targets = full_sequences[:, 1:]
 
     token_logprob = log_probs.gather(
         -1,
-        full_sequences.unsqueeze(-1)
+        targets.unsqueeze(-1)
     ).squeeze(-1)
 
     ref_token_logprob = ref_log_probs.gather(
         -1,
-        full_sequences.unsqueeze(-1)
+        targets.unsqueeze(-1)
     ).squeeze(-1)
 
-    mask = attention_mask
+    mask = attention_mask[:, 1:]
 
     prompt_len = inputs["input_ids"].shape[1]
 
