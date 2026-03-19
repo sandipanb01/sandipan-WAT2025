@@ -231,38 +231,48 @@ for seed in SEEDS:
 
 print("Building model soup")
 
-lora_weights=[]
+lora_weights = []
 
-for p in ckpts:
+for path in ckpts:
 
-    base=AutoModelForCausalLM.from_pretrained(MODEL_NAME)
-    base=build_lora(base)
+    base = AutoModelForCausalLM.from_pretrained(MODEL_NAME)
+    base = build_lora(base)
 
-    m=PeftModel.from_pretrained(base,p)
+    model = PeftModel.from_pretrained(base, path)
 
-    sd=m.state_dict()
+    lora_state = {
+        k: v.cpu()
+        for k, v in model.state_dict().items()
+        if "lora_" in k
+    }
 
-    lora={k:v for k,v in sd.items() if "lora" in k}
-    lora_weights.append(lora)
+    lora_weights.append(lora_state)
 
-avg={}
+# average weights
+avg_lora = {}
 
 for k in lora_weights[0]:
-    avg[k]=torch.stack(
+
+    avg_lora[k] = torch.stack(
         [w[k] for w in lora_weights]
     ).mean(0)
 
-base=AutoModelForCausalLM.from_pretrained(MODEL_NAME)
-base=build_lora(base)
+# create fresh model
+base = AutoModelForCausalLM.from_pretrained(
+    MODEL_NAME,
+    torch_dtype=torch.bfloat16,
+    device_map="auto"
+)
 
-state=base.state_dict()
+base = build_lora(base)
 
-for k in avg:
-    state[k]=avg[k]
+# load averaged LoRA weights
+missing, unexpected = base.load_state_dict(
+    avg_lora,
+    strict=False
+)
 
-base.load_state_dict(state)
-
-SOUP_DIR=f"{OUTPUT_DIR}/soup"
+SOUP_DIR = f"{OUTPUT_DIR}/soup"
 base.save_pretrained(SOUP_DIR)
 
 free_gpu()
