@@ -270,6 +270,12 @@ for seed in SEEDS:
         gradient_accumulation_steps=4,
         learning_rate=3e-5,
         num_train_epochs=2,
+        max_length=MAX_LEN,
+        completion_only_loss=True,
+        gradient_checkpointing=True,
+        lr_scheduler_type="cosine",
+        warmup_ratio=0.1,
+        weight_decay=0.01,
         bf16=True,
         logging_steps=100,
         save_strategy="epoch"
