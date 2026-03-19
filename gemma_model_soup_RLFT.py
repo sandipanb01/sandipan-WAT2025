@@ -32,6 +32,7 @@ from trl import SFTTrainer, SFTConfig
 
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
+torch.set_float32_matmul_precision("high")
 
 # ==========================================================
 # CONFIG
@@ -44,7 +45,7 @@ OUTPUT_DIR = "./outputs"
 MAX_LEN = 4800
 GEN_LEN = 4096
 
-SEEDS = [1,2,3]
+SEEDS = [1, 2, 3]
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -58,24 +59,27 @@ os.makedirs(OUTPUT_DIR, exist_ok=True)
 # UTILITIES
 # ==========================================================
 
+
 def free_gpu():
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
         torch.cuda.ipc_collect()
 
+
 def calc_metrics(preds, refs):
     bleu = sacrebleu.corpus_bleu(preds, [refs]).score
     chrf = sacrebleu.corpus_chrf(preds, [refs]).score
-    return round(bleu,2), round(chrf,2)
+    return round(bleu, 2), round(chrf, 2)
+
 
 # ==========================================================
 # LANGUAGE SPLITS
 # ==========================================================
 
 language_splits = [
-"eng_ben","eng_guj","eng_hin","eng_kan","eng_mal",
-"eng_mar","eng_ori","eng_pan","eng_tam","eng_tel","eng_urd"
+    "eng_ben", "eng_guj", "eng_hin", "eng_kan", "eng_mal",
+    "eng_mar", "eng_ori", "eng_pan", "eng_tam", "eng_tel", "eng_urd"
 ]
 
 # ==========================================================
@@ -84,17 +88,17 @@ language_splits = [
 
 print("Loading Pralekha dataset")
 
-train_sets=[]
-val_sets=[]
+train_sets = []
+val_sets = []
 
 for split in language_splits:
 
     train_sets.append(
-        load_dataset("ai4bharat/Pralekha","train",split=split)
+        load_dataset("ai4bharat/Pralekha", "train", split=split)
     )
 
     val_sets.append(
-        load_dataset("ai4bharat/Pralekha","dev",split=split)
+        load_dataset("ai4bharat/Pralekha", "dev", split=split)
     )
 
 train_dataset = concatenate_datasets(train_sets)
@@ -109,16 +113,19 @@ tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
 if tokenizer.pad_token is None:
     tokenizer.pad_token = tokenizer.eos_token
 
+tokenizer.padding_side = "left"
+
 # ==========================================================
-# PROMPT BUILDER (TRL FORMAT)
+# PROMPT BUILDER (STRICT FORMAT)
 # ==========================================================
+
 
 def build_prompt_wat(example):
 
     lang_map = {
-        "ben":"Bengali","guj":"Gujarati","hin":"Hindi","kan":"Kannada",
-        "mal":"Malayalam","mar":"Marathi","ori":"Odiya","pan":"Punjabi",
-        "tam":"Tamil","tel":"Telugu","urd":"Urdu"
+        "ben": "Bengali", "guj": "Gujarati", "hin": "Hindi", "kan": "Kannada",
+        "mal": "Malayalam", "mar": "Marathi", "ori": "Odiya", "pan": "Punjabi",
+        "tam": "Tamil", "tel": "Telugu", "urd": "Urdu"
     }
 
     target_lang = lang_map[example["tgt_lang"]]
@@ -127,13 +134,14 @@ def build_prompt_wat(example):
         "prompt": [{
             "role": "user",
             "content": f"Translate the following sentence from English to {target_lang}.\n\n"
-            f"English: {example['src_txt']}",
+                       f"English: {example['src_txt']}",
         }],
         "completion": [{
             "role": "assistant",
             "content": example["tgt_txt"]
         }]
     }
+
 
 train_dataset = train_dataset.map(
     build_prompt_wat,
@@ -153,44 +161,50 @@ reward_dataset = train_dataset
 # LORA
 # ==========================================================
 
+
 def build_lora(model):
 
     model.config.use_cache = False
 
-    config=LoraConfig(
+    config = LoraConfig(
         r=16,
         lora_alpha=32,
         target_modules=[
-        "q_proj","k_proj","v_proj","o_proj",
-        "gate_proj","up_proj","down_proj"],
+            "q_proj", "k_proj", "v_proj", "o_proj",
+            "gate_proj", "up_proj", "down_proj"
+        ],
         lora_dropout=0.05,
         bias="none",
         task_type="CAUSAL_LM"
     )
 
-    return get_peft_model(model,config)
+    return get_peft_model(model, config)
+
 
 # ==========================================================
-# TRAIN MULTIPLE SEEDS (SFTTrainer)
+# TRAIN MULTIPLE SEEDS
 # ==========================================================
 
-ckpts=[]
+ckpts = []
 
 for seed in SEEDS:
 
-    print("Training seed",seed)
+    print("Training seed", seed)
 
     torch.manual_seed(seed)
 
-    base=AutoModelForCausalLM.from_pretrained(
+    base = AutoModelForCausalLM.from_pretrained(
         MODEL_NAME,
         torch_dtype=torch.bfloat16,
         device_map="auto"
     )
 
-    model=build_lora(base)
+    base.config.pad_token_id = tokenizer.pad_token_id
+    base.config.eos_token_id = tokenizer.eos_token_id
 
-    out=f"{OUTPUT_DIR}/seed_{seed}"
+    model = build_lora(base)
+
+    out = f"{OUTPUT_DIR}/seed_{seed}"
 
     config = SFTConfig(
         output_dir=out,
@@ -213,7 +227,6 @@ for seed in SEEDS:
         model=model,
         train_dataset=train_dataset,
         eval_dataset=val_dataset,
-        peft_config=None,
         args=config,
         processing_class=tokenizer
     )
@@ -248,7 +261,6 @@ for path in ckpts:
 
     lora_weights.append(lora_state)
 
-# average weights
 avg_lora = {}
 
 for k in lora_weights[0]:
@@ -257,20 +269,18 @@ for k in lora_weights[0]:
         [w[k] for w in lora_weights]
     ).mean(0)
 
-# create fresh model
 base = AutoModelForCausalLM.from_pretrained(
     MODEL_NAME,
     torch_dtype=torch.bfloat16,
     device_map="auto"
 )
 
+base.config.pad_token_id = tokenizer.pad_token_id
+base.config.eos_token_id = tokenizer.eos_token_id
+
 base = build_lora(base)
 
-# load averaged LoRA weights
-missing, unexpected = base.load_state_dict(
-    avg_lora,
-    strict=False
-)
+base.load_state_dict(avg_lora, strict=False)
 
 SOUP_DIR = f"{OUTPUT_DIR}/soup"
 base.save_pretrained(SOUP_DIR)
@@ -278,62 +288,60 @@ base.save_pretrained(SOUP_DIR)
 free_gpu()
 
 # ==========================================================
-# BUILD PREFERENCE DATASET
+# BUILD PREFERENCE DATASET (BATCHED INFERENCE)
 # ==========================================================
 
 print("Building preference dataset")
 
-policy=AutoModelForCausalLM.from_pretrained(
-SOUP_DIR,
-torch_dtype=torch.bfloat16,
-device_map="auto"
+policy = AutoModelForCausalLM.from_pretrained(
+    SOUP_DIR,
+    torch_dtype=torch.bfloat16,
+    device_map="auto"
 )
 
-prefs=[]
+policy.config.pad_token_id = tokenizer.pad_token_id
 
-sample=reward_dataset.select(range(5000))
+prefs = []
 
-for i in tqdm(range(0,len(sample),BATCH_SIZE)):
+sample = reward_dataset.select(range(5000))
 
-    batch = sample.select(range(i, min(i+BATCH_SIZE, len(sample))))
+for i in tqdm(range(0, len(sample), BATCH_SIZE)):
+
+    batch = sample.select(range(i, min(i + BATCH_SIZE, len(sample))))
 
     prompts = [p[0]["content"] for p in batch["prompt"]]
 
-    
-    inputs=tokenizer(
+    inputs = tokenizer(
         prompts,
         return_tensors="pt",
-        padding=False,
-        max_length=MAX_LEN,
-        truncation=True
+        truncation=True,
+        max_length=MAX_LEN
     ).to(DEVICE)
 
     with torch.no_grad():
-        out=policy.generate(
+        outputs = policy.generate(
             **inputs,
             max_new_tokens=GEN_LEN,
             do_sample=True,
             temperature=0.8,
-            top_p=0.9
+            top_p=0.9,
+            pad_token_id=tokenizer.pad_token_id
         )
 
-    for j in range(len(batch["prompt"])):
-        
-        gen = out[j][inputs["input_ids"].shape[1]:]
+    for j in range(len(prompts)):
 
-        pred=tokenizer.decode(
-            gen,
-            skip_special_tokens=True
-        )
+        gen = outputs[j][inputs["input_ids"].shape[1]:]
+
+        pred = tokenizer.decode(gen, skip_special_tokens=True)
 
         ref = batch["completion"][j][0]["content"]
 
-        if pred!=ref:
+        if pred != ref:
 
             prefs.append({
-                "prompt":ex["prompt"][0]["content"],
-                "chosen":ref,
-                "rejected":pred
+                "prompt": prompts[j],
+                "chosen": ref,
+                "rejected": pred
             })
 
 free_gpu()
@@ -342,25 +350,23 @@ free_gpu()
 # REWARD MODEL
 # ==========================================================
 
+
 class RewardModel(torch.nn.Module):
 
-    def __init__(self,base):
-
+    def __init__(self, base):
         super().__init__()
+        self.base = base
+        self.head = torch.nn.Linear(base.config.hidden_size, 1)
 
-        self.base=base
-        self.head=torch.nn.Linear(
-        base.config.hidden_size,1)
+    def forward(self, input_ids, attention_mask):
 
-    def forward(self,input_ids,attention_mask):
-
-        out=self.base(
+        out = self.base(
             input_ids=input_ids,
             attention_mask=attention_mask,
             output_hidden_states=True
         )
 
-        lengths = attention_mask.sum(dim=1)-1
+        lengths = attention_mask.sum(dim=1) - 1
 
         h = out.hidden_states[-1][
             torch.arange(len(lengths)), lengths
@@ -368,32 +374,30 @@ class RewardModel(torch.nn.Module):
 
         return self.head(h)
 
-reward_base=AutoModel.from_pretrained(MODEL_NAME).to(DEVICE)
 
-reward_model=RewardModel(reward_base).to(DEVICE)
+reward_base = AutoModel.from_pretrained(MODEL_NAME).to(DEVICE)
+
+reward_model = RewardModel(reward_base).to(DEVICE)
 reward_model.train()
 
-opt=torch.optim.AdamW(
-reward_model.parameters(),
-lr=1e-5
-)
+opt = torch.optim.AdamW(reward_model.parameters(), lr=1e-5)
 
 print("Training reward model")
 
-for i in tqdm(range(0,len(prefs),BATCH_SIZE)):
+for i in tqdm(range(0, len(prefs), BATCH_SIZE)):
 
-    batch=prefs[i:i+BATCH_SIZE]
+    batch = prefs[i:i + BATCH_SIZE]
 
-    chosen=[b["prompt"]+b["chosen"] for b in batch]
-    rejected=[b["prompt"]+b["rejected"] for b in batch]
+    chosen = [b["prompt"] + b["chosen"] for b in batch]
+    rejected = [b["prompt"] + b["rejected"] for b in batch]
 
-    chosen=tokenizer(chosen,return_tensors="pt",padding=True,max_length=MAX_LEN,truncation=True).to(DEVICE)
-    rejected=tokenizer(rejected,return_tensors="pt",padding=True,max_length=MAX_LEN,truncation=True).to(DEVICE)
+    chosen = tokenizer(chosen, return_tensors="pt", truncation=True, max_length=MAX_LEN).to(DEVICE)
+    rejected = tokenizer(rejected, return_tensors="pt", truncation=True, max_length=MAX_LEN).to(DEVICE)
 
-    rc=reward_model(chosen["input_ids"],chosen["attention_mask"])
-    rr=reward_model(rejected["input_ids"],rejected["attention_mask"])
+    rc = reward_model(chosen["input_ids"], chosen["attention_mask"])
+    rr = reward_model(rejected["input_ids"], rejected["attention_mask"])
 
-    loss=-torch.nn.functional.logsigmoid(rc-rr).mean()
+    loss = -torch.nn.functional.logsigmoid(rc - rr).mean()
 
     opt.zero_grad()
     loss.backward()
@@ -408,46 +412,68 @@ free_gpu()
 print("Running RLHF")
 
 policy = AutoModelForCausalLM.from_pretrained(
-SOUP_DIR,
-torch_dtype=torch.bfloat16,
-device_map="auto"
+    SOUP_DIR,
+    torch_dtype=torch.bfloat16,
+    device_map="auto"
 )
 
+policy.config.pad_token_id = tokenizer.pad_token_id
+policy.config.eos_token_id = tokenizer.eos_token_id
+
 ref_model = AutoModelForCausalLM.from_pretrained(
-SOUP_DIR,
-torch_dtype=torch.bfloat16,
-device_map="auto"
+    SOUP_DIR,
+    torch_dtype=torch.bfloat16,
+    device_map="auto"
 )
+
+ref_model.config.pad_token_id = tokenizer.pad_token_id
+ref_model.config.eos_token_id = tokenizer.eos_token_id
 
 ref_model.eval()
 
 for p in ref_model.parameters():
-    p.requires_grad=False
+    p.requires_grad = False
 
 optimizer = torch.optim.AdamW(policy.parameters(), lr=1e-6)
 
 for step in tqdm(range(RL_STEPS)):
 
-    batch=random.sample(prefs,BATCH_SIZE)
+    batch = random.sample(prefs, BATCH_SIZE)
 
-    prompts=[b["prompt"] for b in batch]
+    prompts = [b["prompt"] for b in batch]
 
-    inputs=tokenizer(prompts,return_tensors="pt",padding=True,max_length=MAX_LEN,truncation=True).to(DEVICE)
+    inputs = tokenizer(
+        prompts,
+        return_tensors="pt",
+        padding=True,
+        truncation=True,
+        max_length=MAX_LEN
+    ).to(DEVICE)
+
+    # ------------------------------------------------------
+    # Generate responses
+    # ------------------------------------------------------
 
     with torch.no_grad():
-        outputs=policy.generate(
+        outputs = policy.generate(
             **inputs,
             max_new_tokens=GEN_LEN,
             do_sample=True,
             temperature=0.8,
-            top_p=0.9
+            top_p=0.9,
+            pad_token_id=tokenizer.pad_token_id,
+            eos_token_id=tokenizer.eos_token_id
         )
 
-    gen=outputs[:,inputs["input_ids"].shape[1]:]
+    gen = outputs[:, inputs["input_ids"].shape[1]:]
 
     full_sequences = torch.cat([inputs["input_ids"], gen], dim=1)
 
-    attention_mask = torch.ones_like(full_sequences).to(DEVICE)
+    attention_mask = (full_sequences != tokenizer.pad_token_id).long()
+
+    # ------------------------------------------------------
+    # Reward
+    # ------------------------------------------------------
 
     reward = reward_model(
         full_sequences,
@@ -455,7 +481,12 @@ for step in tqdm(range(RL_STEPS)):
     )
 
     reward = reward.squeeze(-1)
+
     reward = (reward - reward.mean()) / (reward.std() + 1e-8)
+
+    # ------------------------------------------------------
+    # Policy logits
+    # ------------------------------------------------------
 
     outputs_policy = policy(
         input_ids=full_sequences,
@@ -487,21 +518,34 @@ for step in tqdm(range(RL_STEPS)):
 
     mask = attention_mask[:, 1:]
 
-    prompt_len = inputs["input_ids"].shape[1]
+    prompt_lens = inputs["attention_mask"].sum(dim=1)
 
     response_mask = mask.clone()
-    response_mask[:, :prompt_len] = 0
+
+    for i, l in enumerate(prompt_lens):
+        response_mask[i, :l] = 0
+
+    # ------------------------------------------------------
+    # KL
+    # ------------------------------------------------------
 
     kl = ((token_logprob - ref_token_logprob) * response_mask).sum(-1).mean()
 
-    seq_logprob = (token_logprob * response_mask).sum(-1) / response_mask.sum(-1)
+    # ------------------------------------------------------
+    # Policy gradient
+    # ------------------------------------------------------
 
-    pg_loss = -(reward.squeeze() * seq_logprob).mean()
+    seq_logprob = (token_logprob * response_mask).sum(-1) / (response_mask.sum(-1) + 1e-8)
+    pg_loss = -(reward * seq_logprob).mean()
 
     loss = pg_loss + KL_BETA * kl
 
     optimizer.zero_grad()
+
     loss.backward()
+
+    torch.nn.utils.clip_grad_norm_(policy.parameters(), 1.0)
+
     optimizer.step()
 
 free_gpu()
@@ -510,7 +554,7 @@ free_gpu()
 # SAVE FINAL MODEL
 # ==========================================================
 
-FINAL_DIR=f"{OUTPUT_DIR}/final_model"
+FINAL_DIR = f"{OUTPUT_DIR}/final_model"
 
 policy.save_pretrained(FINAL_DIR)
 tokenizer.save_pretrained(FINAL_DIR)
