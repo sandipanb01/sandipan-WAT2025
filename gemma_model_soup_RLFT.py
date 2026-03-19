@@ -218,11 +218,12 @@ for seed in SEEDS:
         learning_rate=3e-5,
         lr_scheduler_type="cosine",
         warmup_steps=100,
-        logging_steps=100,
+        logging_steps=2000,
         bf16=True,
         max_length=MAX_LEN,
         packing=False,
-        completion_only_loss=True,
+        gradient_checkpointing = True,
+        completion_only_loss=True,        
         save_strategy="epoch",
         report_to="none"
     )
