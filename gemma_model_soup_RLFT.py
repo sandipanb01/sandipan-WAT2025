@@ -304,6 +304,7 @@ for i in tqdm(range(0,len(sample),BATCH_SIZE)):
         prompts,
         return_tensors="pt",
         padding=False,
+        max_length=MAX_LEN,
         truncation=True
     ).to(DEVICE)
 
@@ -386,8 +387,8 @@ for i in tqdm(range(0,len(prefs),BATCH_SIZE)):
     chosen=[b["prompt"]+b["chosen"] for b in batch]
     rejected=[b["prompt"]+b["rejected"] for b in batch]
 
-    chosen=tokenizer(chosen,return_tensors="pt",padding=True,truncation=True).to(DEVICE)
-    rejected=tokenizer(rejected,return_tensors="pt",padding=True,truncation=True).to(DEVICE)
+    chosen=tokenizer(chosen,return_tensors="pt",padding=True,max_length=MAX_LEN,truncation=True).to(DEVICE)
+    rejected=tokenizer(rejected,return_tensors="pt",padding=True,max_length=MAX_LEN,truncation=True).to(DEVICE)
 
     rc=reward_model(chosen["input_ids"],chosen["attention_mask"])
     rr=reward_model(rejected["input_ids"],rejected["attention_mask"])
@@ -431,7 +432,7 @@ for step in tqdm(range(RL_STEPS)):
 
     prompts=[b["prompt"] for b in batch]
 
-    inputs=tokenizer(prompts,return_tensors="pt",padding=True,truncation=True).to(DEVICE)
+    inputs=tokenizer(prompts,return_tensors="pt",padding=True,max_length=MAX_LEN,truncation=True).to(DEVICE)
 
     with torch.no_grad():
         outputs=policy.generate(
