@@ -10,15 +10,12 @@ import sacrebleu
 
 from tqdm import tqdm
 
-from datasets import load_dataset, concatenate_datasets, Dataset
-from transformers import DataCollatorForLanguageModeling
+from datasets import load_dataset, concatenate_datasets
 
 from transformers import (
     AutoTokenizer,
     AutoModelForCausalLM,
-    AutoModel,
-    Trainer,
-    TrainingArguments
+    AutoModel
 )
 
 from peft import (
@@ -26,6 +23,8 @@ from peft import (
     get_peft_model,
     PeftModel
 )
+
+from trl import SFTTrainer, SFTConfig
 
 # ==========================================================
 # SPEED SETTINGS
@@ -110,19 +109,11 @@ tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
 if tokenizer.pad_token is None:
     tokenizer.pad_token = tokenizer.eos_token
 
-data_collator = DataCollatorForSeq2Seq(
-    tokenizer=tokenizer,
-    padding=False
-)
-
 # ==========================================================
-# PROMPT BUILDER
+# PROMPT BUILDER (TRL FORMAT)
 # ==========================================================
 
-def build_prompt_wat(example, tokenizer):
-
-    ref = example["tgt_txt"]
-    tgt_lang = example["tgt_lang"]
+def build_prompt_wat(example):
 
     lang_map = {
         "ben":"Bengali","guj":"Gujarati","hin":"Hindi","kan":"Kannada",
@@ -130,86 +121,33 @@ def build_prompt_wat(example, tokenizer):
         "tam":"Tamil","tel":"Telugu","urd":"Urdu"
     }
 
-    target_lang = lang_map[tgt_lang]
-
-    messages = {
-        "prompt":[
-            {
-                "role":"user",
-                "content":f"Translate the following sentence from English to {target_lang}.\n\n"
-                f"English: {example['src_txt']}"
-            }
-        ],
-        "completion":[
-            {"role":"assistant","content":example["tgt_txt"]}
-        ]
-    }
-
-    prompt = tokenizer.apply_chat_template(
-        messages["prompt"],
-        tokenize=False,
-        add_generation_prompt=True
-    )
-
-    full = prompt + example["tgt_txt"]
+    target_lang = lang_map[example["tgt_lang"]]
 
     return {
-        "text":full,
-        "prompt":prompt,
-        "reference":ref
+        "prompt": [{
+            "role": "user",
+            "content": f"Translate the following sentence from English to {target_lang}.\n\n"
+            f"English: {example['src_txt']}",
+        }],
+        "completion": [{
+            "role": "assistant",
+            "content": example["tgt_txt"]
+        }]
     }
 
-train_dataset=train_dataset.map(
+train_dataset = train_dataset.map(
     build_prompt_wat,
-    fn_kwargs={"tokenizer":tokenizer}, 
-    num_proc=32
+    remove_columns=train_dataset.column_names,
+    num_proc=16
 )
 
-val_dataset=val_dataset.map(
+val_dataset = val_dataset.map(
     build_prompt_wat,
-    fn_kwargs={"tokenizer":tokenizer},
-    num_proc=32
-    
+    remove_columns=val_dataset.column_names,
+    num_proc=16
 )
 
-reward_dataset = train_dataset.select(range(len(train_dataset)))
-
-# ==========================================================
-# TOKENIZATION
-# ==========================================================
-
-def tokenize(example):
-
-    prompt_ids = tokenizer(
-        example["prompt"],
-        add_special_tokens=False
-    )["input_ids"]
-
-    full = example["prompt"] + example["reference"]
-
-    tok = tokenizer(
-        full,
-        truncation=True,
-        max_length=MAX_LEN
-    )
-
-    labels = tok["input_ids"].copy()
-
-    prompt_len = len(prompt_ids)
-
-    labels[:prompt_len] = [-100]*prompt_len
-
-    return {
-        "input_ids": tok["input_ids"],
-        "attention_mask": tok["attention_mask"],
-        "labels": labels
-    }
-
-train_dataset = train_dataset.map(tokenize, remove_columns=train_dataset.column_names)
-val_dataset = val_dataset.map(tokenize, remove_columns=val_dataset.column_names)
-
-train_dataset.set_format("torch")
-val_dataset.set_format("torch")
+reward_dataset = train_dataset
 
 # ==========================================================
 # LORA
@@ -233,7 +171,7 @@ def build_lora(model):
     return get_peft_model(model,config)
 
 # ==========================================================
-# TRAIN MULTIPLE SEEDS
+# TRAIN MULTIPLE SEEDS (SFTTrainer)
 # ==========================================================
 
 ckpts=[]
@@ -254,27 +192,29 @@ for seed in SEEDS:
 
     out=f"{OUTPUT_DIR}/seed_{seed}"
 
-    args=TrainingArguments(
+    config = SFTConfig(
         output_dir=out,
         per_device_train_batch_size=2,
         gradient_accumulation_steps=4,
-        learning_rate=3e-5,
         num_train_epochs=2,
-        gradient_checkpointing=True,
+        learning_rate=3e-5,
         lr_scheduler_type="cosine",
-        warmup_ratio=0.1,
-        weight_decay=0.01,
-        bf16=True,
+        warmup_steps=100,
         logging_steps=100,
-        save_strategy="epoch"
+        bf16=True,
+        max_length=MAX_LEN,
+        packing=False,
+        completion_only_loss=True,
+        report_to="none"
     )
 
-    trainer=Trainer(
+    trainer = SFTTrainer(
         model=model,
-        args=args,
         train_dataset=train_dataset,
         eval_dataset=val_dataset,
-        data_collator=data_collator
+        peft_config=None,
+        args=config,
+        processing_class=tokenizer
     )
 
     trainer.train()
@@ -307,7 +247,6 @@ for p in ckpts:
 avg={}
 
 for k in lora_weights[0]:
-
     avg[k]=torch.stack(
         [w[k] for w in lora_weights]
     ).mean(0)
@@ -347,7 +286,7 @@ for i in tqdm(range(0,len(sample),BATCH_SIZE)):
 
     batch = sample[i:i+BATCH_SIZE]
 
-    prompts=[ex["prompt"] for ex in batch]
+    prompts=[b["prompt"][0]["content"] for b in batch]
 
     inputs=tokenizer(
         prompts,
@@ -374,12 +313,12 @@ for i in tqdm(range(0,len(sample),BATCH_SIZE)):
             skip_special_tokens=True
         )
 
-        ref=ex["reference"]
+        ref=ex["completion"][0]["content"]
 
         if pred!=ref:
 
             prefs.append({
-                "prompt":ex["prompt"],
+                "prompt":ex["prompt"][0]["content"],
                 "chosen":ref,
                 "rejected":pred
             })
