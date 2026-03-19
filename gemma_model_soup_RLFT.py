@@ -1,3 +1,4 @@
+!pip install flash-attn
 # ==========================================================
 # IMPORTS
 # ==========================================================
@@ -198,7 +199,8 @@ for seed in SEEDS:
     base = AutoModelForCausalLM.from_pretrained(
         MODEL_NAME,
         torch_dtype=torch.bfloat16,
-        device_map="auto"
+        device_map="auto",
+        attn_implementation="flash_attention_2"
     )
 
     base.config.pad_token_id = tokenizer.pad_token_id
