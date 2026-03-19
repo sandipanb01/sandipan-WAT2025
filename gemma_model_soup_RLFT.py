@@ -238,6 +238,10 @@ for seed in SEEDS:
 
     ckpts.append(out)
 
+    del trainer
+    del model
+    del base
+
     free_gpu()
 
 # ==========================================================
@@ -321,12 +325,12 @@ for i in tqdm(range(0, len(sample), BATCH_SIZE)):
     ).to(DEVICE)
 
     with torch.no_grad():
-        outputs = policy.generate(
+        outputs = policy.generate(   
             **inputs,
             max_new_tokens=GEN_LEN,
-            do_sample=True,
-            temperature=0.8,
-            top_p=0.9,
+            do_sample=False,
+            use_cache=True,
+            eos_token_id=tokenizer.eos_token_id,
             pad_token_id=tokenizer.pad_token_id
         )
 
@@ -376,8 +380,10 @@ class RewardModel(torch.nn.Module):
             torch.arange(len(lengths)), lengths
         ]
 
-        return self.head(h)
+        # make dtype match the head
+        h = h.to(self.head.weight.dtype)
 
+        return self.head(h)
 
 reward_base = AutoModel.from_pretrained(MODEL_NAME).to(DEVICE)
 reward_base.config.pad_token_id = tokenizer.pad_token_id
@@ -469,14 +475,18 @@ for step in tqdm(range(RL_STEPS)):
         outputs = policy.generate(
             **inputs,
             max_new_tokens=GEN_LEN,
-            do_sample=True,
-            temperature=0.8,
-            top_p=0.9,
+            do_sample=False,
+            use_cache=True,
             pad_token_id=tokenizer.pad_token_id,
             eos_token_id=tokenizer.eos_token_id
         )
 
-    gen = outputs[:, inputs["input_ids"].shape[1]:]
+    gen = []
+    for i in range(outputs.shape[0]):
+        prompt_len = inputs["attention_mask"][i].sum()
+        gen.append(outputs[i, prompt_len:])
+
+    gen = torch.nn.utils.rnn.pad_sequence(gen, batch_first=True)
 
     full_sequences = torch.cat([inputs["input_ids"], gen], dim=1)
 
