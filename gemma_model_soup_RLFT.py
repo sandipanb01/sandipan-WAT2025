@@ -11,7 +11,7 @@ import sacrebleu
 from tqdm import tqdm
 
 from datasets import load_dataset, concatenate_datasets, Dataset
-from transformers import DataCollatorForSeq2Seq
+from transformers import DataCollatorForLanguageModeling
 
 from transformers import (
     AutoTokenizer,
@@ -112,7 +112,7 @@ if tokenizer.pad_token is None:
 
 data_collator = DataCollatorForSeq2Seq(
     tokenizer=tokenizer,
-    padding=True
+    padding=False
 )
 
 # ==========================================================
@@ -161,12 +161,15 @@ def build_prompt_wat(example, tokenizer):
 
 train_dataset=train_dataset.map(
     build_prompt_wat,
-    fn_kwargs={"tokenizer":tokenizer}
+    fn_kwargs={"tokenizer":tokenizer}, 
+    num_proc=32
 )
 
 val_dataset=val_dataset.map(
     build_prompt_wat,
-    fn_kwargs={"tokenizer":tokenizer}
+    fn_kwargs={"tokenizer":tokenizer},
+    num_proc=32
+    
 )
 
 reward_dataset = train_dataset.select(range(len(train_dataset)))
@@ -349,7 +352,7 @@ for i in tqdm(range(0,len(sample),BATCH_SIZE)):
     inputs=tokenizer(
         prompts,
         return_tensors="pt",
-        padding=True,
+        padding=False,
         truncation=True
     ).to(DEVICE)
 
