@@ -138,13 +138,13 @@ def build_prompt_wat(example):
 train_dataset = train_dataset.map(
     build_prompt_wat,
     remove_columns=train_dataset.column_names,
-    num_proc=16
+    num_proc=32
 )
 
 val_dataset = val_dataset.map(
     build_prompt_wat,
     remove_columns=val_dataset.column_names,
-    num_proc=16
+    num_proc=32
 )
 
 reward_dataset = train_dataset
@@ -205,6 +205,7 @@ for seed in SEEDS:
         max_length=MAX_LEN,
         packing=False,
         completion_only_loss=True,
+        save_strategy="epoch",
         report_to="none"
     )
 
