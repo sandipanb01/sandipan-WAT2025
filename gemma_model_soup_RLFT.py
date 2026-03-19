@@ -295,10 +295,11 @@ sample=reward_dataset.select(range(5000))
 
 for i in tqdm(range(0,len(sample),BATCH_SIZE)):
 
-    batch = sample[i:i+BATCH_SIZE]
+    batch = sample.select(range(i, min(i+BATCH_SIZE, len(sample))))
 
-    prompts=[b["prompt"][0]["content"] for b in batch]
+    prompts = [p[0]["content"] for p in batch["prompt"]]
 
+    
     inputs=tokenizer(
         prompts,
         return_tensors="pt",
@@ -315,8 +316,8 @@ for i in tqdm(range(0,len(sample),BATCH_SIZE)):
             top_p=0.9
         )
 
-    for j,ex in enumerate(batch):
-
+    for j in range(len(batch["prompt"])):
+        
         gen = out[j][inputs["input_ids"].shape[1]:]
 
         pred=tokenizer.decode(
@@ -324,7 +325,7 @@ for i in tqdm(range(0,len(sample),BATCH_SIZE)):
             skip_special_tokens=True
         )
 
-        ref=ex["completion"][0]["content"]
+        ref = batch["completion"][j][0]["content"]
 
         if pred!=ref:
 
@@ -452,7 +453,8 @@ for step in tqdm(range(RL_STEPS)):
         attention_mask
     )
 
-    reward=(reward-reward.mean())/(reward.std()+1e-8)
+    reward = reward.squeeze(-1)
+    reward = (reward - reward.mean()) / (reward.std() + 1e-8)
 
     outputs_policy = policy(
         input_ids=full_sequences,
