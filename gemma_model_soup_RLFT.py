@@ -563,3 +563,151 @@ policy.save_pretrained(FINAL_DIR)
 tokenizer.save_pretrained(FINAL_DIR)
 
 print("Pipeline complete")
+# ==========================================================
+# BATCHED EVALUATION ON PRALEKHA TEST SET
+# ==========================================================
+
+import json
+
+print("\nStarting evaluation on Pralekha TEST set")
+
+TEST_BATCH_SIZE = 8
+
+RESULT_DIR = f"{OUTPUT_DIR}/evaluation"
+os.makedirs(RESULT_DIR, exist_ok=True)
+
+model = AutoModelForCausalLM.from_pretrained(
+    FINAL_DIR,
+    torch_dtype=torch.bfloat16,
+    device_map="auto"
+)
+
+model.eval()
+
+tokenizer = AutoTokenizer.from_pretrained(FINAL_DIR)
+
+if tokenizer.pad_token is None:
+    tokenizer.pad_token = tokenizer.eos_token
+
+tokenizer.padding_side = "left"
+
+
+def build_eval_prompt(example):
+
+    lang_map = {
+        "ben": "Bengali", "guj": "Gujarati", "hin": "Hindi", "kan": "Kannada",
+        "mal": "Malayalam", "mar": "Marathi", "ori": "Odiya", "pan": "Punjabi",
+        "tam": "Tamil", "tel": "Telugu", "urd": "Urdu"
+    }
+
+    target_lang = lang_map[example["tgt_lang"]]
+
+    return (
+        f"Translate the following sentence from English to {target_lang}.\n\n"
+        f"English: {example['src_txt']}"
+    )
+
+
+all_scores = []
+
+for split in language_splits:
+
+    print(f"\nEvaluating {split}")
+
+    test_dataset = load_dataset(
+        "ai4bharat/Pralekha",
+        "test",
+        split=split
+    )
+
+    preds = []
+    refs = []
+
+    out_file = f"{RESULT_DIR}/{split}_predictions.jsonl"
+
+    with open(out_file, "w", encoding="utf-8") as f:
+
+        for i in tqdm(range(0, len(test_dataset), TEST_BATCH_SIZE)):
+
+            batch = test_dataset.select(
+                range(i, min(i + TEST_BATCH_SIZE, len(test_dataset)))
+            )
+
+            prompts = [build_eval_prompt(x) for x in batch]
+
+            inputs = tokenizer(
+                prompts,
+                return_tensors="pt",
+                padding=True,
+                truncation=True,
+                max_length=MAX_LEN
+            ).to(DEVICE)
+
+            with torch.no_grad():
+
+                outputs = model.generate(
+                    **inputs,
+                    max_new_tokens=GEN_LEN,
+                    do_sample=False,
+                    use_cache=True,
+                    pad_token_id=tokenizer.pad_token_id,
+                    eos_token_id=tokenizer.eos_token_id
+                )
+
+            for j in range(outputs.shape[0]):
+
+                prompt_len = inputs["attention_mask"][j].sum()
+
+                gen_tokens = outputs[j][prompt_len:]
+
+                pred = tokenizer.decode(
+                    gen_tokens,
+                    skip_special_tokens=True
+                )
+
+                ref = batch[j]["tgt_txt"]
+
+                preds.append(pred)
+                refs.append(ref)
+
+                record = {
+                    "split": split,
+                    "src": batch[j]["src_txt"],
+                    "prediction": pred,
+                    "reference": ref
+                }
+
+                f.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+    # ======================================================
+    # METRICS
+    # ======================================================
+
+    bleu = sacrebleu.corpus_bleu(preds, [refs]).score
+    chrf = sacrebleu.corpus_chrf(preds, [refs]).score
+    chrfpp = sacrebleu.corpus_chrf(preds, [refs], word_order=2).score
+
+    score_record = {
+        "split": split,
+        "BLEU": round(bleu, 2),
+        "CHRF": round(chrf, 2),
+        "CHRF++": round(chrfpp, 2)
+    }
+
+    all_scores.append(score_record)
+
+    print(score_record)
+
+# ==========================================================
+# SAVE METRIC SUMMARY
+# ==========================================================
+
+score_file = f"{RESULT_DIR}/scores.jsonl"
+
+with open(score_file, "w") as f:
+    for s in all_scores:
+        f.write(json.dumps(s) + "\n")
+
+print("\nEvaluation finished")
+print("Scores saved to:", score_file)
+print("Predictions saved to:", RESULT_DIR)
