@@ -30,6 +30,8 @@ from trl import SFTTrainer, SFTConfig
 # SPEED SETTINGS
 # ==========================================================
 
+os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
+
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
 torch.set_float32_matmul_precision("high")
@@ -116,7 +118,7 @@ if tokenizer.pad_token is None:
 tokenizer.padding_side = "left"
 
 # ==========================================================
-# PROMPT BUILDER (STRICT FORMAT)
+# PROMPT BUILDER
 # ==========================================================
 
 
@@ -288,7 +290,7 @@ base.save_pretrained(SOUP_DIR)
 free_gpu()
 
 # ==========================================================
-# BUILD PREFERENCE DATASET (BATCHED INFERENCE)
+# BUILD PREFERENCE DATASET
 # ==========================================================
 
 print("Building preference dataset")
@@ -330,7 +332,9 @@ for i in tqdm(range(0, len(sample), BATCH_SIZE)):
 
     for j in range(len(prompts)):
 
-        gen = outputs[j][inputs["input_ids"].shape[1]:]
+        prompt_len = inputs["attention_mask"][j].sum()
+
+        gen = outputs[j][prompt_len:]
 
         pred = tokenizer.decode(gen, skip_special_tokens=True)
 
@@ -376,6 +380,7 @@ class RewardModel(torch.nn.Module):
 
 
 reward_base = AutoModel.from_pretrained(MODEL_NAME).to(DEVICE)
+reward_base.config.pad_token_id = tokenizer.pad_token_id
 
 reward_model = RewardModel(reward_base).to(DEVICE)
 reward_model.train()
@@ -391,8 +396,19 @@ for i in tqdm(range(0, len(prefs), BATCH_SIZE)):
     chosen = [b["prompt"] + b["chosen"] for b in batch]
     rejected = [b["prompt"] + b["rejected"] for b in batch]
 
-    chosen = tokenizer(chosen, return_tensors="pt", truncation=True, max_length=MAX_LEN).to(DEVICE)
-    rejected = tokenizer(rejected, return_tensors="pt", truncation=True, max_length=MAX_LEN).to(DEVICE)
+    chosen = tokenizer(
+        chosen,
+        return_tensors="pt",
+        truncation=True,
+        max_length=MAX_LEN
+    ).to(DEVICE)
+
+    rejected = tokenizer(
+        rejected,
+        return_tensors="pt",
+        truncation=True,
+        max_length=MAX_LEN
+    ).to(DEVICE)
 
     rc = reward_model(chosen["input_ids"], chosen["attention_mask"])
     rr = reward_model(rejected["input_ids"], rejected["attention_mask"])
@@ -445,14 +461,9 @@ for step in tqdm(range(RL_STEPS)):
     inputs = tokenizer(
         prompts,
         return_tensors="pt",
-        padding=True,
         truncation=True,
         max_length=MAX_LEN
     ).to(DEVICE)
-
-    # ------------------------------------------------------
-    # Generate responses
-    # ------------------------------------------------------
 
     with torch.no_grad():
         outputs = policy.generate(
@@ -471,22 +482,9 @@ for step in tqdm(range(RL_STEPS)):
 
     attention_mask = (full_sequences != tokenizer.pad_token_id).long()
 
-    # ------------------------------------------------------
-    # Reward
-    # ------------------------------------------------------
+    reward = reward_model(full_sequences, attention_mask).squeeze(-1)
 
-    reward = reward_model(
-        full_sequences,
-        attention_mask
-    )
-
-    reward = reward.squeeze(-1)
-
-    reward = (reward - reward.mean()) / (reward.std() + 1e-8)
-
-    # ------------------------------------------------------
-    # Policy logits
-    # ------------------------------------------------------
+    reward = (reward - reward.mean()) / (reward.std() + 1e-6)
 
     outputs_policy = policy(
         input_ids=full_sequences,
@@ -498,8 +496,8 @@ for step in tqdm(range(RL_STEPS)):
         attention_mask=attention_mask
     )
 
-    logits = outputs_policy.logits
-    ref_logits = outputs_ref.logits
+    logits = torch.nan_to_num(outputs_policy.logits)
+    ref_logits = torch.nan_to_num(outputs_ref.logits)
 
     log_probs = torch.log_softmax(logits[:, :-1], dim=-1)
     ref_log_probs = torch.log_softmax(ref_logits[:, :-1], dim=-1)
@@ -525,17 +523,12 @@ for step in tqdm(range(RL_STEPS)):
     for i, l in enumerate(prompt_lens):
         response_mask[i, :l] = 0
 
-    # ------------------------------------------------------
-    # KL
-    # ------------------------------------------------------
-
-    kl = ((token_logprob - ref_token_logprob) * response_mask).sum(-1).mean()
-
-    # ------------------------------------------------------
-    # Policy gradient
-    # ------------------------------------------------------
+    kl = (token_logprob - ref_token_logprob)
+    kl = (kl * response_mask).sum(-1) / (response_mask.sum(-1) + 1e-8)
+    kl = kl.mean()
 
     seq_logprob = (token_logprob * response_mask).sum(-1) / (response_mask.sum(-1) + 1e-8)
+
     pg_loss = -(reward * seq_logprob).mean()
 
     loss = pg_loss + KL_BETA * kl
