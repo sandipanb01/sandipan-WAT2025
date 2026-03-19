@@ -70,42 +70,6 @@ def calc_metrics(preds, refs):
     return round(bleu,2), round(chrf,2)
 
 # ==========================================================
-# PACKING
-# ==========================================================
-
-def pack_dataset(dataset):
-
-    packed_input_ids=[]
-    packed_labels=[]
-    packed_masks=[]
-
-    buffer=[]
-
-    for ex in dataset:
-
-        buffer += ex["input_ids"]
-
-        while len(buffer) >= MAX_LEN:
-
-            chunk = buffer[:MAX_LEN]
-            buffer = buffer[MAX_LEN:]
-
-            labels = chunk.copy()
-
-            # shift labels
-            labels[:-1] = chunk[1:]
-            labels[-1] = -100
-
-            packed_input_ids.append(chunk)
-            packed_labels.append(labels)
-            packed_masks.append([1]*MAX_LEN)
-
-    return Dataset.from_dict({
-        "input_ids": packed_input_ids,
-        "labels": packed_labels,
-        "attention_mask": packed_masks
-    })
-# ==========================================================
 # LANGUAGE SPLITS
 # ==========================================================
 
@@ -207,31 +171,37 @@ reward_dataset = train_dataset.select(range(len(train_dataset)))
 
 def tokenize(example):
 
-    tok=tokenizer(
-        example["text"],
+    prompt_ids = tokenizer(
+        example["prompt"],
+        add_special_tokens=False
+    )["input_ids"]
+
+    full = example["prompt"] + example["reference"]
+
+    tok = tokenizer(
+        full,
         truncation=True,
         max_length=MAX_LEN
     )
 
-    return {"input_ids":tok["input_ids"]}
+    labels = tok["input_ids"].copy()
 
-train_dataset=train_dataset.map(tokenize)
-val_dataset=val_dataset.map(tokenize)
+    prompt_len = len(prompt_ids)
 
-print("Packing dataset")
+    labels[:prompt_len] = [-100]*prompt_len
 
-train_dataset = pack_dataset(train_dataset)
-val_dataset = pack_dataset(val_dataset)
+    return {
+        "input_ids": tok["input_ids"],
+        "attention_mask": tok["attention_mask"],
+        "labels": labels
+    }
 
-train_dataset.set_format(
-    type="torch",
-    columns=["input_ids","labels","attention_mask"]
-)
+# FIX — ACTUALLY TOKENIZE DATASET
+train_dataset = train_dataset.map(tokenize, remove_columns=train_dataset.column_names)
+val_dataset = val_dataset.map(tokenize, remove_columns=val_dataset.column_names)
 
-val_dataset.set_format(
-    type="torch",
-    columns=["input_ids","labels","attention_mask"]
-)
+train_dataset.set_format("torch")
+val_dataset.set_format("torch")
 
 # ==========================================================
 # LORA
@@ -282,8 +252,6 @@ for seed in SEEDS:
         gradient_accumulation_steps=4,
         learning_rate=3e-5,
         num_train_epochs=2,
-        max_length=MAX_LEN,
-        completion_only_loss=True,
         gradient_checkpointing=True,
         lr_scheduler_type="cosine",
         warmup_ratio=0.1,
@@ -313,18 +281,16 @@ for seed in SEEDS:
 
 print("Building model soup")
 
-base=AutoModelForCausalLM.from_pretrained(
-MODEL_NAME,
-torch_dtype=torch.bfloat16
-)
-
-base=build_lora(base)
-
 lora_weights=[]
 
 for p in ckpts:
 
+    # FIX — reload base each time
+    base=AutoModelForCausalLM.from_pretrained(MODEL_NAME)
+    base=build_lora(base)
+
     m=PeftModel.from_pretrained(base,p)
+
     sd=m.state_dict()
 
     lora={k:v for k,v in sd.items() if "lora" in k}
@@ -337,6 +303,9 @@ for k in lora_weights[0]:
     avg[k]=torch.stack(
         [w[k] for w in lora_weights]
     ).mean(0)
+
+base=AutoModelForCausalLM.from_pretrained(MODEL_NAME)
+base=build_lora(base)
 
 state=base.state_dict()
 
@@ -351,7 +320,7 @@ base.save_pretrained(SOUP_DIR)
 free_gpu()
 
 # ==========================================================
-# BUILD PREFERENCE DATASET (BATCHED)
+# BUILD PREFERENCE DATASET
 # ==========================================================
 
 print("Building preference dataset")
@@ -375,15 +344,15 @@ for i in tqdm(range(0,len(sample),BATCH_SIZE)):
     inputs=tokenizer(
         prompts,
         return_tensors="pt",
-        padding=True
+        padding=True,
+        truncation=True
     ).to(DEVICE)
 
     with torch.no_grad():
         out=policy.generate(
             **inputs,
             max_new_tokens=GEN_LEN,
-            do_sample=False,
-            use_cache=True,
+            do_sample=True,   # FIX
             temperature=0.8,
             top_p=0.9
         )
@@ -458,8 +427,8 @@ for i in tqdm(range(0,len(prefs),BATCH_SIZE)):
     chosen=[b["prompt"]+b["chosen"] for b in batch]
     rejected=[b["prompt"]+b["rejected"] for b in batch]
 
-    chosen=tokenizer(chosen,return_tensors="pt",padding=True).to(DEVICE)
-    rejected=tokenizer(rejected,return_tensors="pt",padding=True).to(DEVICE)
+    chosen=tokenizer(chosen,return_tensors="pt",padding=True,truncation=True).to(DEVICE)
+    rejected=tokenizer(rejected,return_tensors="pt",padding=True,truncation=True).to(DEVICE)
 
     rc=reward_model(chosen["input_ids"],chosen["attention_mask"])
     rr=reward_model(rejected["input_ids"],rejected["attention_mask"])
@@ -503,14 +472,13 @@ for step in tqdm(range(RL_STEPS)):
 
     prompts=[b["prompt"] for b in batch]
 
-    inputs=tokenizer(prompts,return_tensors="pt",padding=True).to(DEVICE)
+    inputs=tokenizer(prompts,return_tensors="pt",padding=True,truncation=True).to(DEVICE)
 
     with torch.no_grad():
         outputs=policy.generate(
             **inputs,
             max_new_tokens=GEN_LEN,
-            do_sample=False,
-            use_cache=True,
+            do_sample=True,
             temperature=0.8,
             top_p=0.9
         )
