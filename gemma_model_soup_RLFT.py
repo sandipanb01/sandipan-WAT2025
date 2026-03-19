@@ -90,8 +90,14 @@ def pack_dataset(dataset):
             chunk = buffer[:MAX_LEN]
             buffer = buffer[MAX_LEN:]
 
+            labels = chunk.copy()
+
+            # shift labels
+            labels[:-1] = chunk[1:]
+            labels[-1] = -100
+
             packed_input_ids.append(chunk)
-            packed_labels.append(chunk.copy())
+            packed_labels.append(labels)
             packed_masks.append([1]*MAX_LEN)
 
     return Dataset.from_dict({
@@ -99,7 +105,6 @@ def pack_dataset(dataset):
         "labels": packed_labels,
         "attention_mask": packed_masks
     })
-
 # ==========================================================
 # LANGUAGE SPLITS
 # ==========================================================
@@ -218,8 +223,15 @@ print("Packing dataset")
 train_dataset = pack_dataset(train_dataset)
 val_dataset = pack_dataset(val_dataset)
 
-train_dataset.set_format("torch")
-val_dataset.set_format("torch")
+train_dataset.set_format(
+    type="torch",
+    columns=["input_ids","labels","attention_mask"]
+)
+
+val_dataset.set_format(
+    type="torch",
+    columns=["input_ids","labels","attention_mask"]
+)
 
 # ==========================================================
 # LORA
