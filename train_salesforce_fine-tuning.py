@@ -210,12 +210,14 @@ training_args = SFTConfig(
     num_train_epochs=2,
     learning_rate=2e-4,
     lr_scheduler_type="cosine",
+    warmup_ratio=0.05,
     logging_steps=500,
     save_steps=EVAL_EVERY,
     bf16=True,
     max_length=MAX_SEQ_LENGTH,
     completion_only_loss=True,
     gradient_checkpointing=True,
+    max_grad_norm=1.0,
     report_to="none",
 )
 
