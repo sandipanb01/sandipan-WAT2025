@@ -1,14 +1,11 @@
 # ============================================================
 # XML DOCUMENT MACHINE TRANSLATION — TRAINING
-# Checkpointed LoRA Training + Dev Evaluation
 # ============================================================
 
 import os
 import json
 import torch
-import sacrebleu
 from pathlib import Path
-from tqdm import tqdm
 from datasets import Dataset
 from transformers import (
     AutoTokenizer,
@@ -19,7 +16,7 @@ from peft import LoraConfig
 from trl import SFTTrainer, SFTConfig
 
 # ============================================================
-# ENV
+# ENVIRONMENT
 # ============================================================
 
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
@@ -41,7 +38,6 @@ OUTPUT_DIR = "./xml_mt_lora"
 
 MAX_SEQ_LENGTH = 1024
 MAX_NEW_TOKENS = 512
-
 EVAL_EVERY = 1000
 
 Path(OUTPUT_DIR).mkdir(exist_ok=True)
@@ -80,7 +76,7 @@ def normalize_salesforce_entry(v):
     return str(v)
 
 # ============================================================
-# LOAD SPLITS
+# LOAD DATA SPLITS
 # ============================================================
 
 def load_split(root, lang_pair, split):
@@ -101,9 +97,8 @@ def load_split(root, lang_pair, split):
 
     return src, tgt
 
-
 # ============================================================
-# BUILD DATASETS
+# BUILD DATASET
 # ============================================================
 
 def build_dataset(split):
@@ -115,7 +110,6 @@ def build_dataset(split):
     for lp in LANG_PAIRS:
 
         src, tgt = load_split(DATA_ROOT, lp, split)
-
         lang = LANG_CODE_MAP[lp]
 
         for s, t in zip(src, tgt):
@@ -125,34 +119,54 @@ def build_dataset(split):
             lang_all.append(lang)
 
     return Dataset.from_dict({
-        "src": src_all,
-        "tgt": tgt_all,
+        "src_txt": src_all,
+        "tgt_txt": tgt_all,
         "lang": lang_all,
     })
 
+# ============================================================
+# TOKENIZER
+# ============================================================
+
+tokenizer = AutoTokenizer.from_pretrained(
+    MODEL_NAME,
+    use_fast=True,
+)
+
+tokenizer.pad_token = tokenizer.eos_token
 
 # ============================================================
-# PROMPT FORMAT
+# FORMAT EXAMPLES 
 # ============================================================
 
 def format_example(example):
 
-    prompt = (
-        f"Translate the following XML document from English to {example['lang']}.\n\n"
-        f"English XML:\n{example['src']}\n\n"
-    )
-    completion = example["tgt"]
+    target_lang = example["lang"]
 
-    return {
-        "prompt": [{"role":"user","content":prompt}],
-        "completion":[{"role":"assistant","content":completion}],
+    messages = {
+        "prompt": [
+            {
+                "role": "user",
+                "content":
+                f"Translate the following XML document from English to {target_lang}.\n\n"
+                f"English XML:\n{example['src_txt']}",
+            }
+        ],
+        "completion": [
+            {
+                "role": "assistant",
+                "content": example["tgt_txt"]
+            }
+        ],
     }
 
+    return messages
+
 # ============================================================
-# LOAD DATA
+# LOAD DATASETS
 # ============================================================
 
-print("Loading datasets")
+print("Loading datasets...")
 
 train_dataset = build_dataset("train")
 dev_dataset = build_dataset("dev")
@@ -163,12 +177,11 @@ train_dataset = train_dataset.map(
     num_proc=32,
 )
 
-# ============================================================
-# TOKENIZER
-# ============================================================
-
-tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
-tokenizer.pad_token = tokenizer.eos_token
+dev_dataset = dev_dataset.map(
+    format_example,
+    remove_columns=dev_dataset.column_names,
+    num_proc=32,
+)
 
 # ============================================================
 # MODEL
@@ -182,18 +195,27 @@ model = AutoModelForCausalLM.from_pretrained(
 )
 
 # ============================================================
-# LORA
+# LORA CONFIG
 # ============================================================
 
 lora_config = LoraConfig(
+
     r=16,
     lora_alpha=32,
     lora_dropout=0.05,
+
     bias="none",
+
     task_type="CAUSAL_LM",
+
     target_modules=[
-        "q_proj","k_proj","v_proj","o_proj",
-        "gate_proj","up_proj","down_proj",
+        "q_proj",
+        "k_proj",
+        "v_proj",
+        "o_proj",
+        "gate_proj",
+        "up_proj",
+        "down_proj",
     ],
 )
 
@@ -202,20 +224,30 @@ lora_config = LoraConfig(
 # ============================================================
 
 training_args = SFTConfig(
+
     output_dir=OUTPUT_DIR,
+
     per_device_train_batch_size=2,
     gradient_accumulation_steps=16,
+
     num_train_epochs=2,
+
     learning_rate=2e-4,
     lr_scheduler_type="cosine",
     warmup_ratio=0.05,
+
     logging_steps=500,
     save_steps=EVAL_EVERY,
+
     bf16=True,
+
     max_length=MAX_SEQ_LENGTH,
-    completion_only_loss=True,
+
     gradient_checkpointing=True,
     max_grad_norm=1.0,
+
+    packing=False,
+
     report_to="none",
 )
 
@@ -224,10 +256,16 @@ training_args = SFTConfig(
 # ============================================================
 
 trainer = SFTTrainer(
+
     model=model,
+
     train_dataset=train_dataset,
+    eval_dataset=dev_dataset,
+
     peft_config=lora_config,
+
     args=training_args,
+
     processing_class=tokenizer,
 )
 
@@ -235,10 +273,10 @@ trainer = SFTTrainer(
 # TRAIN
 # ============================================================
 
-print("Starting training")
+print("Starting training...")
 
 trainer.train()
 
 trainer.save_model()
 
-print("Training finished")
+print("Training finished.")
