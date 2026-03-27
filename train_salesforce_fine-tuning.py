@@ -134,6 +134,7 @@ tokenizer = AutoTokenizer.from_pretrained(
 )
 
 tokenizer.pad_token = tokenizer.eos_token
+tokenizer.padding_side = "right"
 
 # ============================================================
 # FORMAT EXAMPLES 
