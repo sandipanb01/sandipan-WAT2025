@@ -140,9 +140,7 @@ def format_example(example):
     prompt = (
         f"Translate the following XML document from English to {example['lang']}.\n\n"
         f"English XML:\n{example['src']}\n\n"
-        f"{example['lang']} XML:"
     )
-
     completion = example["tgt"]
 
     return {
