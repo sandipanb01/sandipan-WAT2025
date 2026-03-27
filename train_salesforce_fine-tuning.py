@@ -171,6 +171,23 @@ print("Loading datasets...")
 train_dataset = build_dataset("train")
 dev_dataset = build_dataset("dev")
 
+# ============================================================
+# REMOVE EMPTY EXAMPLES (prevents NaN loss)
+# ============================================================
+
+def filter_empty(example):
+    return (
+        example["src_txt"] is not None and
+        example["tgt_txt"] is not None and
+        len(example["src_txt"].strip()) > 0 and
+        len(example["tgt_txt"].strip()) > 0
+    )
+
+# ============================================================
+# FORMAT DATASET
+# ============================================================
+train_dataset = train_dataset.filter(filter_empty)
+dev_dataset = dev_dataset.filter(filter_empty)
 train_dataset = train_dataset.map(
     format_example,
     remove_columns=train_dataset.column_names,
