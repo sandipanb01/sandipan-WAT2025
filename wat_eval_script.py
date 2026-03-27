@@ -1,282 +1,313 @@
-# ============================================================
-# XML DOCUMENT MACHINE TRANSLATION — TRAINING
-# ============================================================
-
-import os
 import json
+import os
+import re
+import argparse
+from tqdm import tqdm
 import torch
-from pathlib import Path
-from datasets import Dataset
-from transformers import (
-    AutoTokenizer,
-    AutoModelForCausalLM,
-    set_seed,
-)
-from peft import LoraConfig
-from trl import SFTTrainer, SFTConfig
+import sacrebleu
 
-# ============================================================
-# ENVIRONMENT
-# ============================================================
+from transformers import AutoModelForCausalLM, AutoTokenizer
+from datasets import load_dataset
+from peft import AutoPeftModelForCausalLM
 
-os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
-set_seed(42)
+def free_gpu():
+    import gc
+    
+    gc.collect()
 
-DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch.cuda.ipc_collect()
 
-# ============================================================
-# CONFIG
-# ============================================================
+def calc_metrics(preds, refs):
+    bleu = sacrebleu.corpus_bleu(preds, [refs]).score
+    chrf = sacrebleu.corpus_chrf(preds, [refs]).score
+    return round(bleu, 2), round(chrf, 2)
 
-MODEL_NAME = "google/gemma-3-4b-it"
+def load_wat_dataset_train(tokenizer=None):
+    logging.info(f"Loading Machine Translation dataset")
 
-DATA_ROOT = "localization-xml-mt"
+    dataset = load_dataset("ai4bharat/Pralekha", data_dir="train")
 
-LANG_PAIRS = ["ende", "enfr", "ennl", "enfi", "enru"]
+    def format_example(example):
+        src_lang = example["src_lang"]
+        tgt_lang = example["tgt_lang"]
 
-OUTPUT_DIR = "./xml_mt_lora"
+        source_lang = "English"
+        target_lang = ""
 
-MAX_SEQ_LENGTH = 1024
-MAX_NEW_TOKENS = 512
-EVAL_EVERY = 1000
+        if tgt_lang == "ben":
+            target_lang = "Bengali"
+        elif tgt_lang == "guj":
+            target_lang = "Gujarati"
+        elif tgt_lang == "hin":
+            target_lang = "Hindi"
+        elif tgt_lang == "kan":
+            target_lang = "Kannada"
+        elif tgt_lang == "mal":
+            target_lang = "Malayalam"
+        elif tgt_lang == "mar":
+            target_lang = "Marathi"
+        elif tgt_lang == "Ori":
+            target_lang = "Odiya"
+        elif tgt_lang == "pan":
+            target_lang = "Punjabi"
+        elif tgt_lang == "tam":
+            target_lang = "Tamil"
+        elif tgt_lang == "tel":
+            target_lang = "Telugu"
+        elif tgt_lang == "urd":
+            target_lang = "Urdu"
 
-Path(OUTPUT_DIR).mkdir(exist_ok=True)
+        messages = {
+            "prompt": [
+                {
+                    "role": "user",
+                    "content": f"Translate the following sentence from English to {target_lang}.\n\n"
+                    f"English: {example['src_txt']}",
+                }
+            ],
+            "completion": [{"role": "assistant", "content": example["tgt_txt"]}],
+        }
 
-# ============================================================
-# LANGUAGE MAP
-# ============================================================
+        return messages
 
-LANG_CODE_MAP = {
-    "ende": "German",
-    "enfr": "French",
-    "ennl": "Dutch",
-    "enfi": "Finnish",
-    "enru": "Russian",
-}
+    dataset = dataset.filter(
+        lambda x: x["src_txt"] != x["tgt_txt"],
+        num_proc=4,
+    )["train"]
+    dataset = dataset.map(format_example)
+    logging.info(dataset)
 
-# ============================================================
-# DATA NORMALIZATION
-# ============================================================
+    dev_dataset = load_dataset("ai4bharat/Pralekha", data_dir="dev")
+    dev_dataset = dev_dataset.filter(
+        lambda x: x["src_txt"] != x["tgt_txt"],
+        num_proc=4,
+    )["train"]
+    dev_dataset = dev_dataset.map(format_example)
 
-def normalize_salesforce_entry(v):
+    return dataset, dev_dataset
 
-    if isinstance(v, str):
-        return v
 
-    if isinstance(v, dict):
+def build_prompt_wat(example, tokenizer):
+    src = example["src_txt"]
+    ref = example["tgt_txt"]
 
-        if "text" in v:
-            return v["text"]
+    prompt = (
+        "Translate the following text from English to Hindi:\n"
+        f"English: {src}\n"
+        "Hindi: "
+    )
 
-        if "segments" in v:
-            return "".join(seg.get("text", "") for seg in v["segments"])
-
-        return json.dumps(v, ensure_ascii=False)
-
-    return str(v)
-
-# ============================================================
-# LOAD DATA SPLITS
-# ============================================================
-
-def load_split(root, lang_pair, split):
-
-    base = os.path.join(root, "data", lang_pair)
-
-    src_file = os.path.join(base, f"{lang_pair}_en_{split}.json")
-    tgt_file = os.path.join(base, f"{lang_pair}_{lang_pair[2:]}_{split}.json")
-
-    with open(src_file) as f:
-        src_json = json.load(f)
-
-    with open(tgt_file) as f:
-        tgt_json = json.load(f)
-
-    src = [normalize_salesforce_entry(v) for v in src_json["text"].values()]
-    tgt = [normalize_salesforce_entry(v) for v in tgt_json["text"].values()]
-
-    return src, tgt
-
-# ============================================================
-# BUILD DATASET
-# ============================================================
-
-def build_dataset(split):
-
-    src_all = []
-    tgt_all = []
-    lang_all = []
-
-    for lp in LANG_PAIRS:
-
-        src, tgt = load_split(DATA_ROOT, lp, split)
-        lang = LANG_CODE_MAP[lp]
-
-        for s, t in zip(src, tgt):
-
-            src_all.append(s)
-            tgt_all.append(t)
-            lang_all.append(lang)
-
-    return Dataset.from_dict({
-        "src_txt": src_all,
-        "tgt_txt": tgt_all,
-        "lang": lang_all,
-    })
-
-# ============================================================
-# TOKENIZER 
-# ============================================================
-
-tokenizer = AutoTokenizer.from_pretrained(
-    MODEL_NAME,
-    use_fast=True,
-)
-
-tokenizer.pad_token = tokenizer.eos_token
-
-# ============================================================
-# FORMAT EXAMPLES 
-# ============================================================
-
-def format_example(example):
-
-    target_lang = example["lang"]
-
-    messages = {
-        "prompt": [
+    messages = [
             {
                 "role": "user",
-                "content":
-                f"Translate the following XML document from English to {target_lang}.\n\n"
-                f"English XML:\n{example['src_txt']}",
+                "content": prompt
             }
-        ],
-        "completion": [
-            {
-                "role": "assistant",
-                "content": example["tgt_txt"]
-            }
-        ],
+        ]
+
+    # Apply chat template
+    prompt = tokenizer.apply_chat_template(
+        messages,
+        tokenize=False,
+        add_generation_prompt=True,
+    )
+
+    tokens = tokenizer(
+        prompt,
+        truncation=True,
+        padding=False,
+    )
+
+    return {
+        "input_ids": tokens["input_ids"],
+        "attention_mask": tokens["attention_mask"],
+        "reference": ref,
     }
 
-    return messages
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Evaluate model"
+    )
 
-# ============================================================
-# LOAD DATASETS
-# ============================================================
+    # Model and Data Arguments
+    parser.add_argument(
+        "--model_name",
+        type=str,
+        default="ibm-granite/granite-4.0-h-350m",  # Use a small model for full fine-tuning example
+        help="The model ID or path to the pretrained model.",
+    )
 
-print("Loading datasets...")
+    parser.add_argument(
+        "--dataset",
+        type=str,
+        default="wat",  # Use a small model for full fine-tuning example
+        help="The model ID or path to the pretrained model.",
+    )
 
-train_dataset = build_dataset("train")
-dev_dataset = build_dataset("dev")
+    parser.add_argument(
+        "--output_dir",
+        type=str,
+        default="./output",
+        help="Output directory for checkpoints and logs.",
+    )
 
-train_dataset = train_dataset.map(
-    format_example,
-    remove_columns=train_dataset.column_names,
-    num_proc=32,
-)
+    parser.add_argument(
+        "--use_lora",
+        action="store_true",
+        help="Whether to use LoRA or full finetuning",
+    )
 
-dev_dataset = dev_dataset.map(
-    format_example,
-    remove_columns=dev_dataset.column_names,
-    num_proc=32,
-)
+    parser.add_argument(
+        "--fp16",
+        action="store_true",
+        help="Whether to use 16-bit float precision (mixed precision).",
+    )
+    parser.add_argument(
+        "--bf16",
+        action="store_true",
+        help="Whether to use 16-bit float precision (mixed precision).",
+    )
 
-# ============================================================
-# MODEL
-# ============================================================
+    return parser.parse_args()
 
-model = AutoModelForCausalLM.from_pretrained(
-    MODEL_NAME,
-    device_map="auto",
-    torch_dtype=torch.bfloat16,
-    attn_implementation="sdpa"
-)
+def evaluate_wat(model, tokenizer, dataset, batch_size=4):
+    predictions = []
+    references = []
 
-# ============================================================
-# LORA CONFIG
-# ============================================================
+    print("Running inference...")
 
-lora_config = LoraConfig(
+    for i in tqdm(range(0, len(dataset), batch_size)):
+        batch = dataset[i:i+batch_size]
 
-    r=16,
-    lora_alpha=32,
-    lora_dropout=0.05,
+        padded = tokenizer.pad(
+            {
+                "input_ids": batch["input_ids"],
+                "attention_mask": batch["attention_mask"],
+            },
+            padding=True,
+            return_tensors="pt",
+        )
 
-    bias="none",
+        input_ids = padded["input_ids"].to(model.device)
+        attention_mask = padded["attention_mask"].to(model.device)
 
-    task_type="CAUSAL_LM",
+        with torch.no_grad():
+            outputs = model.generate(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                max_new_tokens=4096,
+                do_sample=False,
+                use_cache=True,
+            )
 
-    target_modules=[
-        "q_proj",
-        "k_proj",
-        "v_proj",
-        "o_proj",
-        "gate_proj",
-        "up_proj",
-        "down_proj",
-    ],
-)
+        new_tokens = outputs[:, input_ids.shape[1]:]
 
-# ============================================================
-# TRAINING CONFIG
-# ============================================================
+        decoded = tokenizer.batch_decode(
+            new_tokens,
+            skip_special_tokens=True,
+        )
 
-training_args = SFTConfig(
+        predictions.extend(decoded)
 
-    output_dir=OUTPUT_DIR,
+        refs = dataset[i:i+batch_size]["reference"]
+        references.extend(refs)
 
-    per_device_train_batch_size=2,
-    gradient_accumulation_steps=16,
+    return references, predictions
 
-    num_train_epochs=2,
+def main():
+    args = parse_args()
+    
+    model = AutoModelForCausalLM.from_pretrained(
+        args.model_name,
+        device_map="auto",
+        torch_dtype=torch.float16 if args.fp16 else torch.float32,
+    )
+    model.config.use_cache = False
 
-    learning_rate=2e-4,
-    lr_scheduler_type="cosine",
-    warmup_ratio=0.05,
+    tokenizer = AutoTokenizer.from_pretrained(args.model_name)
 
-    logging_steps=500,
-    save_steps=EVAL_EVERY,
+    # Set padding token if not already defined (common practice)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+        tokenizer.pad_token_id = tokenizer.eos_token_id
 
-    bf16=True,
+    DATASET_NAME = "ai4bharat/Pralekha"
+    EVAL_SPLIT = "test"
+    dataset = load_dataset(DATASET_NAME, EVAL_SPLIT, split="eng_hin")
 
-    max_length=MAX_SEQ_LENGTH,
+    dataset = dataset.map(build_prompt_wat, fn_kwargs={"tokenizer": tokenizer})
+    
+    references, predictions = evaluate_wat(model, tokenizer, dataset)
 
-    gradient_checkpointing=True,
-    max_grad_norm=1.0,
+    bleu, chrf = calc_metrics(predictions, references)
+    results = {}
+    results["BLEU"] = bleu
+    results["CHRF"] = chrf
 
-    packing=False,
+    results_path = (
+        f"{args.output_dir}/wat_-1_{args.model_name.split('/')[-1]}.json"
+    )
 
-    report_to="none",
-)
+    with open(results_path, "w") as outfile:
+        json.dump(results, outfile)
+        
+    base_dir = args.output_dir
 
-# ============================================================
-# TRAINER
-# ============================================================
+    for name in sorted(os.listdir(base_dir)):
+        free_gpu()
 
-trainer = SFTTrainer(
+        path = os.path.join(base_dir, name)
+        if os.path.isdir(path) and name.startswith("checkpoint-"):
+            match = re.match(r"checkpoint-(\d+)", name)
+            ckpt_num = int(match.group(1))
 
-    model=model,
+            if args.use_lora:
+                print(f"Loading LoRA model {path}")
+                model = AutoPeftModelForCausalLM.from_pretrained(
+                    path,
+                    device_map="auto",
+                    torch_dtype=torch.float16 if args.fp16 else torch.float32,
+                )
+                model = model.merge_and_unload()
 
-    train_dataset=train_dataset,
-    eval_dataset=dev_dataset,
+            else:
+                model = AutoModelForCausalLM.from_pretrained(
+                    path,
+                    device_map="auto",
+                    torch_dtype=torch.float16 if args.fp16 else torch.float32,
+                )
 
-    peft_config=lora_config,
+            model.eval()
 
-    args=training_args,
+            tokenizer = AutoTokenizer.from_pretrained(path)
 
-    processing_class=tokenizer,
-)
+            # Set padding token if not already defined (common practice)
+            if tokenizer.pad_token is None:
+                tokenizer.pad_token = tokenizer.eos_token
 
-# ============================================================
-# TRAIN
-# ============================================================
+            if args.dataset == "wat":
+                DATASET_NAME = "ai4bharat/Pralekha"
+                EVAL_SPLIT = "test"
+                dataset = load_dataset(DATASET_NAME, EVAL_SPLIT, split="eng_hin")
 
-print("Starting training...")
+                dataset = dataset.map(build_prompt_wat, fn_kwargs={"tokenizer": tokenizer})
+                
+                references, predictions = evaluate_wat(model, tokenizer, dataset)
 
-trainer.train()
+                bleu, chrf = calc_metrics(predictions, references)
+                bleu, chrf = calc_metrics(predictions, references)
+                
+                results = {}
+                results["BLEU"] = bleu
+                results["CHRF"] = chrf
 
-trainer.save_model()
+                results_path = (
+                    f"{args.output_dir}/wat_{ckpt_num}.json"
+                )
 
-print("Training finished.")
+                with open(results_path, "w") as outfile:
+                    json.dump(results, outfile)
+
+if __name__ == "__main__":
+    main()
