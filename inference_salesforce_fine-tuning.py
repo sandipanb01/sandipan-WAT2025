@@ -1,5 +1,5 @@
 # ============================================================
-# XML MT CHECKPOINT EVALUATION (Advisor + Salesforce Metrics)
+# XML MT CHECKPOINT EVALUATION 
 # ============================================================
 
 import os
