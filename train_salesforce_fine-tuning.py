@@ -134,7 +134,6 @@ tokenizer = AutoTokenizer.from_pretrained(
 )
 
 tokenizer.pad_token = tokenizer.eos_token
-#tokenizer.padding_side = "right"
 
 # ============================================================
 # FORMAT EXAMPLES 
@@ -173,7 +172,7 @@ train_dataset = build_dataset("train")
 dev_dataset = build_dataset("dev")
 
 # ============================================================
-# REMOVE EMPTY EXAMPLES (prevents NaN loss)
+# REMOVE EMPTY EXAMPLES 
 # ============================================================
 
 def filter_empty(example):
@@ -212,6 +211,7 @@ model = AutoModelForCausalLM.from_pretrained(
     attn_implementation="sdpa"
 )
 model.config.use_cache = False
+
 # ============================================================
 # LORA CONFIG
 # ============================================================
