@@ -244,8 +244,7 @@ lora_config = LoraConfig(
 training_args = SFTConfig(
 
     output_dir=OUTPUT_DIR,
-    dataset_text_field=None,
-
+    
     per_device_train_batch_size=2,
     gradient_accumulation_steps=16,
 
