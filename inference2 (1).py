@@ -1,6 +1,7 @@
 # ============================================================
-# XML MT EVALUATION — STABLE VERSION (FIXED)
+# XML MT EVALUATION — FINAL AMTA-FAITHFUL VERSION
 # ============================================================
+pip install sacrebleu evaluate lxml transformers peft tqdm
 
 import os
 import json
@@ -8,23 +9,23 @@ import re
 import gc
 import torch
 import numpy as np
-import pandas as pd
 from tqdm import tqdm
 from pathlib import Path
-from collections import Counter
 from lxml import etree
 
-from datasets import Dataset
 from transformers import AutoTokenizer, AutoModelForCausalLM
 from peft import PeftModel
 import evaluate
+import sacrebleu
+
 
 # ============================================================
 # CONFIG
 # ============================================================
 
 DATA_ROOT   = "localization-xml-mt"
-OUTPUT_DIR  = "xml_mt_eval_fixed"
+OUTPUT_DIR  = "xml_mt_eval_final"
+
 BASE_MODEL  = "google/gemma-3-4b-it"
 FINAL_MODEL = "./xml_mt_lora/checkpoint-15506"
 
@@ -38,13 +39,14 @@ LANG_NAME_MAP = {
     "enru": "Russian",
 }
 
-BATCH_SIZE     = 4
+BATCH_SIZE     = 8
 MAX_NEW_TOKENS = 512
 
 SANITY_TEST    = True
 SANITY_SAMPLES = 100
 
 Path(OUTPUT_DIR).mkdir(exist_ok=True)
+
 
 # ============================================================
 # GPU CLEANUP
@@ -55,6 +57,7 @@ def free_gpu():
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
 
+
 # ============================================================
 # METRICS
 # ============================================================
@@ -63,11 +66,13 @@ bleu_metric  = evaluate.load("bleu")
 chrf_metric  = evaluate.load("chrf")
 chrf2_metric = evaluate.load("chrf")
 
+
 # ============================================================
-# PROMPT (FIXED — NO CHAT TEMPLATE)
+# PROMPT
 # ============================================================
 
 def build_prompt(src, tgt_lang):
+
     instruction = (
         f"Translate the following XML document from English to {tgt_lang}.\n\n"
         f"English:\n{src}\n"
@@ -80,89 +85,125 @@ def build_prompt(src, tgt_lang):
         f"<start_of_turn>model\n"
     )
 
+
 # ============================================================
-# XML UTILITIES
+# AMTA XML METRICS (STRICT IMPLEMENTATION)
 # ============================================================
 
-def extract_xml_tags(text):
-    return re.findall(r"</?[^>]+>", text)
+def normalize_xml_whitespace(text):
+    if text is None:
+        return ""
+    return re.sub(r"\s+", " ", text).strip()
 
-def fix_xml_tags(src, pred):
-    """Non-destructive: ensure all source tags exist in prediction"""
-    src_tags = extract_xml_tags(src)
-
-    for tag in src_tags:
-        if tag not in pred:
-            pred += tag
-
-    return pred
-
-def normalize_xml(text):
-    text = re.sub(r">\s+<", "><", text)
-    return text.strip()
 
 def get_xml_structure(text):
+
     try:
-        text = normalize_xml(text)
         root = etree.fromstring(f"<root>{text}</root>")
-
-        def structure(el):
-            return (el.tag, [structure(c) for c in el])
-
-        return structure(root)
     except Exception:
         return None
 
-def compute_xml_match(predictions, references):
-    matches = sum(
-        1 for p, r in zip(predictions, references)
-        if get_xml_structure(p) == get_xml_structure(r)
-    )
-    return matches / len(predictions) if predictions else 0.0
+    def structure(el):
+        return (el.tag, tuple(structure(c) for c in el))
 
-def compute_xml_chrf(predictions, references):
-    scores = []
-    for p, r in zip(predictions, references):
-        if get_xml_structure(p) != get_xml_structure(r):
-            scores.append(0.0)
+    return structure(root)
+
+
+def extract_text_segments(text):
+
+    try:
+        root = etree.fromstring(f"<root>{text}</root>")
+    except Exception:
+        return []
+
+    segments = []
+
+    def collect(node):
+
+        if node.text and node.text.strip():
+            segments.append(node.text.strip())
+
+        for child in node:
+            collect(child)
+
+        if node.tail and node.tail.strip():
+            segments.append(node.tail.strip())
+
+    collect(root)
+
+    return segments
+
+
+def compute_xml_metrics(preds, refs):
+
+    match_count = 0
+    chrf_scores = []
+
+    for pred, ref in zip(preds, refs):
+
+        pred_struct = get_xml_structure(pred)
+        ref_struct  = get_xml_structure(ref)
+
+        if pred_struct == ref_struct and pred_struct is not None:
+
+            match_count += 1
+
+            pred_segments = extract_text_segments(pred)
+            ref_segments  = extract_text_segments(ref)
+
+            # align segments conservatively
+            n = min(len(pred_segments), len(ref_segments))
+
+            if n == 0:
+                chrf_scores.append(0.0)
+                continue
+
+            segment_scores = []
+
+            for i in range(n):
+
+                score = sacrebleu.sentence_chrf(
+                    pred_segments[i],
+                    [ref_segments[i]]
+                ).score
+
+                segment_scores.append(score)
+
+            chrf_scores.append(sum(segment_scores) / len(segment_scores))
+
         else:
-            score = chrf_metric.compute(
-                predictions=[p], references=[r], beta=1
-            )["score"]
-            scores.append(score)
-    return float(np.mean(scores)) if scores else 0.0
+            chrf_scores.append(0.0)
 
-def compute_xml_retention(src_texts, predictions):
-    scores = []
-    for s, p in zip(src_texts, predictions):
-        s_tags = extract_xml_tags(s)
-        if not s_tags:
-            scores.append(1.0)
-            continue
+    xml_match = match_count / len(preds) * 100
+    xml_chrf  = sum(chrf_scores) / len(chrf_scores)
 
-        p_tags = extract_xml_tags(p)
-        sc, pc = Counter(s_tags), Counter(p_tags)
-        retained = sum(min(sc[t], pc.get(t, 0)) for t in sc)
-        scores.append(retained / sum(sc.values()))
+    return xml_match, xml_chrf
 
-    return np.mean(scores) * 100
 
 # ============================================================
 # DATA LOADER
 # ============================================================
 
 def normalize_entry(v):
+
     if isinstance(v, str):
         return v
+
     if isinstance(v, dict):
+
         if "text" in v:
             return v["text"]
+
         if "segments" in v:
             return "".join(s.get("text", "") for s in v["segments"])
+
         return json.dumps(v)
+
     return str(v)
 
+
 def load_dev(lang_pair):
+
     base = os.path.join(DATA_ROOT, "data", lang_pair)
 
     with open(os.path.join(base, f"{lang_pair}_en_dev.json")) as f:
@@ -176,14 +217,17 @@ def load_dev(lang_pair):
 
     return src, tgt
 
+
 # ============================================================
 # INFERENCE
 # ============================================================
 
-def evaluate_model(model, tokenizer, src_texts, tgt_texts, tgt_lang):
-    preds_raw, preds_fixed = [], []
+def evaluate_model(model, tokenizer, src_texts, tgt_lang):
+
+    predictions = []
 
     for i in tqdm(range(0, len(src_texts), BATCH_SIZE)):
+
         batch_src = src_texts[i:i+BATCH_SIZE]
 
         prompts = [build_prompt(s, tgt_lang) for s in batch_src]
@@ -192,53 +236,78 @@ def evaluate_model(model, tokenizer, src_texts, tgt_texts, tgt_lang):
             prompts,
             return_tensors="pt",
             padding=True,
-            add_special_tokens=False
+            truncation=True
         ).to(model.device)
 
         input_len = inputs["input_ids"].shape[1]
 
         with torch.no_grad():
+
             outputs = model.generate(
                 **inputs,
                 max_new_tokens=MAX_NEW_TOKENS,
                 do_sample=False,
+                use_cache=True,
                 repetition_penalty=1.1,
-                length_penalty=1.0,
                 pad_token_id=tokenizer.eos_token_id
             )
 
         new_tokens = outputs[:, input_len:]
-        decoded = tokenizer.batch_decode(new_tokens, skip_special_tokens=True)
 
-        raw = [d.strip() for d in decoded]
-        fixed = [fix_xml_tags(s, d) for s, d in zip(batch_src, raw)]
+        decoded = tokenizer.batch_decode(
+            new_tokens,
+            skip_special_tokens=True
+        )
 
-        preds_raw.extend(raw)
-        preds_fixed.extend(fixed)
+        preds = [d.strip() for d in decoded]
 
-    return preds_raw, preds_fixed
+        predictions.extend(preds)
+
+    return predictions
+
 
 # ============================================================
-# METRICS
+# METRIC WRAPPER
 # ============================================================
 
-def compute_metrics(preds, refs, srcs):
+def compute_metrics(preds, refs):
+
     preds_safe = [p if p.strip() else "EMPTY" for p in preds]
 
+    bleu = bleu_metric.compute(
+        predictions=preds_safe,
+        references=refs
+    )["bleu"] * 100
+
+    chrf = chrf_metric.compute(
+        predictions=preds_safe,
+        references=refs,
+        beta=1
+    )["score"]
+
+    chrf2 = chrf2_metric.compute(
+        predictions=preds_safe,
+        references=refs,
+        beta=2
+    )["score"]
+
+    xml_match, xml_chrf = compute_xml_metrics(preds_safe, refs)
+
     return {
-        "BLEU": round(bleu_metric.compute(predictions=preds_safe, references=refs)["bleu"] * 100, 2),
-        "chrF": round(chrf_metric.compute(predictions=preds_safe, references=refs, beta=1)["score"], 2),
-        "chrF++": round(chrf2_metric.compute(predictions=preds_safe, references=refs, beta=2)["score"], 2),
-        "XML_Match": round(compute_xml_match(preds_safe, refs) * 100, 2),
-        "XML_chrF": round(compute_xml_chrf(preds_safe, refs), 2),
-        "XML_Retention": round(compute_xml_retention(srcs, preds_safe), 2),
+        "BLEU": round(bleu, 2),
+        "chrF": round(chrf, 2),
+        "chrF++": round(chrf2, 2),
+        "XML-Match": round(xml_match, 2),
+        "XML-chrF": round(xml_chrf, 2)
     }
+
 
 # ============================================================
 # MAIN
 # ============================================================
 
 def main():
+
     free_gpu()
 
     tokenizer = AutoTokenizer.from_pretrained(BASE_MODEL)
@@ -246,16 +315,18 @@ def main():
 
     base_model = AutoModelForCausalLM.from_pretrained(
         BASE_MODEL,
-        dtype=torch.bfloat16,
+        torch_dtype=torch.bfloat16,
         device_map="auto"
     )
 
     model = PeftModel.from_pretrained(base_model, FINAL_MODEL)
+
     model = model.merge_and_unload()
     model.eval()
 
     for lp in LANG_PAIRS:
-        print(f"\n=== {lp} ===")
+
+        print(f"\n========== {lp} ==========")
 
         src, tgt = load_dev(lp)
 
@@ -263,12 +334,18 @@ def main():
             src = src[:SANITY_SAMPLES]
             tgt = tgt[:SANITY_SAMPLES]
 
-        preds_raw, preds_fixed = evaluate_model(
-            model, tokenizer, src, tgt, LANG_NAME_MAP[lp]
+        preds = evaluate_model(
+            model,
+            tokenizer,
+            src,
+            LANG_NAME_MAP[lp]
         )
 
-        print("\nRAW:", compute_metrics(preds_raw, tgt, src))
-        print("FIX:", compute_metrics(preds_fixed, tgt, src))
+        results = compute_metrics(preds, tgt)
+
+        print("\nRESULTS")
+        print(results)
+
 
 if __name__ == "__main__":
     main()
