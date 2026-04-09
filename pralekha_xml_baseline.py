@@ -1,11 +1,11 @@
 # ============================================================
-# ZERO-SHOT XML MACHINE TRANSLATION BASELINE
-# Pralekha Dataset (English → Hindi)
-# Markdown XML Tag Protection + Strict XML Metrics
+# AMTA-STYLE XML MT BASELINE
+# Pralekha English → Hindi
+# STRICT XML EVALUATION
 # ============================================================
 
-import re
 import gc
+import re
 import torch
 import sacrebleu
 import evaluate
@@ -31,7 +31,7 @@ BATCH_SIZE = 8
 MAX_NEW_TOKENS = 4096
 
 SANITY_TEST = False
-SANITY_SAMPLES = 100
+SANITY_SAMPLES = 200
 
 
 # ============================================================
@@ -45,72 +45,20 @@ def free_gpu():
 
 
 # ============================================================
-# LOAD PRALEKHA DATASET
-# ============================================================
-
-def load_pralekha():
-
-    dataset = load_dataset("ai4bharat/Pralekha")
-
-    dataset = dataset.filter(
-        lambda x: x["src_lang"] == SRC_LANG and x["tgt_lang"] == TGT_LANG
-    )
-
-    src = dataset["test"]["src_txt"]
-    tgt = dataset["test"]["tgt_txt"]
-
-    return src, tgt
-
-
-# ============================================================
-# MARKDOWN XML TAG PROTECTION
-# (AMTA paper style)
-# ============================================================
-
-TAG_PATTERN = re.compile(r"<[^>]+>")
-
-def markdown_xml(text):
-
-    def repl(match):
-        tag = match.group(0)
-        return f"`{tag}`"
-
-    return TAG_PATTERN.sub(repl, text)
-
-
-def restore_xml(text):
-    return text.replace("`<", "<").replace(">`", ">")
-
-
-# ============================================================
-# PROMPT
-# ============================================================
-
-def build_prompt(src):
-
-    instruction = (
-        f"Translate the following XML document from English to Hindi.\n"
-        f"Preserve ALL XML tags exactly.\n\n"
-        f"English:\n{src}\n\n"
-        f"Hindi:"
-    )
-
-    return (
-        f"<bos><start_of_turn>user\n"
-        f"{instruction}<end_of_turn>\n"
-        f"<start_of_turn>model\n"
-    )
-
-
-# ============================================================
-# XML METRICS
+# WHITESPACE NORMALIZATION (Hashimoto style)
 # ============================================================
 
 def normalize_xml_whitespace(text):
+
     if text is None:
         return ""
+
     return re.sub(r"\s+", " ", text).strip()
 
+
+# ============================================================
+# XML METRICS (VERBATIM IMPLEMENTATION)
+# ============================================================
 
 def get_xml_structure(text):
 
@@ -127,10 +75,7 @@ def get_xml_structure(text):
 
 def extract_text_segments(text):
 
-    try:
-        root = etree.fromstring(f"<root>{text}</root>")
-    except:
-        return []
+    root = etree.fromstring(f"<root>{text}</root>")
 
     segments = []
 
@@ -187,30 +132,106 @@ def compute_xml_metrics(preds, refs):
 
 
 # ============================================================
-# METRIC OBJECTS
+# LOAD PRALEKHA
 # ============================================================
 
-bleu_metric = evaluate.load("bleu")
-chrf_metric = evaluate.load("chrf")
-chrf2_metric = evaluate.load("chrf")
+def load_pralekha():
+
+    dataset = load_dataset("ai4bharat/Pralekha")
+
+    dataset = dataset.filter(
+        lambda x: x["src_lang"] == SRC_LANG
+        and x["tgt_lang"] == TGT_LANG
+        and x["src_txt"] != x["tgt_txt"]
+    )
+
+    src = dataset["test"]["src_txt"]
+    tgt = dataset["test"]["tgt_txt"]
+
+    return src, tgt
 
 
 # ============================================================
-# INFERENCE
+# XML PARSING
 # ============================================================
 
-def run_inference(model, tokenizer, src_texts):
+def parse_xml(text):
 
-    predictions = []
+    try:
+        root = etree.fromstring(f"<root>{text}</root>")
+    except:
+        return None
 
-    for i in tqdm(range(0, len(src_texts), BATCH_SIZE)):
+    return root
 
-        batch = src_texts[i:i+BATCH_SIZE]
 
-        prompts = [
-            build_prompt(markdown_xml(s))
-            for s in batch
-        ]
+def extract_nodes(root):
+
+    nodes = []
+
+    def walk(node):
+
+        if node.text and node.text.strip():
+            nodes.append(("text", node))
+
+        for child in node:
+            walk(child)
+
+        if node.tail and node.tail.strip():
+            nodes.append(("tail", node))
+
+    walk(root)
+
+    return nodes
+
+
+# ============================================================
+# REBUILD XML
+# ============================================================
+
+def rebuild_xml(root):
+
+    xml = "".join(
+        etree.tostring(child, encoding="unicode")
+        for child in root
+    )
+
+    return xml
+
+
+# ============================================================
+# PROMPT
+# ============================================================
+
+def build_prompt(text):
+
+    instruction = (
+        f"Translate the following text from English to Hindi.\n"
+        f"Only translate the text content.\n\n"
+        f"English:\n{text}\n\n"
+        f"Hindi:"
+    )
+
+    return (
+        f"<bos><start_of_turn>user\n"
+        f"{instruction}<end_of_turn>\n"
+        f"<start_of_turn>model\n"
+    )
+
+
+# ============================================================
+# SEGMENT TRANSLATION
+# ============================================================
+
+def translate_segments(model, tokenizer, segments):
+
+    outputs = []
+
+    for i in range(0, len(segments), BATCH_SIZE):
+
+        batch = segments[i:i+BATCH_SIZE]
+
+        prompts = [build_prompt(x) for x in batch]
 
         inputs = tokenizer(
             prompts,
@@ -223,7 +244,7 @@ def run_inference(model, tokenizer, src_texts):
 
         with torch.no_grad():
 
-            outputs = model.generate(
+            generated = model.generate(
                 **inputs,
                 max_new_tokens=MAX_NEW_TOKENS,
                 do_sample=False,
@@ -232,46 +253,98 @@ def run_inference(model, tokenizer, src_texts):
                 pad_token_id=tokenizer.eos_token_id
             )
 
-        new_tokens = outputs[:, input_len:]
+        new_tokens = generated[:, input_len:]
 
         decoded = tokenizer.batch_decode(
             new_tokens,
             skip_special_tokens=True
         )
 
-        preds = [restore_xml(d.strip()) for d in decoded]
+        outputs.extend([d.strip() for d in decoded])
 
-        predictions.extend(preds)
-
-    return predictions
+    return outputs
 
 
 # ============================================================
-# METRIC COMPUTATION
+# DOCUMENT TRANSLATION
 # ============================================================
+
+def translate_document(model, tokenizer, xml):
+
+    root = parse_xml(xml)
+
+    if root is None:
+        return ""
+
+    nodes = extract_nodes(root)
+
+    segments = []
+
+    for typ, node in nodes:
+
+        if typ == "text":
+            segments.append(node.text.strip())
+        else:
+            segments.append(node.tail.strip())
+
+    if len(segments) == 0:
+        return rebuild_xml(root)
+
+    translated = translate_segments(
+        model,
+        tokenizer,
+        segments
+    )
+
+    idx = 0
+
+    for typ, node in nodes:
+
+        if typ == "text":
+            node.text = translated[idx]
+        else:
+            node.tail = translated[idx]
+
+        idx += 1
+
+    return rebuild_xml(root)
+
+
+# ============================================================
+# METRICS
+# ============================================================
+
+bleu_metric = evaluate.load("bleu")
+chrf_metric = evaluate.load("chrf")
+chrf2_metric = evaluate.load("chrf")
+
 
 def compute_metrics(preds, refs):
 
-    preds_safe = [p if p.strip() else "EMPTY" for p in preds]
+    preds_norm = [normalize_xml_whitespace(p) for p in preds]
+    refs_norm = [normalize_xml_whitespace(r) for r in refs]
 
     bleu = bleu_metric.compute(
-        predictions=preds_safe,
-        references=refs
+        predictions=preds_norm,
+        references=refs_norm
     )["bleu"] * 100
 
     chrf = chrf_metric.compute(
-        predictions=preds_safe,
-        references=refs,
+        predictions=preds_norm,
+        references=refs_norm,
         beta=1
     )["score"]
 
     chrf2 = chrf2_metric.compute(
-        predictions=preds_safe,
-        references=refs,
+        predictions=preds_norm,
+        references=refs_norm,
         beta=2
     )["score"]
 
-    xml_metrics = compute_xml_metrics(preds_safe, refs)
+    xml_metrics = compute_xml_metrics(
+        preds_norm,
+        refs_norm
+    )
 
     return {
         "BLEU": round(bleu, 2),
@@ -311,26 +384,32 @@ def main():
 
     model.eval()
 
-    print("Running inference...")
+    preds = []
 
-    preds = run_inference(
-        model,
-        tokenizer,
-        src
-    )
+    print("Running structure-aware translation...")
+
+    for doc in tqdm(src):
+
+        translated = translate_document(
+            model,
+            tokenizer,
+            doc
+        )
+
+        preds.append(translated)
 
     print("Computing metrics...")
 
     results = compute_metrics(preds, tgt)
 
-    print("\n===================================")
-    print("ZERO SHOT BASELINE RESULTS")
-    print("===================================")
+    print("\n==============================")
+    print("ZERO-SHOT BASELINE RESULTS")
+    print("==============================")
 
     for k, v in results.items():
         print(f"{k}: {v}")
 
-    print("===================================")
+    print("==============================")
 
 
 if __name__ == "__main__":
