@@ -54,10 +54,10 @@ def translate_indictrans(texts, model, tokenizer, src_lang_tag, tgt_lang_tag, ba
             gen = model.generate(
                 **inputs,
                 max_new_tokens=max_len,
-                num_beams=1,
+                use_cache=True,
                 do_sample=False,
                 repetition_penalty=1.1,
-                use_cache=False # Explicitly disable cache to avoid NoneType error
+                
             )
 
         outputs.extend(tokenizer.batch_decode(gen, skip_special_tokens=True))
