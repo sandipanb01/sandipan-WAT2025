@@ -297,7 +297,7 @@ for sample in tqdm(test_set):
             output = model.generate(
                 **inputs,
                 max_new_tokens=MAX_NEW_TOKENS,
-                temperature=0.1,
+                use_cache=True,
                 do_sample=False,
                 repetition_penalty=1.1
             )
@@ -360,7 +360,7 @@ def back_translate(results, model, tokenizer):
             output = model.generate(
                 **inputs,
                 max_new_tokens=MAX_NEW_TOKENS,
-                temperature=0.1,
+                use_cache=True,
                 do_sample=False,
                 repetition_penalty=1.1
             )
