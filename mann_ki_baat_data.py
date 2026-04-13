@@ -1,258 +1,291 @@
 # =========================================================
-# W19-5212 STYLE MULTILINGUAL CORPUS PIPELINE
-# Mann Ki Baat → Structured Parallel Dataset
+# RESEARCH-GRADE MULTILINGUAL DATASET PIPELINE
+# Mann Ki Baat → Parallel Corpus
+# W19-5212 compliant
 # =========================================================
 
 import requests
 from bs4 import BeautifulSoup
 import re
-import json
 import time
 import unicodedata
 from tqdm import tqdm
+import pandas as pd
 from sklearn.model_selection import train_test_split
-
-import nltk
-nltk.download("punkt")
-from nltk.tokenize import sent_tokenize
 
 import torch
 from transformers import AutoTokenizer, AutoModelForCausalLM
 
-# =========================
+# =========================================================
 # CONFIG
-# =========================
+# =========================================================
 
-BASE_URLS = [
-    "https://www.pmindia.gov.in/en/mann-ki-baat/",
-    "https://www.pmindia.gov.in/en/tag/mann-ki-baat/"
-]
-
+BASE_URL = "https://www.pmindia.gov.in/en/tag/mann-ki-baat/"
 SITEMAP = "https://www.pmindia.gov.in/sitemap.xml"
 
 HEADERS = {"User-Agent": "Mozilla/5.0"}
 
-TARGET_EPISODES = 132
-BATCH_SIZE = 6
-
 MODEL_NAME = "sarvamai/sarvam-translate"
 
-# =========================
-# LOAD SARVAM MODEL
-# =========================
+BATCH_SIZE = 16
+MIN_SENT_LEN = 15
+MAX_SENT_LEN = 600
+
+# =========================================================
+# LOAD MODEL (Stable HF loading)
+# =========================================================
+
+device = "cuda" if torch.cuda.is_available() else "cpu"
 
 tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
 
 model = AutoModelForCausalLM.from_pretrained(
     MODEL_NAME,
-    torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
-).to("cuda" if torch.cuda.is_available() else "cpu")
+    torch_dtype=torch.float16 if device == "cuda" else torch.float32,
+    device_map="auto"
+)
 
-# =========================
-# STEP 1: CRAWLING (HTML + SITEMAP)
-# =========================
+model.eval()
 
-def extract_links(url):
-    links = set()
-    try:
-        r = requests.get(url, headers=HEADERS, timeout=30)
-        soup = BeautifulSoup(r.text, "lxml")
+# =========================================================
+# TEXT CLEANING
+# =========================================================
 
-        for a in soup.find_all("a", href=True):
-            if "mann-ki-baat" in a["href"] and a["href"].startswith("http"):
-                links.add(a["href"])
-    except:
-        pass
-    return links
+def normalize(text):
+
+    text = unicodedata.normalize("NFC", text)
+    text = re.sub(r"\s+", " ", text)
+    return text.strip()
+
+
+# =========================================================
+# INDIC SAFE SENTENCE SPLITTER
+# =========================================================
+
+def split_sentences(text):
+
+    sents = re.split(r'(?<=[.!?।])\s+', text)
+
+    return [s.strip() for s in sents if len(s.strip()) > 0]
+
+
+# =========================================================
+# STEP 1 — CRAWL EPISODE URLS
+# =========================================================
+
+def episode_number(url):
+
+    m = re.search(r'(\d+)', url)
+    return int(m.group(1)) if m else 9999
 
 
 def get_urls():
+
     urls = set()
 
-    for base in BASE_URLS:
-        urls |= extract_links(base)
+    # tag pagination
+    for i in range(1, 40):
 
-        for i in range(1, 30):
-            urls |= extract_links(f"{base}page/{i}/")
+        try:
+            r = requests.get(f"{BASE_URL}page/{i}/", headers=HEADERS)
+            soup = BeautifulSoup(r.text, "lxml")
 
+            for a in soup.find_all("a", href=True):
+
+                if "mann-ki-baat" in a["href"] and a["href"].startswith("http"):
+                    urls.add(a["href"])
+
+        except:
+            pass
+
+    # sitemap
     try:
-        r = requests.get(SITEMAP, timeout=30)
+        r = requests.get(SITEMAP)
         soup = BeautifulSoup(r.text, "xml")
+
         for loc in soup.find_all("loc"):
+
             if "mann-ki-baat" in loc.text:
                 urls.add(loc.text)
+
     except:
         pass
 
-    return list(urls)
+    urls = sorted(list(urls), key=episode_number)
+
+    return urls
 
 
-urls = sorted(list(set(get_urls())))
-print("[STEP 1] URLs:", len(urls))
+urls = get_urls()
 
-# =========================
-# STEP 2: STRUCTURED DOM EXTRACTION (W19 IDEA)
-# =========================
-
-def clean(text):
-    text = unicodedata.normalize("NFC", text)
-    text = re.sub(r"\s+", " ", text).strip()
-    return text
+print("URLs collected:", len(urls))
 
 
-def scrape_structured(url):
+# =========================================================
+# STEP 2 — SCRAPE EPISODE CONTENT
+# =========================================================
+
+def scrape_episode(url):
+
     try:
-        r = requests.get(url, headers=HEADERS, timeout=20)
+
+        r = requests.get(url, headers=HEADERS, timeout=30)
+
         soup = BeautifulSoup(r.text, "lxml")
 
-        paragraphs = soup.find_all("p")
+        article = soup.find("div", {"class": "entry-content"})
 
-        structured = []
-        for i, p in enumerate(paragraphs):
-            txt = clean(p.get_text(" ", strip=True))
-            if len(txt) > 20:
-                structured.append({
+        if article is None:
+            return None
+
+        paragraphs = []
+
+        for i, p in enumerate(article.find_all("p")):
+
+            txt = normalize(p.get_text())
+
+            if len(txt) > 40:
+                paragraphs.append({
                     "para_id": i,
                     "text": txt
                 })
 
-        return structured if len(structured) > 3 else None
+        if len(paragraphs) < 3:
+            return None
+
+        return paragraphs
 
     except:
+
         return None
 
 
-raw = []
+episodes = []
 
 for url in tqdm(urls):
-    data = scrape_structured(url)
+
+    data = scrape_episode(url)
+
     if data:
-        raw.append({"url": url, "paragraphs": data})
-
-print("[STEP 2] Episodes scraped:", len(raw))
-
-# =========================
-# STEP 3: FORCE 132 ALIGNMENT
-# =========================
-
-raw = raw[:TARGET_EPISODES]
-
-while len(raw) < TARGET_EPISODES:
-    raw.append({"url": "MISSING", "paragraphs": []})
-
-print("[STEP 3] Episodes:", len(raw))
-
-# =========================
-# STEP 4: SENTENCE SEGMENTATION WITH IDS
-# =========================
-
-dataset = []
-
-for ep in raw:
-    segments = []
-
-    for para in ep["paragraphs"]:
-        sents = sent_tokenize(para["text"])
-
-        for j, s in enumerate(sents):
-            segments.append({
-                "para_id": para["para_id"],
-                "sent_id": j,
-                "en": s
-            })
-
-    dataset.append({
-        "url": ep["url"],
-        "segments": segments
-    })
-
-# =========================
-# STEP 5: SARVAM TRANSLATION (CORRECT HF USAGE)
-# =========================
-
-def translate(text):
-    messages = [
-        {"role": "system", "content": "Translate the text below to Hindi."},
-        {"role": "user", "content": text}
-    ]
-
-    prompt = tokenizer.apply_chat_template(
-        messages,
-        tokenize=False,
-        add_generation_prompt=True
-    )
-
-    inputs = tokenizer([prompt], return_tensors="pt").to(model.device)
-
-    with torch.no_grad():
-        out = model.generate(
-            **inputs,
-            max_new_tokens=512,
-            do_sample=True,
-            temperature=0.01
-        )
-
-    return tokenizer.decode(out[0], skip_special_tokens=True)
-
-
-# =========================
-# STEP 6: QUALITY FILTER + TRANSLATION
-# =========================
-
-final = []
-
-for ep in tqdm(dataset):
-
-    ep_out = {
-        "segments": []
-    }
-
-    for seg in ep["segments"]:
-
-        en = seg["en"]
-
-        # simple quality filter (W19-style)
-        if len(en) < 20 or len(en) > 1000:
-            continue
-
-        hi = translate(en)
-        ta = translate(en)
-        bn = translate(en)
-
-        ep_out["segments"].append({
-            "para_id": seg["para_id"],
-            "sent_id": seg["sent_id"],
-            "en": en,
-            "hi": hi,
-            "ta": ta,
-            "bn": bn
+        episodes.append({
+            "url": url,
+            "paragraphs": data
         })
 
-    final.append(ep_out)
+print("Episodes scraped:", len(episodes))
 
-# =========================
-# STEP 7: SPLIT (80/10/10)
-# =========================
 
-train, temp = train_test_split(final, test_size=0.2, random_state=42)
+# =========================================================
+# STEP 3 — SENTENCE SEGMENTATION
+# =========================================================
+
+rows = []
+
+for eid, ep in enumerate(episodes):
+
+    for para in ep["paragraphs"]:
+
+        sentences = split_sentences(para["text"])
+
+        for sid, s in enumerate(sentences):
+
+            if len(s) < MIN_SENT_LEN or len(s) > MAX_SENT_LEN:
+                continue
+
+            rows.append({
+
+                "episode_id": eid,
+                "url": ep["url"],
+                "para_id": para["para_id"],
+                "sent_id": sid,
+                "en": s
+
+            })
+
+print("English segments:", len(rows))
+
+
+# =========================================================
+# STEP 4 — BATCH TRANSLATION
+# =========================================================
+
+def translate_batch(sentences, language):
+
+    prompt = (
+        f"Translate each line into {language}. "
+        "Return translations line-by-line in same order.\n\n"
+    )
+
+    prompt += "\n".join(sentences)
+
+    inputs = tokenizer(prompt, return_tensors="pt").to(device)
+
+    with torch.no_grad():
+
+        output = model.generate(
+            **inputs,
+            max_new_tokens=1024,
+            temperature=0.01,
+            do_sample=False
+        )
+
+    decoded = tokenizer.decode(output[0], skip_special_tokens=True)
+
+    lines = decoded.split("\n")
+
+    return lines[-len(sentences):]
+
+
+# =========================================================
+# STEP 5 — MULTILINGUAL TRANSLATION
+# =========================================================
+
+for i in tqdm(range(0, len(rows), BATCH_SIZE)):
+
+    batch = rows[i:i+BATCH_SIZE]
+
+    en_sentences = [r["en"] for r in batch]
+
+    hi = translate_batch(en_sentences, "Hindi")
+    ta = translate_batch(en_sentences, "Tamil")
+    bn = translate_batch(en_sentences, "Bengali")
+
+    for j in range(len(batch)):
+
+        batch[j]["hi"] = hi[j] if j < len(hi) else ""
+        batch[j]["ta"] = ta[j] if j < len(ta) else ""
+        batch[j]["bn"] = bn[j] if j < len(bn) else ""
+
+
+# =========================================================
+# STEP 6 — DATAFRAME
+# =========================================================
+
+df = pd.DataFrame(rows)
+
+print("Final dataset size:", len(df))
+
+
+# =========================================================
+# STEP 7 — TRAIN DEV TEST SPLIT
+# =========================================================
+
+train, temp = train_test_split(df, test_size=0.2, random_state=42)
+
 dev, test = train_test_split(temp, test_size=0.5, random_state=42)
 
-# =========================
-# STEP 8: SAVE (SALESFORCE STYLE)
-# =========================
 
-json.dump(train, open("train.json", "w"), indent=2)
-json.dump(dev, open("dev.json", "w"), indent=2)
-json.dump(test, open("test.json", "w"), indent=2)
-json.dump(final, open("full_dataset.json", "w"), indent=2)
+# =========================================================
+# STEP 8 — SAVE PARQUET (Pralekha style)
+# =========================================================
 
-# =========================
-# STEP 9: STATS
-# =========================
+train.to_parquet("train.parquet")
+dev.to_parquet("dev.parquet")
+test.to_parquet("test.parquet")
 
-print("\n========================")
-print("W19-5212 STYLE PIPELINE COMPLETE")
-print("========================")
-print("Episodes:", len(final))
-print("Segments:", sum(len(e["segments"]) for e in final))
-print("========================")
+df.to_parquet("full_dataset.parquet")
+
+print("\nPipeline complete.")
+print("Train:", len(train))
+print("Dev:", len(dev))
+print("Test:", len(test))
