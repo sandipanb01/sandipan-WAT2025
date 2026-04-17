@@ -1,291 +1,366 @@
-# =========================================================
-# RESEARCH-GRADE MULTILINGUAL DATASET PIPELINE
-# Mann Ki Baat → Parallel Corpus
-# W19-5212 compliant
-# =========================================================
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+###############################################################
+# Mann Ki Baat Structured Dataset Builder
+# Hashimoto-style XML dataset generator
+###############################################################
 
 import requests
 from bs4 import BeautifulSoup
 import re
-import time
+import os
+import json
 import unicodedata
+import xml.etree.ElementTree as ET
 from tqdm import tqdm
-import pandas as pd
 from sklearn.model_selection import train_test_split
+from urllib.parse import urljoin
 
-import torch
-from transformers import AutoTokenizer, AutoModelForCausalLM
-
-# =========================================================
+###############################################################
 # CONFIG
-# =========================================================
+###############################################################
 
-BASE_URL = "https://www.pmindia.gov.in/en/tag/mann-ki-baat/"
-SITEMAP = "https://www.pmindia.gov.in/sitemap.xml"
+BASE = "https://www.pmindia.gov.in"
+TAG_PAGE = "https://www.pmindia.gov.in/en/tag/mann-ki-baat/"
 
-HEADERS = {"User-Agent": "Mozilla/5.0"}
+DATA_DIR = "mkb_dataset"
 
-MODEL_NAME = "sarvamai/sarvam-translate"
+os.makedirs(DATA_DIR, exist_ok=True)
 
-BATCH_SIZE = 16
-MIN_SENT_LEN = 15
-MAX_SENT_LEN = 600
+###############################################################
+# STEP 1 — DISCOVER ALL EPISODES
+###############################################################
 
-# =========================================================
-# LOAD MODEL (Stable HF loading)
-# =========================================================
+def get_episode_links():
 
-device = "cuda" if torch.cuda.is_available() else "cpu"
+    links=set()
 
-tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
+    print("Scanning episode pages...")
 
-model = AutoModelForCausalLM.from_pretrained(
-    MODEL_NAME,
-    torch_dtype=torch.float16 if device == "cuda" else torch.float32,
-    device_map="auto"
-)
+    for page in range(1,40):
 
-model.eval()
+        url=f"{TAG_PAGE}page/{page}/"
 
-# =========================================================
-# TEXT CLEANING
-# =========================================================
+        try:
+            r=requests.get(url,timeout=20)
+        except:
+            continue
 
-def normalize(text):
+        soup=BeautifulSoup(r.text,"lxml")
 
-    text = unicodedata.normalize("NFC", text)
-    text = re.sub(r"\s+", " ", text)
+        for a in soup.find_all("a",href=True):
+
+            href=a["href"]
+
+            if "/news_updates/" in href and "mann" in href.lower():
+
+                links.add(href.split("?")[0])
+
+    links=list(links)
+
+    print("TOTAL UNIQUE EPISODES FOUND:",len(links))
+
+    return links
+
+
+###############################################################
+# STEP 2 — PRESERVE HTML INLINE TAGS
+###############################################################
+
+def serialize_html(element):
+
+    """Convert HTML element to text while preserving tags"""
+
+    text=""
+
+    for node in element.children:
+
+        if isinstance(node,str):
+
+            text+=node
+
+        else:
+
+            tag=node.name
+
+            inner=serialize_html(node)
+
+            text+=f"<{tag}>{inner}</{tag}>"
+
     return text.strip()
 
 
-# =========================================================
-# INDIC SAFE SENTENCE SPLITTER
-# =========================================================
+###############################################################
+# STEP 3 — EXTRACT TRANSCRIPT
+###############################################################
 
-def split_sentences(text):
-
-    sents = re.split(r'(?<=[.!?।])\s+', text)
-
-    return [s.strip() for s in sents if len(s.strip()) > 0]
-
-
-# =========================================================
-# STEP 1 — CRAWL EPISODE URLS
-# =========================================================
-
-def episode_number(url):
-
-    m = re.search(r'(\d+)', url)
-    return int(m.group(1)) if m else 9999
-
-
-def get_urls():
-
-    urls = set()
-
-    # tag pagination
-    for i in range(1, 40):
-
-        try:
-            r = requests.get(f"{BASE_URL}page/{i}/", headers=HEADERS)
-            soup = BeautifulSoup(r.text, "lxml")
-
-            for a in soup.find_all("a", href=True):
-
-                if "mann-ki-baat" in a["href"] and a["href"].startswith("http"):
-                    urls.add(a["href"])
-
-        except:
-            pass
-
-    # sitemap
-    try:
-        r = requests.get(SITEMAP)
-        soup = BeautifulSoup(r.text, "xml")
-
-        for loc in soup.find_all("loc"):
-
-            if "mann-ki-baat" in loc.text:
-                urls.add(loc.text)
-
-    except:
-        pass
-
-    urls = sorted(list(urls), key=episode_number)
-
-    return urls
-
-
-urls = get_urls()
-
-print("URLs collected:", len(urls))
-
-
-# =========================================================
-# STEP 2 — SCRAPE EPISODE CONTENT
-# =========================================================
-
-def scrape_episode(url):
+def extract_segments(url):
 
     try:
-
-        r = requests.get(url, headers=HEADERS, timeout=30)
-
-        soup = BeautifulSoup(r.text, "lxml")
-
-        article = soup.find("div", {"class": "entry-content"})
-
-        if article is None:
-            return None
-
-        paragraphs = []
-
-        for i, p in enumerate(article.find_all("p")):
-
-            txt = normalize(p.get_text())
-
-            if len(txt) > 40:
-                paragraphs.append({
-                    "para_id": i,
-                    "text": txt
-                })
-
-        if len(paragraphs) < 3:
-            return None
-
-        return paragraphs
-
+        r=requests.get(url,timeout=30)
+        r.raise_for_status()
     except:
+        return []
 
-        return None
+    soup=BeautifulSoup(r.text,"lxml")
+
+    blocks=[
+
+        soup.find("div",class_="news_content detail_content"),
+        soup.find("div",class_="td-post-content"),
+        soup.find("div",class_="entry-content"),
+        soup.find("div",class_="tdb-block-inner"),
+        soup.find("div",itemprop="articleBody")
+
+    ]
+
+    block=None
+
+    for b in blocks:
+
+        if b:
+            block=b
+            break
+
+    if block:
+        tags=block.find_all(["p","li"])
+    else:
+        tags=soup.find_all("p")
+
+    segments=[]
+
+    for tag in tags:
+
+        text=serialize_html(tag)
+
+        if len(text)<40:
+            continue
+
+        if "share this" in text.lower():
+            continue
+
+        segments.append(text)
+
+    return segments
 
 
-episodes = []
+###############################################################
+# STEP 4 — SENTENCE SEGMENTATION
+###############################################################
 
-for url in tqdm(urls):
+def split_sentences(paragraphs):
 
-    data = scrape_episode(url)
+    sentences=[]
 
-    if data:
-        episodes.append({
-            "url": url,
-            "paragraphs": data
-        })
+    for p in paragraphs:
 
-print("Episodes scraped:", len(episodes))
+        parts=re.split(r'(?<=[.!?])\s+',p)
+
+        for s in parts:
+
+            s=s.strip()
+
+            if len(s)>15:
+                sentences.append(s)
+
+    return sentences
 
 
-# =========================================================
-# STEP 3 — SENTENCE SEGMENTATION
-# =========================================================
+###############################################################
+# STEP 5 — NORMALIZATION
+###############################################################
 
-rows = []
+def normalize(text):
 
-for eid, ep in enumerate(episodes):
+    text=unicodedata.normalize("NFC",text)
 
-    for para in ep["paragraphs"]:
+    text=text.replace("\u200c","")
+    text=text.replace("\u200d","")
 
-        sentences = split_sentences(para["text"])
+    return text
 
-        for sid, s in enumerate(sentences):
 
-            if len(s) < MIN_SENT_LEN or len(s) > MAX_SENT_LEN:
-                continue
+###############################################################
+# STEP 6 — BUILD DATASET
+###############################################################
 
-            rows.append({
+def build_dataset(links):
 
-                "episode_id": eid,
-                "url": ep["url"],
-                "para_id": para["para_id"],
-                "sent_id": sid,
-                "en": s
+    dataset=[]
+
+    print("Extracting transcripts...")
+
+    for episode_id,url in enumerate(tqdm(links)):
+
+        paragraphs=extract_segments(url)
+
+        sentences=split_sentences(paragraphs)
+
+        for sid,s in enumerate(sentences):
+
+            s=normalize(s)
+
+            dataset.append({
+
+                "episode":episode_id,
+                "url":url,
+                "seg_id":sid,
+                "source":s,
+                "target":s
 
             })
 
-print("English segments:", len(rows))
+    print("TOTAL SEGMENTS:",len(dataset))
+
+    return dataset
 
 
-# =========================================================
-# STEP 4 — BATCH TRANSLATION
-# =========================================================
+###############################################################
+# STEP 7 — FILTER BAD SEGMENTS
+###############################################################
 
-def translate_batch(sentences, language):
+def filter_pairs(data):
 
-    prompt = (
-        f"Translate each line into {language}. "
-        "Return translations line-by-line in same order.\n\n"
-    )
+    clean=[]
 
-    prompt += "\n".join(sentences)
+    for x in data:
 
-    inputs = tokenizer(prompt, return_tensors="pt").to(device)
+        src=x["source"]
+        tgt=x["target"]
 
-    with torch.no_grad():
+        if len(src)<10:
+            continue
 
-        output = model.generate(
-            **inputs,
-            max_new_tokens=1024,
-            temperature=0.01,
-            do_sample=False
-        )
+        if len(tgt)<10:
+            continue
 
-    decoded = tokenizer.decode(output[0], skip_special_tokens=True)
+        ratio=len(tgt)/len(src)
 
-    lines = decoded.split("\n")
+        if ratio>4:
+            continue
 
-    return lines[-len(sentences):]
+        clean.append(x)
 
+    print("After filtering:",len(clean))
 
-# =========================================================
-# STEP 5 — MULTILINGUAL TRANSLATION
-# =========================================================
-
-for i in tqdm(range(0, len(rows), BATCH_SIZE)):
-
-    batch = rows[i:i+BATCH_SIZE]
-
-    en_sentences = [r["en"] for r in batch]
-
-    hi = translate_batch(en_sentences, "Hindi")
-    ta = translate_batch(en_sentences, "Tamil")
-    bn = translate_batch(en_sentences, "Bengali")
-
-    for j in range(len(batch)):
-
-        batch[j]["hi"] = hi[j] if j < len(hi) else ""
-        batch[j]["ta"] = ta[j] if j < len(ta) else ""
-        batch[j]["bn"] = bn[j] if j < len(bn) else ""
+    return clean
 
 
-# =========================================================
-# STEP 6 — DATAFRAME
-# =========================================================
+###############################################################
+# STEP 8 — TRAIN DEV TEST SPLIT
+###############################################################
 
-df = pd.DataFrame(rows)
+def split_dataset(data):
 
-print("Final dataset size:", len(df))
+    train,temp=train_test_split(data,test_size=0.2,random_state=42)
+
+    dev,test=train_test_split(temp,test_size=0.5,random_state=42)
+
+    print("Train:",len(train))
+    print("Dev:",len(dev))
+    print("Test:",len(test))
+
+    return train,dev,test
 
 
-# =========================================================
-# STEP 7 — TRAIN DEV TEST SPLIT
-# =========================================================
+###############################################################
+# STEP 9 — SAVE JSONL
+###############################################################
 
-train, temp = train_test_split(df, test_size=0.2, random_state=42)
+def save_jsonl(data,path):
 
-dev, test = train_test_split(temp, test_size=0.5, random_state=42)
+    with open(path,"w",encoding="utf-8") as f:
+
+        for x in data:
+
+            f.write(json.dumps(x,ensure_ascii=False)+"\n")
 
 
-# =========================================================
-# STEP 8 — SAVE PARQUET (Pralekha style)
-# =========================================================
+###############################################################
+# STEP 10 — HASHIMOTO STYLE XML
+###############################################################
 
-train.to_parquet("train.parquet")
-dev.to_parquet("dev.parquet")
-test.to_parquet("test.parquet")
+def save_xml(data,path,split_name):
 
-df.to_parquet("full_dataset.parquet")
+    root=ET.Element("dataset")
 
-print("\nPipeline complete.")
-print("Train:", len(train))
-print("Dev:", len(dev))
-print("Test:", len(test))
+    doc=ET.SubElement(root,"doc")
+
+    doc.set("id",split_name)
+
+    for x in data:
+
+        seg=ET.SubElement(doc,"seg")
+
+        seg.set("id",str(x["seg_id"]))
+
+        src=ET.SubElement(seg,"source")
+        src.text=x["source"]
+
+        tgt=ET.SubElement(seg,"target")
+        tgt.text=x["target"]
+
+    tree=ET.ElementTree(root)
+
+    tree.write(path,encoding="utf-8",xml_declaration=True)
+
+
+###############################################################
+# MAIN PIPELINE
+###############################################################
+
+def main():
+
+    links=get_episode_links()
+
+    dataset=build_dataset(links)
+
+    dataset=filter_pairs(dataset)
+
+    train,dev,test=split_dataset(dataset)
+
+    ############################################
+    # SAVE JSONL
+    ############################################
+
+    save_jsonl(train,f"{DATA_DIR}/train.jsonl")
+    save_jsonl(dev,f"{DATA_DIR}/dev.jsonl")
+    save_jsonl(test,f"{DATA_DIR}/test.jsonl")
+
+    ############################################
+    # SAVE XML
+    ############################################
+
+    save_xml(train,f"{DATA_DIR}/train.xml","train")
+    save_xml(dev,f"{DATA_DIR}/dev.xml","dev")
+    save_xml(test,f"{DATA_DIR}/test.xml","test")
+
+    print("DATASET COMPLETE")
+
+
+###############################################################
+
+if __name__=="__main__":
+
+    main()
+    
+########### FOR COLAB ONLY####################    
+
+import zipfile
+from google.colab import files
+
+zip_path="mkb_dataset.zip"
+
+with zipfile.ZipFile(zip_path,"w") as z:
+
+    z.write("mkb_dataset/train.jsonl")
+    z.write("mkb_dataset/dev.jsonl")
+    z.write("mkb_dataset/test.jsonl")
+
+    z.write("mkb_dataset/train.xml")
+    z.write("mkb_dataset/dev.xml")
+    z.write("mkb_dataset/test.xml")
+
+files.download(zip_path)    
+    
