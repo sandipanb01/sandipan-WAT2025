@@ -85,7 +85,7 @@ def translate_one(client, text, model='gemma-4-31b-it'):
             temperature=1.0,  # Standard recommended sampling config for Gemma 4
             top_p=0.95,
             top_k=64,
-            max_output_tokens=3072
+            max_new_tokens=3072
         ),
     )
     
