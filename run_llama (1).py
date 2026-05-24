@@ -79,7 +79,8 @@ def translate_one(client, text, model='meta-llama/llama-3.3-70b-instruct:free'):
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": masked}
         ],
-        temperature=0.3,  # Lower temperature prevents formatting hallucinations
+        temperature=0.3,   # Lower temperature prevents formatting hallucinations
+        max_new_tokens=3072, 
     )
     
     translated = response.choices[0].message.content.strip()
